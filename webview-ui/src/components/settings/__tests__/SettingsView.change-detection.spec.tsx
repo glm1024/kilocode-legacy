@@ -129,6 +129,12 @@ vi.mock("../UISettings", () => ({
 	UISettings: () => null,
 }))
 
+// kilocode_change start
+vi.mock("../StatisticsSettings", () => ({
+	StatisticsSettings: () => null,
+}))
+// kilocode_change end
+
 vi.mock("../SettingsSearch", () => ({
 	SettingsSearch: () => null,
 }))

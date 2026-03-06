@@ -126,6 +126,11 @@ vi.mock("../SlashCommandsSettings", () => ({
 vi.mock("../UISettings", () => ({
 	UISettings: vi.fn(() => <div>UISettings</div>),
 }))
+// kilocode_change start
+vi.mock("../StatisticsSettings", () => ({
+	StatisticsSettings: vi.fn(() => <div>StatisticsSettings</div>),
+}))
+// kilocode_change end
 vi.mock("../SectionHeader", () => ({
 	SectionHeader: ({ children }: any) => <div>{children}</div>,
 }))

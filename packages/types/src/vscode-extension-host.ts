@@ -232,6 +232,9 @@ export interface ExtensionMessage {
 		| "autoPurgeCompletedTaskRetentionDays" // kilocode_change
 		| "autoPurgeIncompleteTaskRetentionDays" // kilocode_change
 		| "manualPurge" // kilocode_change
+		| "aiCodeStatsSummaryResponse" // kilocode_change
+		| "aiCodeStatsWebhookTestResult" // kilocode_change
+		| "aiCodeStatsUploadTestResult" // kilocode_change
 		| "commands"
 		| "insertTextIntoTextarea"
 		| "dismissedUpsells"
@@ -558,6 +561,10 @@ export type ExtensionState = Pick<
 	| "autoPurgeCompletedTaskRetentionDays" // kilocode_change
 	| "autoPurgeIncompleteTaskRetentionDays" // kilocode_change
 	| "autoPurgeLastRunTimestamp" // kilocode_change
+	// kilocode_change start
+	| "aiCodeStatsUploadEnabled"
+	| "aiCodeStatsWebhookUrl"
+	// kilocode_change end
 	| "condensingApiConfigId"
 	| "customCondensingPrompt"
 	| "yoloGatekeeperApiConfigId" // kilocode_change: AI gatekeeper for YOLO mode
@@ -876,6 +883,9 @@ export interface WebviewMessage {
 		| "focusPanelRequest"
 		| "clearUsageData" // kilocode_change
 		| "getUsageData" // kilocode_change
+		| "getAiCodeStatsSummary" // kilocode_change
+		| "testAiCodeStatsWebhook" // kilocode_change
+		| "testAiCodeStatsUpload" // kilocode_change
 		| "usageDataResponse" // kilocode_change
 		| "showTaskTimeline" // kilocode_change
 		| "sendMessageOnEnter" // kilocode_change

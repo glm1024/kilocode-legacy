@@ -14,6 +14,9 @@ import { formatResponse } from "../../core/prompts/responses"
 import { diagnosticsToProblemsString, getNewDiagnostics } from "../diagnostics"
 import { Task } from "../../core/task/Task"
 import { resolveToolProtocol } from "../../utils/resolveToolProtocol"
+// kilocode_change start
+import { AiCodeStatsService } from "../../services/ai-code-stats"
+// kilocode_change end
 
 import { DecorationController } from "./DecorationController"
 
@@ -315,6 +318,9 @@ export class DiffViewProvider {
 			// Store the results as class properties for formatFileWriteResponse to use
 			this.newProblemsMessage = newProblemsMessage
 			this.userEdits = userEdits
+			// kilocode_change start
+			await this.recordAgentInsertForStats(this.relPath, this.originalContent ?? "", normalizedEditedContent)
+			// kilocode_change end
 
 			return { newProblemsMessage, userEdits, finalContent: normalizedEditedContent }
 		} else {
@@ -322,6 +328,9 @@ export class DiffViewProvider {
 			// Store the results as class properties for formatFileWriteResponse to use
 			this.newProblemsMessage = newProblemsMessage
 			this.userEdits = undefined
+			// kilocode_change start
+			await this.recordAgentInsertForStats(this.relPath, this.originalContent ?? "", normalizedEditedContent)
+			// kilocode_change end
 
 			return { newProblemsMessage, userEdits: undefined, finalContent: normalizedEditedContent }
 		}
@@ -678,6 +687,37 @@ export class DiffViewProvider {
 		return result
 	}
 
+	// kilocode_change start
+	private async recordAgentInsertForStats(
+		relPath: string,
+		originalContent: string,
+		newContent: string,
+	): Promise<void> {
+		const aiCodeStatsService = AiCodeStatsService.getInstance()
+		if (!aiCodeStatsService) {
+			return
+		}
+
+		try {
+			const task = this.taskRef.deref()
+			await aiCodeStatsService.recordAgentFileWrite({
+				cwd: this.cwd,
+				filePath: path.resolve(this.cwd, relPath),
+				relativePath: relPath,
+				originalContent,
+				newContent,
+				taskId: task?.taskId,
+			})
+		} catch (error) {
+			console.warn(
+				`[DiffViewProvider] Failed to record AI code stats for ${relPath}: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			)
+		}
+	}
+	// kilocode_change end
+
 	async reset(): Promise<void> {
 		await this.closeAllDiffViews()
 		this.editType = undefined
@@ -713,6 +753,9 @@ export class DiffViewProvider {
 		finalContent: string | undefined
 	}> {
 		const absolutePath = path.resolve(this.cwd, relPath)
+		// kilocode_change start
+		const originalContent = await fs.readFile(absolutePath, "utf-8").catch(() => "")
+		// kilocode_change end
 
 		// kilocode_change start: In CLI mode, skip VSCode-specific operations (diagnostics are mocked)
 		const skipVscodeOps = process.env.KILO_CLI_MODE === "true"
@@ -789,6 +832,9 @@ export class DiffViewProvider {
 		this.userEdits = undefined
 		this.relPath = relPath
 		this.newContent = content
+		// kilocode_change start
+		await this.recordAgentInsertForStats(relPath, originalContent, content)
+		// kilocode_change end
 
 		return {
 			newProblemsMessage,

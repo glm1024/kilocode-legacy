@@ -23,6 +23,7 @@ import {
 	Bot, // kilocode_change
 	MessageSquare,
 	Monitor,
+	Activity, // kilocode_change
 	LucideIcon,
 	// SquareSlash, // kilocode_change
 	// Glasses, // kilocode_change
@@ -86,6 +87,9 @@ import { AutocompleteServiceSettingsView } from "../kilocode/settings/Autocomple
 import { SlashCommandsSettings } from "./SlashCommandsSettings"
 import { UISettings } from "./UISettings"
 import AgentBehaviourView from "../kilocode/settings/AgentBehaviourView" // kilocode_change - new combined view
+// kilocode_change start
+import { StatisticsSettings } from "./StatisticsSettings"
+// kilocode_change end
 // import ModesView from "../modes/ModesView" // kilocode_change - now used inside AgentBehaviourView
 // import McpView from "../mcp/McpView" // kilocode_change: own view
 import { SettingsSearch } from "./SettingsSearch"
@@ -110,6 +114,7 @@ export const sectionNames = [
 	"browser",
 	"checkpoints",
 	"autocomplete", // kilocode_change
+	"statistics", // kilocode_change
 	"display", // kilocode_change
 	"notifications",
 	"contextManagement",
@@ -144,6 +149,10 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 	const [isDiscardDialogShow, setDiscardDialogShow] = useState(false)
 	const [isChangeDetected, setChangeDetected] = useState(false)
 	const [errorMessage, setErrorMessage] = useState<string | undefined>(undefined)
+	const [aiCodeStatsWebhookValidationError, setAiCodeStatsWebhookValidationError] = useState<string | undefined>(
+		undefined,
+	)
+	const [isSubmitting, setIsSubmitting] = useState(false) // kilocode_change
 	const [activeTab, setActiveTab] = useState<SectionName>(
 		targetSection && sectionNames.includes(targetSection as SectionName)
 			? (targetSection as SectionName)
@@ -243,6 +252,7 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 		alwaysAllowFollowupQuestions,
 		followupAutoApproveTimeoutMs,
 		ghostServiceSettings, // kilocode_change
+		aiCodeStatsWebhookUrl, // kilocode_change
 		// kilocode_change start - Auto-purge settings
 		autoPurgeEnabled,
 		autoPurgeDefaultRetentionDays,
@@ -386,6 +396,10 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 			setChangeDetected(true)
 			return { ...prevState, [field]: value }
 		})
+
+		if (field === "aiCodeStatsWebhookUrl") {
+			setAiCodeStatsWebhookValidationError(undefined)
+		}
 	}, [])
 
 	// kilocode_change start
@@ -528,142 +542,227 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 
 	const isSettingValid = !errorMessage
 
-	const handleSubmit = () => {
-		if (isSettingValid) {
-			vscode.postMessage({
-				type: "updateSettings",
-				updatedSettings: {
-					language,
-					alwaysAllowReadOnly: alwaysAllowReadOnly ?? undefined,
-					alwaysAllowReadOnlyOutsideWorkspace: alwaysAllowReadOnlyOutsideWorkspace ?? undefined,
-					alwaysAllowWrite: alwaysAllowWrite ?? undefined,
-					alwaysAllowWriteOutsideWorkspace: alwaysAllowWriteOutsideWorkspace ?? undefined,
-					alwaysAllowWriteProtected: alwaysAllowWriteProtected ?? undefined,
-					alwaysAllowDelete: alwaysAllowDelete ?? undefined, // kilocode_change
-					alwaysAllowExecute: alwaysAllowExecute ?? undefined,
-					alwaysAllowBrowser: alwaysAllowBrowser ?? undefined,
-					alwaysAllowMcp,
-					alwaysAllowModeSwitch,
-					allowedCommands: allowedCommands ?? [],
-					deniedCommands: deniedCommands ?? [],
-					// Note that we use `null` instead of `undefined` since `JSON.stringify`
-					// will omit `undefined` when serializing the object and passing it to the
-					// extension host. We may need to do the same for other nullable fields.
-					allowedMaxRequests: allowedMaxRequests ?? null,
-					allowedMaxCost: allowedMaxCost ?? null,
-					autoCondenseContext,
-					autoCondenseContextPercent,
-					browserToolEnabled: browserToolEnabled ?? true,
-					soundEnabled: soundEnabled ?? true,
-					soundVolume: soundVolume ?? 0.5,
-					ttsEnabled,
-					ttsSpeed,
-					diffEnabled: diffEnabled ?? true,
-					enableCheckpoints: enableCheckpoints ?? false,
-					checkpointTimeout: checkpointTimeout ?? DEFAULT_CHECKPOINT_TIMEOUT_SECONDS,
-					browserViewportSize: browserViewportSize ?? "900x600",
-					remoteBrowserHost: remoteBrowserEnabled ? remoteBrowserHost : undefined,
-					remoteBrowserEnabled: remoteBrowserEnabled ?? false,
-					fuzzyMatchThreshold: fuzzyMatchThreshold ?? 1.0,
-					writeDelayMs,
-					screenshotQuality: screenshotQuality ?? 75,
-					terminalOutputLineLimit: terminalOutputLineLimit ?? 500,
-					terminalOutputCharacterLimit: terminalOutputCharacterLimit ?? 50_000,
-					terminalShellIntegrationTimeout: terminalShellIntegrationTimeout ?? 30_000,
-					terminalShellIntegrationDisabled,
-					terminalCommandDelay,
-					terminalPowershellCounter,
-					terminalZshClearEolMark,
-					terminalZshOhMy,
-					terminalZshP10k,
-					terminalZdotdir,
-					terminalCompressProgressBar,
-					mcpEnabled,
-					maxOpenTabsContext: Math.min(Math.max(0, maxOpenTabsContext ?? 20), 500),
-					maxWorkspaceFiles: Math.min(Math.max(0, maxWorkspaceFiles ?? 200), 500),
-					showRooIgnoredFiles: showRooIgnoredFiles ?? true,
-					enableSubfolderRules: enableSubfolderRules ?? false,
-					maxReadFileLine: maxReadFileLine ?? 500 /*kilocode_change*/,
-					maxImageFileSize: maxImageFileSize ?? 5,
-					maxTotalImageSize: maxTotalImageSize ?? 20,
-					maxConcurrentFileReads: cachedState.maxConcurrentFileReads ?? 5,
-					includeDiagnosticMessages:
-						includeDiagnosticMessages !== undefined ? includeDiagnosticMessages : true,
-					maxDiagnosticMessages: maxDiagnosticMessages ?? 50,
-					alwaysAllowSubtasks,
-					alwaysAllowFollowupQuestions: alwaysAllowFollowupQuestions ?? false,
-					followupAutoApproveTimeoutMs,
-					condensingApiConfigId: condensingApiConfigId || "",
-					includeTaskHistoryInEnhance: includeTaskHistoryInEnhance ?? true,
-					reasoningBlockCollapsed: reasoningBlockCollapsed ?? true,
-					enterBehavior: enterBehavior ?? "send",
-					includeCurrentTime: includeCurrentTime ?? true,
-					includeCurrentCost: includeCurrentCost ?? true,
-					maxGitStatusFiles: maxGitStatusFiles ?? 0,
-					profileThresholds,
-					imageGenerationProvider,
-					openRouterImageApiKey,
-					openRouterImageGenerationSelectedModel,
-					experiments,
-					customSupportPrompts,
-				},
-			})
-			vscode.postMessage({ type: "ttsEnabled", bool: ttsEnabled })
-			vscode.postMessage({ type: "ttsSpeed", value: ttsSpeed })
-			vscode.postMessage({ type: "terminalCommandApiConfigId", text: terminalCommandApiConfigId || "" }) // kilocode_change
-			vscode.postMessage({ type: "showAutoApproveMenu", bool: showAutoApproveMenu }) // kilocode_change
-			vscode.postMessage({ type: "yoloMode", bool: yoloMode }) // kilocode_change
-			vscode.postMessage({ type: "allowVeryLargeReads", bool: allowVeryLargeReads }) // kilocode_change
-			vscode.postMessage({ type: "currentApiConfigName", text: currentApiConfigName })
-			vscode.postMessage({ type: "showTaskTimeline", bool: showTaskTimeline }) // kilocode_change
-			vscode.postMessage({ type: "sendMessageOnEnter", bool: sendMessageOnEnter }) // kilocode_change
-			vscode.postMessage({ type: "showTimestamps", bool: showTimestamps }) // kilocode_change
-			vscode.postMessage({ type: "showDiffStats", bool: cachedState.showDiffStats }) // kilocode_change
-			vscode.postMessage({ type: "hideCostBelowThreshold", value: hideCostBelowThreshold }) // kilocode_change
-			vscode.postMessage({ type: "updateCondensingPrompt", text: customCondensingPrompt || "" })
-			vscode.postMessage({ type: "yoloGatekeeperApiConfigId", text: yoloGatekeeperApiConfigId || "" }) // kilocode_change: AI gatekeeper for YOLO mode
-			vscode.postMessage({ type: "setReasoningBlockCollapsed", bool: reasoningBlockCollapsed ?? true })
-			vscode.postMessage({ type: "upsertApiConfiguration", text: editingApiConfigName, apiConfiguration }) // kilocode_change: Save to editing profile instead of current active profile
-			vscode.postMessage({ type: "telemetrySetting", text: telemetrySetting })
-			vscode.postMessage({ type: "systemNotificationsEnabled", bool: systemNotificationsEnabled }) // kilocode_change
-			vscode.postMessage({ type: "ghostServiceSettings", values: ghostServiceSettings }) // kilocode_change
-			vscode.postMessage({ type: "morphApiKey", text: morphApiKey }) // kilocode_change
-			vscode.postMessage({ type: "fastApplyModel", text: fastApplyModel }) // kilocode_change: Fast Apply model selection
-			vscode.postMessage({ type: "fastApplyApiProvider", text: fastApplyApiProvider }) // kilocode_change: Fast Apply model api base url
-			vscode.postMessage({ type: "kiloCodeImageApiKey", text: kiloCodeImageApiKey })
-			// kilocode_change start - Auto-purge settings
-			vscode.postMessage({ type: "autoPurgeEnabled", bool: autoPurgeEnabled })
-			vscode.postMessage({ type: "autoPurgeDefaultRetentionDays", value: autoPurgeDefaultRetentionDays })
-			vscode.postMessage({
-				type: "autoPurgeFavoritedTaskRetentionDays",
-				value: autoPurgeFavoritedTaskRetentionDays ?? undefined,
-			})
-			vscode.postMessage({
-				type: "autoPurgeCompletedTaskRetentionDays",
-				value: autoPurgeCompletedTaskRetentionDays,
-			})
-			vscode.postMessage({
-				type: "autoPurgeIncompleteTaskRetentionDays",
-				value: autoPurgeIncompleteTaskRetentionDays,
-			})
-			// kilocode_change end - Auto-purge settings
-			vscode.postMessage({ type: "debugSetting", bool: cachedState.debug })
+	// kilocode_change start
+	const testAiCodeStatsWebhook = useCallback(
+		async (webhookUrl: string): Promise<{ success: boolean; message: string }> => {
+			return await new Promise((resolve) => {
+				const timeoutMs = 8_000
+				let settled = false
 
-			// kilocode_change: After saving, sync cachedState to extensionState without clobbering
-			// the editing profile's apiConfiguration when editing a non-active profile.
-			if (editingApiConfigName !== currentApiConfigName) {
-				// Only sync non-apiConfiguration fields from extensionState
-				const { apiConfiguration: _, ...restOfExtensionState } = extensionState
-				setCachedState((prevState) => ({
-					...prevState,
-					...restOfExtensionState,
-				}))
-			} else {
-				// When editing the active profile, sync everything including apiConfiguration
-				setCachedState((prevState) => ({ ...prevState, ...extensionState }))
+				const cleanup = () => {
+					window.clearTimeout(timeoutId)
+					window.removeEventListener("message", handleMessage)
+				}
+
+				const settle = (result: { success: boolean; message: string }) => {
+					if (settled) {
+						return
+					}
+					settled = true
+					cleanup()
+					resolve(result)
+				}
+
+				const timeoutId = window.setTimeout(() => {
+					settle({
+						success: false,
+						message: t("settings:statistics.webhook.test.timeout"),
+					})
+				}, timeoutMs)
+
+				const handleMessage = (event: MessageEvent) => {
+					const message = event.data
+					if (message?.type !== "aiCodeStatsWebhookTestResult") {
+						return
+					}
+
+					const rawMessage =
+						typeof message.text === "string" && message.text.trim().length > 0 ? message.text : ""
+					const errorCode = (message.values as Record<string, unknown> | undefined)?.errorCode
+					const localizedMessage = message.success
+						? t("settings:statistics.webhook.test.success")
+						: errorCode === "webhook_required"
+							? t("settings:statistics.webhook.test.required")
+							: rawMessage
+								? `${t("settings:statistics.webhook.test.failed")}: ${rawMessage}`
+								: t("settings:statistics.webhook.test.failed")
+
+					settle({
+						success: !!message.success,
+						message: localizedMessage,
+					})
+				}
+
+				window.addEventListener("message", handleMessage)
+				vscode.postMessage({
+					type: "testAiCodeStatsWebhook",
+					text: webhookUrl,
+				})
+			})
+		},
+		[t],
+	)
+	// kilocode_change end
+
+	const handleSubmit = async () => {
+		if (isSettingValid && !isSubmitting) {
+			// kilocode_change start
+			setIsSubmitting(true)
+			try {
+				const normalizedWebhookUrl = (aiCodeStatsWebhookUrl ?? "").trim()
+				const originalWebhookUrl = (extensionState.aiCodeStatsWebhookUrl ?? "").trim()
+				const shouldTestWebhook = normalizedWebhookUrl.length > 0 && normalizedWebhookUrl !== originalWebhookUrl
+
+				if (shouldTestWebhook) {
+					const testResult = await testAiCodeStatsWebhook(normalizedWebhookUrl)
+					if (!testResult.success) {
+						setAiCodeStatsWebhookValidationError(testResult.message)
+						return
+					}
+				}
+				setAiCodeStatsWebhookValidationError(undefined)
+				// kilocode_change end
+
+				vscode.postMessage({
+					type: "updateSettings",
+					updatedSettings: {
+						language,
+						alwaysAllowReadOnly: alwaysAllowReadOnly ?? undefined,
+						alwaysAllowReadOnlyOutsideWorkspace: alwaysAllowReadOnlyOutsideWorkspace ?? undefined,
+						alwaysAllowWrite: alwaysAllowWrite ?? undefined,
+						alwaysAllowWriteOutsideWorkspace: alwaysAllowWriteOutsideWorkspace ?? undefined,
+						alwaysAllowWriteProtected: alwaysAllowWriteProtected ?? undefined,
+						alwaysAllowDelete: alwaysAllowDelete ?? undefined, // kilocode_change
+						alwaysAllowExecute: alwaysAllowExecute ?? undefined,
+						alwaysAllowBrowser: alwaysAllowBrowser ?? undefined,
+						alwaysAllowMcp,
+						alwaysAllowModeSwitch,
+						allowedCommands: allowedCommands ?? [],
+						deniedCommands: deniedCommands ?? [],
+						// Note that we use `null` instead of `undefined` since `JSON.stringify`
+						// will omit `undefined` when serializing the object and passing it to the
+						// extension host. We may need to do the same for other nullable fields.
+						allowedMaxRequests: allowedMaxRequests ?? null,
+						allowedMaxCost: allowedMaxCost ?? null,
+						autoCondenseContext,
+						autoCondenseContextPercent,
+						browserToolEnabled: browserToolEnabled ?? true,
+						soundEnabled: soundEnabled ?? true,
+						soundVolume: soundVolume ?? 0.5,
+						ttsEnabled,
+						ttsSpeed,
+						diffEnabled: diffEnabled ?? true,
+						enableCheckpoints: enableCheckpoints ?? false,
+						checkpointTimeout: checkpointTimeout ?? DEFAULT_CHECKPOINT_TIMEOUT_SECONDS,
+						browserViewportSize: browserViewportSize ?? "900x600",
+						remoteBrowserHost: remoteBrowserEnabled ? remoteBrowserHost : undefined,
+						remoteBrowserEnabled: remoteBrowserEnabled ?? false,
+						fuzzyMatchThreshold: fuzzyMatchThreshold ?? 1.0,
+						writeDelayMs,
+						screenshotQuality: screenshotQuality ?? 75,
+						terminalOutputLineLimit: terminalOutputLineLimit ?? 500,
+						terminalOutputCharacterLimit: terminalOutputCharacterLimit ?? 50_000,
+						terminalShellIntegrationTimeout: terminalShellIntegrationTimeout ?? 30_000,
+						terminalShellIntegrationDisabled,
+						terminalCommandDelay,
+						terminalPowershellCounter,
+						terminalZshClearEolMark,
+						terminalZshOhMy,
+						terminalZshP10k,
+						terminalZdotdir,
+						terminalCompressProgressBar,
+						mcpEnabled,
+						maxOpenTabsContext: Math.min(Math.max(0, maxOpenTabsContext ?? 20), 500),
+						maxWorkspaceFiles: Math.min(Math.max(0, maxWorkspaceFiles ?? 200), 500),
+						showRooIgnoredFiles: showRooIgnoredFiles ?? true,
+						enableSubfolderRules: enableSubfolderRules ?? false,
+						maxReadFileLine: maxReadFileLine ?? 500 /*kilocode_change*/,
+						maxImageFileSize: maxImageFileSize ?? 5,
+						maxTotalImageSize: maxTotalImageSize ?? 20,
+						maxConcurrentFileReads: cachedState.maxConcurrentFileReads ?? 5,
+						includeDiagnosticMessages:
+							includeDiagnosticMessages !== undefined ? includeDiagnosticMessages : true,
+						maxDiagnosticMessages: maxDiagnosticMessages ?? 50,
+						alwaysAllowSubtasks,
+						alwaysAllowFollowupQuestions: alwaysAllowFollowupQuestions ?? false,
+						followupAutoApproveTimeoutMs,
+						condensingApiConfigId: condensingApiConfigId || "",
+						includeTaskHistoryInEnhance: includeTaskHistoryInEnhance ?? true,
+						reasoningBlockCollapsed: reasoningBlockCollapsed ?? true,
+						enterBehavior: enterBehavior ?? "send",
+						includeCurrentTime: includeCurrentTime ?? true,
+						includeCurrentCost: includeCurrentCost ?? true,
+						maxGitStatusFiles: maxGitStatusFiles ?? 0,
+						profileThresholds,
+						imageGenerationProvider,
+						openRouterImageApiKey,
+						openRouterImageGenerationSelectedModel,
+						experiments,
+						customSupportPrompts,
+						aiCodeStatsWebhookUrl: (aiCodeStatsWebhookUrl ?? "").trim(), // kilocode_change
+					},
+				})
+				vscode.postMessage({ type: "ttsEnabled", bool: ttsEnabled })
+				vscode.postMessage({ type: "ttsSpeed", value: ttsSpeed })
+				vscode.postMessage({ type: "terminalCommandApiConfigId", text: terminalCommandApiConfigId || "" }) // kilocode_change
+				vscode.postMessage({ type: "showAutoApproveMenu", bool: showAutoApproveMenu }) // kilocode_change
+				vscode.postMessage({ type: "yoloMode", bool: yoloMode }) // kilocode_change
+				vscode.postMessage({ type: "allowVeryLargeReads", bool: allowVeryLargeReads }) // kilocode_change
+				vscode.postMessage({ type: "currentApiConfigName", text: currentApiConfigName })
+				vscode.postMessage({ type: "showTaskTimeline", bool: showTaskTimeline }) // kilocode_change
+				vscode.postMessage({ type: "sendMessageOnEnter", bool: sendMessageOnEnter }) // kilocode_change
+				vscode.postMessage({ type: "showTimestamps", bool: showTimestamps }) // kilocode_change
+				vscode.postMessage({ type: "showDiffStats", bool: cachedState.showDiffStats }) // kilocode_change
+				vscode.postMessage({ type: "hideCostBelowThreshold", value: hideCostBelowThreshold }) // kilocode_change
+				vscode.postMessage({ type: "updateCondensingPrompt", text: customCondensingPrompt || "" })
+				vscode.postMessage({ type: "yoloGatekeeperApiConfigId", text: yoloGatekeeperApiConfigId || "" }) // kilocode_change: AI gatekeeper for YOLO mode
+				vscode.postMessage({ type: "setReasoningBlockCollapsed", bool: reasoningBlockCollapsed ?? true })
+				vscode.postMessage({ type: "upsertApiConfiguration", text: editingApiConfigName, apiConfiguration }) // kilocode_change: Save to editing profile instead of current active profile
+				vscode.postMessage({ type: "telemetrySetting", text: telemetrySetting })
+				vscode.postMessage({ type: "systemNotificationsEnabled", bool: systemNotificationsEnabled }) // kilocode_change
+				vscode.postMessage({ type: "ghostServiceSettings", values: ghostServiceSettings }) // kilocode_change
+				vscode.postMessage({ type: "morphApiKey", text: morphApiKey }) // kilocode_change
+				vscode.postMessage({ type: "fastApplyModel", text: fastApplyModel }) // kilocode_change: Fast Apply model selection
+				vscode.postMessage({ type: "fastApplyApiProvider", text: fastApplyApiProvider }) // kilocode_change: Fast Apply model api base url
+				vscode.postMessage({ type: "kiloCodeImageApiKey", text: kiloCodeImageApiKey })
+				// kilocode_change start - Auto-purge settings
+				vscode.postMessage({ type: "autoPurgeEnabled", bool: autoPurgeEnabled })
+				vscode.postMessage({ type: "autoPurgeDefaultRetentionDays", value: autoPurgeDefaultRetentionDays })
+				vscode.postMessage({
+					type: "autoPurgeFavoritedTaskRetentionDays",
+					value: autoPurgeFavoritedTaskRetentionDays ?? undefined,
+				})
+				vscode.postMessage({
+					type: "autoPurgeCompletedTaskRetentionDays",
+					value: autoPurgeCompletedTaskRetentionDays,
+				})
+				vscode.postMessage({
+					type: "autoPurgeIncompleteTaskRetentionDays",
+					value: autoPurgeIncompleteTaskRetentionDays,
+				})
+				// kilocode_change end - Auto-purge settings
+				vscode.postMessage({ type: "debugSetting", bool: cachedState.debug })
+
+				// kilocode_change: After saving, sync cachedState to extensionState without clobbering
+				// the editing profile's apiConfiguration when editing a non-active profile.
+				if (editingApiConfigName !== currentApiConfigName) {
+					// Only sync non-apiConfiguration fields from extensionState
+					const { apiConfiguration: _, ...restOfExtensionState } = extensionState
+					setCachedState((prevState) => ({
+						...prevState,
+						...restOfExtensionState,
+					}))
+				} else {
+					// When editing the active profile, sync everything including apiConfiguration
+					setCachedState((prevState) => ({ ...prevState, ...extensionState }))
+				}
+				// kilocode_change end
+				setChangeDetected(false)
+				// kilocode_change start
+			} finally {
+				setIsSubmitting(false)
 			}
 			// kilocode_change end
-			setChangeDetected(false)
 		}
 	}
 
@@ -768,6 +867,7 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 			{ id: "checkpoints", icon: GitBranch },
 			{ id: "display", icon: Monitor }, // kilocode_change
 			{ id: "autocomplete" as const, icon: Bot }, // kilocode_change
+			{ id: "statistics" as const, icon: Activity }, // kilocode_change
 			{ id: "notifications", icon: Bell },
 			{ id: "contextManagement", icon: Database },
 			{ id: "terminal", icon: SquareTerminal },
@@ -939,7 +1039,7 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 							variant={isSettingValid ? "primary" : "secondary"}
 							className={!isSettingValid ? "!border-vscode-errorForeground" : ""}
 							onClick={handleSubmit}
-							disabled={!isChangeDetected || !isSettingValid}
+							disabled={!isChangeDetected || !isSettingValid || isSubmitting}
 							data-testid="save-button">
 							{t("settings:common.save")}
 						</Button>
@@ -1189,6 +1289,15 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 								onAutocompleteServiceSettingsChange={setAutocompleteServiceSettingsField}
 							/>
 						)}
+						{/* kilocode_change start */}
+						{activeTab === "statistics" && (
+							<StatisticsSettings
+								aiCodeStatsWebhookUrl={aiCodeStatsWebhookUrl}
+								setCachedStateField={setCachedStateField}
+								webhookValidationError={aiCodeStatsWebhookValidationError}
+							/>
+						)}
+						{/* kilocode_change end */}
 						{/* kilocode_change end display section */}
 
 						{/* Notifications Section */}

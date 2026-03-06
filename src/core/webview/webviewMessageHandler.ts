@@ -108,6 +108,10 @@ import { getTaskHistory } from "../../shared/kilocode/getTaskHistory" // kilocod
 import { fetchAndRefreshOrganizationModesOnStartup, refreshOrganizationModes } from "./kiloWebviewMessgeHandlerHelpers" // kilocode_change
 import { getSapAiCoreDeployments } from "../../api/providers/fetchers/sap-ai-core" // kilocode_change
 import { AutoPurgeScheduler } from "../../services/auto-purge" // kilocode_change
+import { fetchWithRetries } from "../../shared/http" // kilocode_change
+// kilocode_change start
+import { AiCodeStatsService, type AiCodeStatsRange, type AiCodeStatsRangeType } from "../../services/ai-code-stats"
+// kilocode_change end
 import { setPendingTodoList } from "../tools/UpdateTodoListTool"
 import { ManagedIndexer } from "../../services/code-index/managed/ManagedIndexer"
 import { SessionManager } from "../../shared/kilocode/cli-sessions/core/SessionManager" // kilocode_change
@@ -126,6 +130,27 @@ export const webviewMessageHandler = async (
 	const getCurrentCwd = () => {
 		return provider.getCurrentTask()?.cwd || provider.cwd
 	}
+
+	// kilocode_change start
+	const parseAiCodeStatsRange = (input: unknown): AiCodeStatsRange => {
+		const validTypes: AiCodeStatsRangeType[] = ["current", "last3days", "last7days", "last30days", "custom", "all"]
+		const fallback: AiCodeStatsRange = { type: "current" }
+		if (!input || typeof input !== "object") {
+			return fallback
+		}
+
+		const raw = input as Record<string, unknown>
+		const type =
+			typeof raw.type === "string" && validTypes.includes(raw.type as AiCodeStatsRangeType)
+				? (raw.type as AiCodeStatsRangeType)
+				: "current"
+
+		const startDate = typeof raw.startDate === "string" ? raw.startDate : undefined
+		const endDate = typeof raw.endDate === "string" ? raw.endDate : undefined
+
+		return { type, startDate, endDate }
+	}
+	// kilocode_change end
 
 	/**
 	 * Resolves image file mentions in incoming messages.
@@ -726,6 +751,12 @@ export const webviewMessageHandler = async (
 						if (!value) {
 							continue
 						}
+						// kilocode_change start
+					} else if (key === "aiCodeStatsUploadEnabled") {
+						newValue = value ?? false
+					} else if (key === "aiCodeStatsWebhookUrl") {
+						newValue = typeof value === "string" ? value.trim() : ""
+						// kilocode_change end
 					}
 
 					await provider.contextProxy.setValue(key as keyof RooCodeSettings, newValue)
@@ -1877,6 +1908,104 @@ export const webviewMessageHandler = async (
 				})
 			}
 			break
+		// kilocode_change start
+		case "testAiCodeStatsWebhook": {
+			const webhookUrl = typeof message.text === "string" ? message.text.trim() : ""
+			if (!webhookUrl) {
+				await provider.postMessageToWebview({
+					type: "aiCodeStatsWebhookTestResult",
+					success: false,
+					text: "",
+					values: {
+						errorCode: "webhook_required",
+					},
+				})
+				break
+			}
+
+			try {
+				const response = await fetchWithRetries({
+					url: webhookUrl,
+					method: "POST",
+					retries: 0,
+					timeout: 8_000,
+					shouldRetry: () => false,
+					headers: {
+						"Content-Type": "application/json",
+					},
+					body: JSON.stringify({
+						type: "ai_code_stats_webhook_test",
+						source: "kilocode-settings",
+						timestamp: Date.now(),
+					}),
+				})
+
+				if (!response.ok) {
+					const errorBody = await response.text().catch(() => "")
+					await provider.postMessageToWebview({
+						type: "aiCodeStatsWebhookTestResult",
+						success: false,
+						text: `Webhook test failed (${response.status} ${response.statusText})${
+							errorBody ? `: ${errorBody.slice(0, 200)}` : ""
+						}`,
+					})
+					break
+				}
+
+				await provider.postMessageToWebview({
+					type: "aiCodeStatsWebhookTestResult",
+					success: true,
+					text: "",
+				})
+			} catch (error) {
+				const errorMessage = error instanceof Error ? error.message : String(error)
+				await provider.postMessageToWebview({
+					type: "aiCodeStatsWebhookTestResult",
+					success: false,
+					text: errorMessage,
+				})
+			}
+			break
+		}
+		// kilocode_change end
+		// kilocode_change start
+		case "testAiCodeStatsUpload": {
+			const aiCodeStatsService = AiCodeStatsService.getInstance()
+			if (!aiCodeStatsService) {
+				await provider.postMessageToWebview({
+					type: "aiCodeStatsUploadTestResult",
+					success: false,
+					text: "AI code stats service is not initialized.",
+				})
+				break
+			}
+
+			try {
+				const range = parseAiCodeStatsRange((message.values as Record<string, unknown> | undefined)?.range)
+				const result = await aiCodeStatsService.triggerManualRangeUpload(range)
+				await provider.postMessageToWebview({
+					type: "aiCodeStatsUploadTestResult",
+					success: true,
+					text: "",
+					values: {
+						uploadedEvents: result.uploadedEvents,
+						timestamp: result.timestamp,
+					},
+				})
+			} catch (error) {
+				const errorMessage = error instanceof Error ? error.message : String(error)
+				const errorCode =
+					errorMessage === "Upload webhook URL is not configured." ? "webhook_not_configured" : undefined
+				await provider.postMessageToWebview({
+					type: "aiCodeStatsUploadTestResult",
+					success: false,
+					text: errorCode ? "" : errorMessage,
+					values: errorCode ? { errorCode } : undefined,
+				})
+			}
+			break
+		}
+		// kilocode_change end
 		// kilocode_change start
 		case "morphApiKey":
 			await updateGlobalState("morphApiKey", message.text)
@@ -3812,6 +3941,52 @@ export const webviewMessageHandler = async (
 			}
 			break
 		}
+		// kilocode_change start
+		case "getAiCodeStatsSummary": {
+			try {
+				const aiCodeStatsService = AiCodeStatsService.getInstance()
+				const range = parseAiCodeStatsRange((message.values as Record<string, unknown> | undefined)?.range)
+				const summary = aiCodeStatsService
+					? await aiCodeStatsService.getSummary()
+					: {
+							today: { agentLines: 0, totalLines: 0 },
+							total: { agentLines: 0, totalLines: 0 },
+							pendingEvents: 0,
+							lastUpload: { status: "idle" as const },
+							lastSuccessfulUploadAt: undefined,
+						}
+				const generatedLines = aiCodeStatsService ? await aiCodeStatsService.getGeneratedLines(range) : 0
+
+				await provider.postMessageToWebview({
+					type: "aiCodeStatsSummaryResponse",
+					values: {
+						...summary,
+						range,
+						generatedLines,
+					},
+				})
+			} catch (error) {
+				const errorMessage = error instanceof Error ? error.message : String(error)
+				provider.log(`Error getting AI code stats summary: ${errorMessage}`)
+				await provider.postMessageToWebview({
+					type: "aiCodeStatsSummaryResponse",
+					values: {
+						today: { agentLines: 0, totalLines: 0 },
+						total: { agentLines: 0, totalLines: 0 },
+						pendingEvents: 0,
+						generatedLines: 0,
+						range: { type: "current" as const },
+						lastSuccessfulUploadAt: undefined,
+						lastUpload: {
+							status: "failed",
+							message: errorMessage,
+						},
+					},
+				})
+			}
+			break
+		}
+		// kilocode_change end
 		// kilocode_change end - add getUsageData
 		// kilocode_change start - add toggleTaskFavorite
 		case "toggleTaskFavorite":

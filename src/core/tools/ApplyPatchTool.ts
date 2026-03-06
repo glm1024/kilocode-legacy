@@ -15,6 +15,9 @@ import { BaseTool, ToolCallbacks } from "./BaseTool"
 import type { ToolUse } from "../../shared/tools"
 import { parsePatch, ParseError, processAllHunks } from "./apply-patch"
 import type { ApplyPatchFileChange } from "./apply-patch"
+// kilocode_change start
+import { AiCodeStatsService } from "../../services/ai-code-stats"
+// kilocode_change end
 
 interface ApplyPatchParams {
 	patch: string
@@ -397,6 +400,28 @@ export class ApplyPatchTool extends BaseTool<"apply_patch"> {
 				const parentDir = path.dirname(moveAbsolutePath)
 				await fs.mkdir(parentDir, { recursive: true })
 				await fs.writeFile(moveAbsolutePath, newContent, "utf8")
+
+				// kilocode_change start
+				const aiCodeStatsService = AiCodeStatsService.getInstance()
+				if (aiCodeStatsService) {
+					try {
+						await aiCodeStatsService.recordAgentFileWrite({
+							cwd: task.cwd,
+							filePath: moveAbsolutePath,
+							relativePath: change.movePath,
+							originalContent,
+							newContent,
+							taskId: task.taskId,
+						})
+					} catch (error) {
+						console.warn(
+							`[ApplyPatchTool] Failed to record AI code stats for moved file '${change.movePath}': ${
+								error instanceof Error ? error.message : String(error)
+							}`,
+						)
+					}
+				}
+				// kilocode_change end
 			}
 
 			// Delete the original file

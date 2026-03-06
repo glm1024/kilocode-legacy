@@ -44,7 +44,48 @@
 		"about": "About Kilo Code",
 		"autoPurge": "Auto-Cleanup",
 		"agentBehaviour": "Agent Behaviour",
-		"autocomplete": "Autocomplete"
+		"autocomplete": "Autocomplete",
+		"statistics": "Statistics"
+	},
+	"statistics": {
+		"tip": "This page is used to track AI-generated code line counts and supports historical data backfill.",
+		"webhook": {
+			"label": "Upload Server URL",
+			"placeholder": "https://example.com/webhook",
+			"description": "Used to receive AI code statistics data. Once filled, scheduled automatic uploads will run.",
+			"test": {
+				"success": "Connectivity test succeeded",
+				"failed": "Connectivity test failed",
+				"failedPrefix": "Upload server URL connectivity test failed",
+				"required": "Please configure the upload server URL first.",
+				"timeout": "Connectivity test timed out. Please try again."
+			}
+		},
+		"generatedLines": {
+			"label": "Generated Code Lines",
+			"empty": "No data yet"
+		},
+		"range": {
+			"current": "Today",
+			"last3days": "Last 3 days",
+			"last7days": "This week",
+			"last30days": "This month",
+			"custom": "Custom range",
+			"all": "All"
+		},
+		"lastSuccessfulUpload": {
+			"label": "Last successful upload time",
+			"empty": "No successful uploads yet"
+		},
+		"uploadTest": {
+			"title": "Historical data backfill",
+			"description": "You can backfill historical data for the selected range. After the upload URL is configured, automatic uploads run daily at 13:00 local time.",
+			"button": "Backfill now",
+			"testing": "Backfilling...",
+			"success": "Backfill succeeded",
+			"failed": "Backfill failed",
+			"webhookRequired": "Please configure the upload server URL first."
+		}
 	},
 	"about": {
 		"bugReport": {

@@ -44,7 +44,48 @@
 		"about": "关于 Kilo Code",
 		"autoPurge": "自动清理",
 		"agentBehaviour": "智能体行为",
-		"autocomplete": "自动补全"
+		"autocomplete": "自动补全",
+		"statistics": "统计"
+	},
+	"statistics": {
+		"tip": "本页用于统计 AI 生成代码行数，并支持历史数据补传。",
+		"webhook": {
+			"label": "上报服务器地址",
+			"placeholder": "https://example.com/webhook",
+			"description": "用于接收 AI 代码统计数据，填写后将按计划自动上报。",
+			"test": {
+				"success": "连通测试成功",
+				"failed": "连通测试失败",
+				"failedPrefix": "上报服务器地址连通测试失败",
+				"required": "请先填写上报服务器地址。",
+				"timeout": "连通测试超时，请稍后重试。"
+			}
+		},
+		"generatedLines": {
+			"label": "生成代码行数",
+			"empty": "暂无数据"
+		},
+		"range": {
+			"current": "当天",
+			"last3days": "最近 3 天",
+			"last7days": "本周",
+			"last30days": "本月",
+			"custom": "自定义时间段",
+			"all": "全部"
+		},
+		"lastSuccessfulUpload": {
+			"label": "最近一次成功上报时间",
+			"empty": "尚无成功上报"
+		},
+		"uploadTest": {
+			"title": "历史数据补传",
+			"description": "可按所选时间范围补传历史数据；填写上报服务器地址后，系统会在本地时间每日 13:00 自动上报。",
+			"button": "点击补传",
+			"testing": "补传中...",
+			"success": "补传成功",
+			"failed": "补传失败",
+			"webhookRequired": "请先填写上报服务器地址。"
+		}
 	},
 	"about": {
 		"bugReport": {

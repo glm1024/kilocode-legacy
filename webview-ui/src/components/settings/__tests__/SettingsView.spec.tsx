@@ -1,6 +1,6 @@
 // pnpm --filter @roo-code/vscode-webview test src/components/settings/__tests__/SettingsView.spec.tsx
 
-import { render, screen, fireEvent, within } from "@/utils/test-utils"
+import { render, screen, fireEvent, waitFor, within } from "@/utils/test-utils"
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
 
 import { vscode } from "@/utils/vscode"
@@ -29,6 +29,21 @@ vi.mock("../ApiConfigManager", () => ({
 		</div>
 	),
 }))
+
+// kilocode_change start
+vi.mock("../StatisticsSettings", () => ({
+	StatisticsSettings: ({ aiCodeStatsWebhookUrl, setCachedStateField, webhookValidationError }: any) => (
+		<div data-testid="statistics-settings">
+			<input
+				data-testid="statistics-webhook-url-input"
+				value={aiCodeStatsWebhookUrl ?? ""}
+				onChange={(e) => setCachedStateField("aiCodeStatsWebhookUrl", (e.target as HTMLInputElement).value)}
+			/>
+			{webhookValidationError && <div data-testid="statistics-webhook-error">{webhookValidationError}</div>}
+		</div>
+	),
+}))
+// kilocode_change end
 
 vi.mock("@vscode/webview-ui-toolkit/react", () => ({
 	VSCodeButton: ({ children, onClick, appearance, "data-testid": dataTestId }: any) =>
@@ -299,6 +314,12 @@ const renderSettingsView = (initialState = {}) => {
 	const getSettingsContent = () => screen.getByTestId("settings-content")
 
 	return { onDone, activateTab, getSettingsContent }
+}
+
+const getPostMessageCallsByType = (type: string) => {
+	return (vscode.postMessage as any).mock.calls
+		.map((call: any[]) => call[0])
+		.filter((message: Record<string, unknown>) => message?.type === type)
 }
 
 describe("SettingsView - Sound Settings", () => {
@@ -605,6 +626,14 @@ describe("SettingsView - Allowed Commands", () => {
 			expect(screen.getByTestId("api-config-management")).toBeInTheDocument()
 		})
 
+		// kilocode_change start
+		it("renders statistics tab", () => {
+			renderSettingsView()
+
+			expect(screen.getByTestId("tab-statistics")).toBeInTheDocument()
+		})
+		// kilocode_change end
+
 		it("shows unsaved changes dialog when clicking Done with unsaved changes", () => {
 			// Render once and get the activateTab helper
 			const { activateTab, getSettingsContent } = renderSettingsView()
@@ -709,5 +738,96 @@ describe("SettingsView - Duplicate Commands", () => {
 				}),
 			}),
 		)
+	})
+})
+
+describe("SettingsView - Statistics Webhook Save Validation", () => {
+	beforeEach(() => {
+		vi.clearAllMocks()
+	})
+
+	it("tests changed non-empty webhook before save and continues when test succeeds", async () => {
+		const { activateTab } = renderSettingsView({
+			aiCodeStatsWebhookUrl: "https://old.example.com/webhook",
+		})
+		activateTab("statistics")
+
+		fireEvent.change(screen.getByTestId("statistics-webhook-url-input"), {
+			target: { value: "https://new.example.com/webhook" },
+		})
+		fireEvent.click(screen.getByTestId("save-button"))
+
+		expect(vscode.postMessage).toHaveBeenCalledWith({
+			type: "testAiCodeStatsWebhook",
+			text: "https://new.example.com/webhook",
+		})
+		expect(getPostMessageCallsByType("updateSettings")).toHaveLength(0)
+
+		window.postMessage(
+			{
+				type: "aiCodeStatsWebhookTestResult",
+				success: true,
+				text: "ok",
+			},
+			"*",
+		)
+
+		await waitFor(() => {
+			expect(getPostMessageCallsByType("updateSettings").length).toBeGreaterThan(0)
+		})
+
+		const updateSettings = getPostMessageCallsByType("updateSettings").at(-1)
+		expect(updateSettings.updatedSettings.aiCodeStatsWebhookUrl).toBe("https://new.example.com/webhook")
+	})
+
+	it("blocks save when webhook test fails", async () => {
+		const { activateTab } = renderSettingsView({
+			aiCodeStatsWebhookUrl: "https://old.example.com/webhook",
+		})
+		activateTab("statistics")
+
+		fireEvent.change(screen.getByTestId("statistics-webhook-url-input"), {
+			target: { value: "https://new.example.com/webhook" },
+		})
+		fireEvent.click(screen.getByTestId("save-button"))
+
+		expect(vscode.postMessage).toHaveBeenCalledWith({
+			type: "testAiCodeStatsWebhook",
+			text: "https://new.example.com/webhook",
+		})
+
+		window.postMessage(
+			{
+				type: "aiCodeStatsWebhookTestResult",
+				success: false,
+				text: "network failed",
+			},
+			"*",
+		)
+
+		await waitFor(() => {
+			expect(screen.getByTestId("statistics-webhook-error")).toHaveTextContent(
+				"settings:statistics.webhook.test.failed: network failed",
+			)
+		})
+
+		expect(getPostMessageCallsByType("showSystemNotification")).toHaveLength(0)
+		expect(getPostMessageCallsByType("updateSettings")).toHaveLength(0)
+	})
+
+	it("skips webhook test when normalized url is empty", () => {
+		const { activateTab } = renderSettingsView({
+			aiCodeStatsWebhookUrl: "https://old.example.com/webhook",
+		})
+		activateTab("statistics")
+
+		fireEvent.change(screen.getByTestId("statistics-webhook-url-input"), {
+			target: { value: "   " },
+		})
+		fireEvent.click(screen.getByTestId("save-button"))
+
+		expect(getPostMessageCallsByType("testAiCodeStatsWebhook")).toHaveLength(0)
+		const updateSettings = getPostMessageCallsByType("updateSettings").at(-1)
+		expect(updateSettings.updatedSettings.aiCodeStatsWebhookUrl).toBe("")
 	})
 })

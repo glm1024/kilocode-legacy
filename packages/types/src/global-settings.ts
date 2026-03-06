@@ -162,6 +162,10 @@ export const globalSettingsSchema = z.object({
 	autoPurgeCompletedTaskRetentionDays: z.number().min(1).optional(),
 	autoPurgeIncompleteTaskRetentionDays: z.number().min(1).optional(),
 	autoPurgeLastRunTimestamp: z.number().optional(),
+	// kilocode_change start - AI code stats upload settings
+	aiCodeStatsUploadEnabled: z.boolean().optional(),
+	aiCodeStatsWebhookUrl: z.string().optional(),
+	// kilocode_change end
 	// kilocode_change end
 
 	ttsEnabled: z.boolean().optional(),

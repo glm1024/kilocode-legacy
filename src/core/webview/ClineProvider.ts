@@ -78,6 +78,9 @@ import type { IndexProgressUpdate } from "../../services/code-index/interfaces/m
 import { MdmService } from "../../services/mdm/MdmService"
 import { SessionManager } from "../../shared/kilocode/cli-sessions/core/SessionManager"
 import { SkillsManager } from "../../services/skills/SkillsManager"
+// kilocode_change start
+import { AiCodeStatsService } from "../../services/ai-code-stats"
+// kilocode_change end
 
 import { fileExistsAtPath } from "../../utils/fs"
 import { setTtsEnabled, setTtsSpeed } from "../../utils/tts"
@@ -338,6 +341,7 @@ export class ClineProvider
 
 		// kilocode_change start - Initialize auto-purge scheduler
 		this.initializeAutoPurgeScheduler()
+		this.initializeAiCodeStatsService()
 		// kilocode_change end
 	}
 
@@ -377,6 +381,24 @@ export class ClineProvider
 		} catch (error) {
 			this.log(
 				`Failed to initialize auto-purge scheduler: ${error instanceof Error ? error.message : String(error)}`,
+			)
+		}
+	}
+
+	/**
+	 * Initialize AI code stats service (local logging is always enabled; upload is configurable).
+	 */
+	private initializeAiCodeStatsService() {
+		try {
+			const globalStoragePath = this.contextProxy.globalStorageUri.fsPath
+			const aiCodeStatsService = AiCodeStatsService.initialize(globalStoragePath, async () => ({
+				webhookUrl: this.contextProxy.getValue("aiCodeStatsWebhookUrl") ?? "",
+			}))
+			aiCodeStatsService.start()
+			this.log("AI code stats service initialized")
+		} catch (error) {
+			this.log(
+				`Failed to initialize AI code stats service: ${error instanceof Error ? error.message : String(error)}`,
 			)
 		}
 	}
@@ -704,6 +726,11 @@ export class ClineProvider
 
 		this.log("Disposed all disposables")
 		ClineProvider.activeInstances.delete(this)
+		// kilocode_change start
+		if (ClineProvider.activeInstances.size === 0) {
+			AiCodeStatsService.disposeInstance()
+		}
+		// kilocode_change end
 
 		// Clean up any event listeners attached to this provider
 		this.removeAllListeners()
@@ -2771,6 +2798,10 @@ export class ClineProvider
 			autoPurgeCompletedTaskRetentionDays: stateValues.autoPurgeCompletedTaskRetentionDays ?? 30,
 			autoPurgeIncompleteTaskRetentionDays: stateValues.autoPurgeIncompleteTaskRetentionDays ?? 7,
 			autoPurgeLastRunTimestamp: stateValues.autoPurgeLastRunTimestamp,
+			// kilocode_change start
+			aiCodeStatsUploadEnabled: stateValues.aiCodeStatsUploadEnabled ?? false,
+			aiCodeStatsWebhookUrl: stateValues.aiCodeStatsWebhookUrl ?? "",
+			// kilocode_change end
 			selectedMicrophoneDevice: stateValues.selectedMicrophoneDevice, // kilocode_change: Selected microphone device for STT
 			// kilocode_change end
 			experiments: stateValues.experiments ?? experimentDefault,
