@@ -1,5 +1,3 @@
-// kilocode_change - new file
-
 import { fireEvent, render, screen, waitFor } from "@/utils/test-utils"
 
 import { vscode } from "@/utils/vscode"
@@ -22,6 +20,8 @@ vi.mock("@/i18n/TranslationContext", () => ({
 				"settings:statistics.webhook.placeholder": "https://example.com/webhook",
 				"settings:statistics.webhook.description":
 					"Used to receive AI code statistics data. Once filled, scheduled automatic uploads will run.",
+				"settings:statistics.userName.label": "Username",
+				"settings:statistics.userName.placeholder": "e.g. Alice Zhang",
 				"settings:statistics.generatedLines.label": "Generated Code Lines",
 				"settings:statistics.generatedLines.empty": "No data yet",
 				"settings:statistics.range.current": "This day",
@@ -101,6 +101,34 @@ describe("StatisticsSettings", () => {
 
 		expect(setCachedStateField).toHaveBeenCalledWith("aiCodeStatsWebhookUrl", "https://hooks.example.com/ai")
 	})
+
+	// kilocode_change start
+	it("renders and updates the user name field", () => {
+		const setCachedStateField = vi.fn()
+		render(
+			<StatisticsSettings
+				aiCodeStatsWebhookUrl=""
+				aiCodeStatsUserName="Alice"
+				setCachedStateField={setCachedStateField}
+			/>,
+		)
+
+		fireEvent.change(screen.getByTestId("ai-code-stats-user-name"), {
+			target: { value: "Bob" },
+		})
+
+		expect(setCachedStateField).toHaveBeenCalledWith("aiCodeStatsUserName", "Bob")
+	})
+
+	it("renders the user name field before the webhook field", () => {
+		render(<StatisticsSettings aiCodeStatsWebhookUrl="" aiCodeStatsUserName="" setCachedStateField={vi.fn()} />)
+
+		const userNameInput = screen.getByTestId("ai-code-stats-user-name")
+		const webhookInput = screen.getByTestId("ai-code-stats-webhook-url")
+
+		expect(userNameInput.compareDocumentPosition(webhookInput) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+	})
+	// kilocode_change end
 
 	it("renders range generated lines and last successful upload time", async () => {
 		render(

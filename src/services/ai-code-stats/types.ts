@@ -1,5 +1,3 @@
-// kilocode_change - new file
-
 export type AiCodeSourceType = "autocomplete" | "agent_insert"
 export type AiCodeIde = "vscode" | "jetbrains"
 export type AiCodeUploadMode = "incremental" | "backfill"
@@ -16,10 +14,21 @@ export interface AiCodeStatsEvent {
 	timestamp: number
 	sourceType: AiCodeSourceType
 	ide: AiCodeIde
+	// kilocode_change start
+	userName?: string
+	userEmail?: string
+	organizationId?: string
+	organizationName?: string
+	sourceIp?: string
 	workspaceName: string
 	workspacePath: string
+	projectKey?: string
 	filePath: string
 	relativePath: string
+	language?: string
+	gitRemoteUrl?: string
+	gitBranch?: string
+	// kilocode_change end
 	lineStart: number
 	lineEnd: number
 	lineCount: number
@@ -67,6 +76,9 @@ export interface AiCodeStatsPersistedState {
 export interface AiCodeStatsUploadSettings {
 	enabled?: boolean
 	webhookUrl?: string
+	// kilocode_change start
+	userName?: string
+	// kilocode_change end
 }
 
 export interface AiCodeStatsUploadClient {

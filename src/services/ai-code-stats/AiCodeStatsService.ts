@@ -1,5 +1,3 @@
-// kilocode_change - new file
-
 import crypto from "crypto"
 import * as path from "path"
 import * as vscode from "vscode"
@@ -7,6 +5,9 @@ import * as vscode from "vscode"
 import { Package } from "../../shared/package"
 import { getKiloCodeWrapperProperties } from "../../core/kilocode/wrapper"
 import { AiCodeDiffExtractor } from "./AiCodeDiffExtractor"
+// kilocode_change start
+import { AiCodeStatsMetadataResolver } from "./AiCodeStatsMetadataResolver"
+// kilocode_change end
 import { AiCodeStatsScheduler } from "./AiCodeStatsScheduler"
 import { AiCodeStatsStore } from "./AiCodeStatsStore"
 import { AiCodeStatsUploader } from "./AiCodeStatsUploader"
@@ -54,6 +55,9 @@ export class AiCodeStatsService {
 	private readonly uploader: AiCodeStatsUploader
 	private readonly scheduler: AiCodeStatsScheduler
 	private readonly extractor: AiCodeDiffExtractor
+	// kilocode_change start
+	private readonly metadataResolver: AiCodeStatsMetadataResolver
+	// kilocode_change end
 	private readonly ide: AiCodeIde
 	private isUploading = false
 
@@ -65,6 +69,9 @@ export class AiCodeStatsService {
 		this.uploader = new AiCodeStatsUploader(this.store)
 		this.scheduler = new AiCodeStatsScheduler(13)
 		this.extractor = new AiCodeDiffExtractor()
+		// kilocode_change start
+		this.metadataResolver = new AiCodeStatsMetadataResolver()
+		// kilocode_change end
 		this.ide = detectIde()
 	}
 
@@ -164,6 +171,10 @@ export class AiCodeStatsService {
 		const relativePath = normalizePath(
 			record.relativePath ? record.relativePath : toRelativePath(workspacePath, filePath),
 		)
+		// kilocode_change start
+		const settings = await this.getUploadSettings()
+		const metadata = await this.metadataResolver.resolve(workspacePath, filePath, settings)
+		// kilocode_change end
 
 		const blocks = this.extractor.extractAddedBlocks(record.originalContent, record.newContent, relativePath)
 		if (blocks.length === 0) {
@@ -176,10 +187,21 @@ export class AiCodeStatsService {
 				timestamp: Date.now(),
 				sourceType: "agent_insert",
 				ide: this.ide,
+				// kilocode_change start
+				userName: metadata.userName,
+				userEmail: metadata.userEmail,
+				organizationId: metadata.organizationId,
+				organizationName: metadata.organizationName,
+				sourceIp: metadata.sourceIp,
 				workspaceName,
 				workspacePath,
+				projectKey: metadata.projectKey,
 				filePath,
 				relativePath,
+				language: metadata.language,
+				gitRemoteUrl: metadata.gitRemoteUrl,
+				gitBranch: metadata.gitBranch,
+				// kilocode_change end
 				lineStart: block.lineStart,
 				lineEnd: block.lineEnd,
 				lineCount: block.lineCount,

@@ -98,19 +98,23 @@ const CodeBlockContainer = styled.div`
 	background-color: ${CODE_BLOCK_BG_COLOR};
 `
 
-export const StyledPre = styled.div<{
-	preStyle?: React.CSSProperties
-	wordwrap?: "true" | "false" | undefined
-	windowshade?: "true" | "false"
-	collapsedHeight?: number
-}>`
+// kilocode_change start - use transient props plus the DOM style attribute to avoid CSSProperties/csstype version conflicts
+type StyledPreProps = {
+	$preStyle?: React.CSSProperties
+	$wordwrap?: "true" | "false" | undefined
+	$windowshade?: "true" | "false"
+	$collapsedHeight?: number
+}
+
+export const StyledPre = styled.div.attrs<StyledPreProps>(({ $preStyle }) => ({
+	style: $preStyle,
+}))<StyledPreProps>`
 	background-color: ${CODE_BLOCK_BG_COLOR};
-	max-height: ${({ windowshade, collapsedHeight }) =>
-		windowshade === "true" ? `${collapsedHeight || WINDOW_SHADE_SETTINGS.collapsedHeight}px` : "none"};
+	max-height: ${({ $windowshade, $collapsedHeight }) =>
+		$windowshade === "true" ? `${$collapsedHeight || WINDOW_SHADE_SETTINGS.collapsedHeight}px` : "none"};
 	overflow-y: auto;
 	padding: 10px;
 	border-radius: 5px;
-	${({ preStyle }) => preStyle && { ...preStyle }}
 
 	pre {
 		background-color: ${CODE_BLOCK_BG_COLOR};
@@ -124,9 +128,9 @@ export const StyledPre = styled.div<{
 	pre,
 	code {
 		/* Undefined wordwrap defaults to true (pre-wrap) behavior. */
-		white-space: ${({ wordwrap }) => (wordwrap === "false" ? "pre" : "pre-wrap")};
-		word-break: ${({ wordwrap }) => (wordwrap === "false" ? "normal" : "normal")};
-		overflow-wrap: ${({ wordwrap }) => (wordwrap === "false" ? "normal" : "break-word")};
+		white-space: ${({ $wordwrap }) => ($wordwrap === "false" ? "pre" : "pre-wrap")};
+		word-break: ${({ $wordwrap }) => ($wordwrap === "false" ? "normal" : "normal")};
+		overflow-wrap: ${({ $wordwrap }) => ($wordwrap === "false" ? "normal" : "break-word")};
 		font-size: var(--vscode-editor-font-size, var(--vscode-font-size, 12px));
 		font-family: var(--vscode-editor-font-family);
 	}
@@ -149,6 +153,7 @@ export const StyledPre = styled.div<{
 		background-color: ${CODE_BLOCK_BG_COLOR};
 	}
 `
+// kilocode_change end
 
 const LanguageSelect = styled.select`
 	font-size: 12px;
@@ -718,6 +723,7 @@ const CodeBlock = memo(
 // Memoized content component to prevent unnecessary re-renders of highlighted code
 const MemoizedCodeContent = memo(({ children }: { children: React.ReactNode }) => <>{children}</>)
 
+// kilocode_change start - keep external props stable while mapping internal style props to transient styled-components props
 // Memoized StyledPre component
 const MemoizedStyledPre = memo(
 	({
@@ -739,15 +745,16 @@ const MemoizedStyledPre = memo(
 	}) => (
 		<StyledPre
 			ref={preRef}
-			preStyle={preStyle}
-			wordwrap={wordWrap ? "true" : "false"}
-			windowshade={windowShade ? "true" : "false"}
-			collapsedHeight={collapsedHeight}
+			$preStyle={preStyle}
+			$wordwrap={wordWrap ? "true" : "false"}
+			$windowshade={windowShade ? "true" : "false"}
+			$collapsedHeight={collapsedHeight}
 			onMouseDown={() => updateCodeBlockButtonPosition(true)}
 			onMouseUp={() => updateCodeBlockButtonPosition(false)}>
 			<MemoizedCodeContent>{highlightedCode}</MemoizedCodeContent>
 		</StyledPre>
 	),
 )
+// kilocode_change end
 
 export default CodeBlock

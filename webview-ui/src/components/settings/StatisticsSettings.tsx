@@ -1,5 +1,3 @@
-// kilocode_change - new file
-
 import { HTMLAttributes, useEffect, useMemo, useRef, useState } from "react"
 import { VSCodeButton, VSCodeDropdown, VSCodeOption, VSCodeTextField } from "@vscode/webview-ui-toolkit/react"
 
@@ -13,7 +11,10 @@ import { SetCachedStateField } from "./types"
 
 type StatisticsSettingsProps = HTMLAttributes<HTMLDivElement> & {
 	aiCodeStatsWebhookUrl?: string
-	setCachedStateField: SetCachedStateField<"aiCodeStatsWebhookUrl">
+	// kilocode_change start
+	aiCodeStatsUserName?: string
+	setCachedStateField: SetCachedStateField<"aiCodeStatsWebhookUrl" | "aiCodeStatsUserName">
+	// kilocode_change end
 	webhookValidationError?: string
 }
 
@@ -77,6 +78,9 @@ const normalizeSummary = (value: unknown): AiCodeStatsSummaryResponse => {
 
 export const StatisticsSettings = ({
 	aiCodeStatsWebhookUrl,
+	// kilocode_change start
+	aiCodeStatsUserName,
+	// kilocode_change end
 	setCachedStateField,
 	webhookValidationError,
 	...props
@@ -188,6 +192,23 @@ export const StatisticsSettings = ({
 					<div className="text-vscode-descriptionForeground text-sm" data-testid="ai-code-stats-tip">
 						{t("settings:statistics.tip")}
 					</div>
+
+					{/* kilocode_change start */}
+					<SearchableSetting
+						settingId="statistics-user-name"
+						section="statistics"
+						label={t("settings:statistics.userName.label")}
+						className="flex flex-col gap-2.5">
+						<label className="block font-medium">{t("settings:statistics.userName.label")}</label>
+						<VSCodeTextField
+							className={controlWidthClass}
+							value={aiCodeStatsUserName ?? ""}
+							onChange={(e: any) => setCachedStateField("aiCodeStatsUserName", e.target.value)}
+							placeholder={t("settings:statistics.userName.placeholder")}
+							data-testid="ai-code-stats-user-name"
+						/>
+					</SearchableSetting>
+					{/* kilocode_change end */}
 
 					<SearchableSetting
 						settingId="statistics-webhook-url"

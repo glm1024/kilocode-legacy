@@ -1,0 +1,8 @@
+{
+	"statistics": {
+		"userName": {
+			"label": "用户名",
+			"placeholder": "例如：张三"
+		}
+	}
+}

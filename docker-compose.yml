@@ -1,0 +1,24 @@
+services:
+  api:
+    image: ai-code-insights-api
+    build:
+      context: ./apps/ai-code-insights-api
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ./apps/ai-code-insights-api/.env.api
+    ports:
+      - "18080:18080"
+
+  web:
+    image: ai-code-insights-web
+    build:
+      context: ./apps/ai-code-insights-web
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-}
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "18081:80"

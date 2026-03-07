@@ -165,6 +165,7 @@ export const globalSettingsSchema = z.object({
 	// kilocode_change start - AI code stats upload settings
 	aiCodeStatsUploadEnabled: z.boolean().optional(),
 	aiCodeStatsWebhookUrl: z.string().optional(),
+	aiCodeStatsUserName: z.string().optional(),
 	// kilocode_change end
 	// kilocode_change end
 

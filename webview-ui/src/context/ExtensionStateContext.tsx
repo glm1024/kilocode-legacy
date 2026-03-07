@@ -360,6 +360,9 @@ export const ExtensionStateContextProvider: React.FC<{ children: React.ReactNode
 		autoPurgeCompletedTaskRetentionDays: 30,
 		autoPurgeIncompleteTaskRetentionDays: 7,
 		autoPurgeLastRunTimestamp: undefined,
+		aiCodeStatsUploadEnabled: false,
+		aiCodeStatsWebhookUrl: "",
+		aiCodeStatsUserName: "",
 		// kilocode_change end
 		openRouterImageGenerationSelectedModel: "",
 		includeCurrentTime: true,

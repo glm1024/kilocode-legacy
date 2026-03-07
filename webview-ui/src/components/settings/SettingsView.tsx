@@ -168,6 +168,12 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 
 	const prevApiConfigName = useRef(currentApiConfigName)
 	const confirmDialogHandler = useRef<() => void>()
+	// kilocode_change start
+	const pendingSavedStatisticsStateRef = useRef<{
+		aiCodeStatsWebhookUrl: string
+		aiCodeStatsUserName: string
+	} | null>(null)
+	// kilocode_change end
 
 	const [cachedState, setCachedState] = useState(() => extensionState)
 
@@ -253,6 +259,7 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 		followupAutoApproveTimeoutMs,
 		ghostServiceSettings, // kilocode_change
 		aiCodeStatsWebhookUrl, // kilocode_change
+		aiCodeStatsUserName, // kilocode_change
 		// kilocode_change start - Auto-purge settings
 		autoPurgeEnabled,
 		autoPurgeDefaultRetentionDays,
@@ -353,6 +360,21 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 		// This prevents overwriting user changes that haven't been saved yet
 		// Also skip if we're loading a profile for editing
 		if (!isChangeDetected && !isLoadingProfileForEditing.current) {
+			// kilocode_change start
+			const pendingSavedStatisticsState = pendingSavedStatisticsStateRef.current
+			const hasPendingSavedStatisticsState = !!pendingSavedStatisticsState
+			const extensionStateMatchesPendingSavedStatistics =
+				hasPendingSavedStatisticsState &&
+				extensionState.aiCodeStatsWebhookUrl === pendingSavedStatisticsState.aiCodeStatsWebhookUrl &&
+				extensionState.aiCodeStatsUserName === pendingSavedStatisticsState.aiCodeStatsUserName
+			if (extensionStateMatchesPendingSavedStatistics) {
+				pendingSavedStatisticsStateRef.current = null
+			}
+			const statisticsStateOverrides =
+				hasPendingSavedStatisticsState && !extensionStateMatchesPendingSavedStatistics
+					? pendingSavedStatisticsState
+					: undefined
+			// kilocode_change end
 			// When editing a different profile than the active one,
 			// don't overwrite apiConfiguration from extensionState since it contains
 			// the active profile's config, not the editing profile's config
@@ -362,10 +384,18 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 				setCachedState((prevState) => ({
 					...prevState,
 					...restOfExtensionState,
+					// kilocode_change start
+					...statisticsStateOverrides,
+					// kilocode_change end
 				}))
 			} else {
 				// When editing the active profile, sync everything including apiConfiguration
-				setCachedState(extensionState)
+				// kilocode_change start
+				setCachedState({
+					...extensionState,
+					...statisticsStateOverrides,
+				})
+				// kilocode_change end
 			}
 		}
 	}, [extensionState, isChangeDetected, editingApiConfigName, currentApiConfigName])
@@ -610,6 +640,7 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 			setIsSubmitting(true)
 			try {
 				const normalizedWebhookUrl = (aiCodeStatsWebhookUrl ?? "").trim()
+				const normalizedUserName = (aiCodeStatsUserName ?? "").trim()
 				const originalWebhookUrl = (extensionState.aiCodeStatsWebhookUrl ?? "").trim()
 				const shouldTestWebhook = normalizedWebhookUrl.length > 0 && normalizedWebhookUrl !== originalWebhookUrl
 
@@ -699,7 +730,8 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 						openRouterImageGenerationSelectedModel,
 						experiments,
 						customSupportPrompts,
-						aiCodeStatsWebhookUrl: (aiCodeStatsWebhookUrl ?? "").trim(), // kilocode_change
+						aiCodeStatsWebhookUrl: normalizedWebhookUrl, // kilocode_change
+						aiCodeStatsUserName: normalizedUserName, // kilocode_change
 					},
 				})
 				vscode.postMessage({ type: "ttsEnabled", bool: ttsEnabled })
@@ -743,19 +775,16 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 				// kilocode_change end - Auto-purge settings
 				vscode.postMessage({ type: "debugSetting", bool: cachedState.debug })
 
-				// kilocode_change: After saving, sync cachedState to extensionState without clobbering
-				// the editing profile's apiConfiguration when editing a non-active profile.
-				if (editingApiConfigName !== currentApiConfigName) {
-					// Only sync non-apiConfiguration fields from extensionState
-					const { apiConfiguration: _, ...restOfExtensionState } = extensionState
-					setCachedState((prevState) => ({
-						...prevState,
-						...restOfExtensionState,
-					}))
-				} else {
-					// When editing the active profile, sync everything including apiConfiguration
-					setCachedState((prevState) => ({ ...prevState, ...extensionState }))
+				// kilocode_change start
+				pendingSavedStatisticsStateRef.current = {
+					aiCodeStatsWebhookUrl: normalizedWebhookUrl,
+					aiCodeStatsUserName: normalizedUserName,
 				}
+				setCachedState((prevState) => ({
+					...prevState,
+					aiCodeStatsWebhookUrl: normalizedWebhookUrl,
+					aiCodeStatsUserName: normalizedUserName,
+				}))
 				// kilocode_change end
 				setChangeDetected(false)
 				// kilocode_change start
@@ -1293,6 +1322,7 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 						{activeTab === "statistics" && (
 							<StatisticsSettings
 								aiCodeStatsWebhookUrl={aiCodeStatsWebhookUrl}
+								aiCodeStatsUserName={aiCodeStatsUserName}
 								setCachedStateField={setCachedStateField}
 								webhookValidationError={aiCodeStatsWebhookValidationError}
 							/>

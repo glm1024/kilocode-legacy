@@ -219,6 +219,9 @@ describe("SettingsView - Unsaved Changes Detection", () => {
 		openRouterImageApiKey: undefined,
 		openRouterImageGenerationSelectedModel: undefined,
 		reasoningBlockCollapsed: true,
+		aiCodeStatsUploadEnabled: false,
+		aiCodeStatsWebhookUrl: "",
+		aiCodeStatsUserName: "",
 	}
 
 	beforeEach(() => {

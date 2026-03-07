@@ -393,6 +393,9 @@ export class ClineProvider
 			const globalStoragePath = this.contextProxy.globalStorageUri.fsPath
 			const aiCodeStatsService = AiCodeStatsService.initialize(globalStoragePath, async () => ({
 				webhookUrl: this.contextProxy.getValue("aiCodeStatsWebhookUrl") ?? "",
+				// kilocode_change start
+				userName: this.contextProxy.getValue("aiCodeStatsUserName") ?? "",
+				// kilocode_change end
 			}))
 			aiCodeStatsService.start()
 			this.log("AI code stats service initialized")
@@ -2798,9 +2801,10 @@ export class ClineProvider
 			autoPurgeCompletedTaskRetentionDays: stateValues.autoPurgeCompletedTaskRetentionDays ?? 30,
 			autoPurgeIncompleteTaskRetentionDays: stateValues.autoPurgeIncompleteTaskRetentionDays ?? 7,
 			autoPurgeLastRunTimestamp: stateValues.autoPurgeLastRunTimestamp,
-			// kilocode_change start
 			aiCodeStatsUploadEnabled: stateValues.aiCodeStatsUploadEnabled ?? false,
 			aiCodeStatsWebhookUrl: stateValues.aiCodeStatsWebhookUrl ?? "",
+			// kilocode_change start - AI code stats user name
+			aiCodeStatsUserName: stateValues.aiCodeStatsUserName ?? "",
 			// kilocode_change end
 			selectedMicrophoneDevice: stateValues.selectedMicrophoneDevice, // kilocode_change: Selected microphone device for STT
 			// kilocode_change end

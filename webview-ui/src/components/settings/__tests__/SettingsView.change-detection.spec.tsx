@@ -214,6 +214,9 @@ describe("SettingsView - Change Detection Fix", () => {
 		openRouterImageApiKey: undefined,
 		openRouterImageGenerationSelectedModel: undefined,
 		reasoningBlockCollapsed: true,
+		aiCodeStatsUploadEnabled: false,
+		aiCodeStatsWebhookUrl: "",
+		aiCodeStatsUserName: "",
 		...overrides,
 	})
 

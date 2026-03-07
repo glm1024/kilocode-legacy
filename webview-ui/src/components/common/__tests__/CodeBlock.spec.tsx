@@ -159,6 +159,27 @@ describe("CodeBlock", () => {
 		expect(screen.getByText(/some code/)).toBeInTheDocument()
 	})
 
+	// kilocode_change start - cover forwarding preStyle through the DOM style prop
+	it("applies preStyle via inline styles", async () => {
+		const code = "const x = 1;"
+		let container: HTMLElement
+
+		await act(async () => {
+			;({ container } = render(
+				<CodeBlock
+					source={code}
+					language="typescript"
+					preStyle={{ marginTop: "12px", backgroundColor: "rgb(1, 2, 3)" }}
+				/>,
+			))
+		})
+
+		const preContainer = container!.firstElementChild?.firstElementChild
+		expect(preContainer).toHaveAttribute("style", expect.stringContaining("margin-top: 12px"))
+		expect(preContainer).toHaveAttribute("style", expect.stringContaining("background-color: rgb(1, 2, 3)"))
+	})
+	// kilocode_change end
+
 	it("handles WASM loading errors", async () => {
 		const mockError = new Error("WASM load failed")
 		const highlighterUtil = await import("../../../utils/highlighter")

@@ -32,12 +32,22 @@ vi.mock("../ApiConfigManager", () => ({
 
 // kilocode_change start
 vi.mock("../StatisticsSettings", () => ({
-	StatisticsSettings: ({ aiCodeStatsWebhookUrl, setCachedStateField, webhookValidationError }: any) => (
+	StatisticsSettings: ({
+		aiCodeStatsWebhookUrl,
+		aiCodeStatsUserName,
+		setCachedStateField,
+		webhookValidationError,
+	}: any) => (
 		<div data-testid="statistics-settings">
 			<input
 				data-testid="statistics-webhook-url-input"
 				value={aiCodeStatsWebhookUrl ?? ""}
 				onChange={(e) => setCachedStateField("aiCodeStatsWebhookUrl", (e.target as HTMLInputElement).value)}
+			/>
+			<input
+				data-testid="statistics-user-name-input"
+				value={aiCodeStatsUserName ?? ""}
+				onChange={(e) => setCachedStateField("aiCodeStatsUserName", (e.target as HTMLInputElement).value)}
 			/>
 			{webhookValidationError && <div data-testid="statistics-webhook-error">{webhookValidationError}</div>}
 		</div>
@@ -749,6 +759,7 @@ describe("SettingsView - Statistics Webhook Save Validation", () => {
 	it("tests changed non-empty webhook before save and continues when test succeeds", async () => {
 		const { activateTab } = renderSettingsView({
 			aiCodeStatsWebhookUrl: "https://old.example.com/webhook",
+			aiCodeStatsUserName: "Old Name",
 		})
 		activateTab("statistics")
 
@@ -779,6 +790,46 @@ describe("SettingsView - Statistics Webhook Save Validation", () => {
 		const updateSettings = getPostMessageCallsByType("updateSettings").at(-1)
 		expect(updateSettings.updatedSettings.aiCodeStatsWebhookUrl).toBe("https://new.example.com/webhook")
 	})
+
+	// kilocode_change start
+	it("trims the user name during save", async () => {
+		const { activateTab } = renderSettingsView({
+			aiCodeStatsWebhookUrl: "https://old.example.com/webhook",
+			aiCodeStatsUserName: "Old Name",
+		})
+		activateTab("statistics")
+
+		fireEvent.change(screen.getByTestId("statistics-user-name-input"), {
+			target: { value: "  Team Nine  " },
+		})
+		fireEvent.click(screen.getByTestId("save-button"))
+
+		await waitFor(() => {
+			expect(getPostMessageCallsByType("updateSettings").length).toBeGreaterThan(0)
+		})
+
+		const updateSettings = getPostMessageCallsByType("updateSettings").at(-1)
+		expect(updateSettings.updatedSettings.aiCodeStatsUserName).toBe("Team Nine")
+	})
+
+	it("keeps the saved user name visible before extension state round-trips back", async () => {
+		const { activateTab } = renderSettingsView({
+			aiCodeStatsWebhookUrl: "https://old.example.com/webhook",
+			aiCodeStatsUserName: "",
+		})
+		activateTab("statistics")
+
+		fireEvent.change(screen.getByTestId("statistics-user-name-input"), {
+			target: { value: "Team Nine" },
+		})
+		fireEvent.click(screen.getByTestId("save-button"))
+
+		await waitFor(() => {
+			expect(getPostMessageCallsByType("updateSettings").length).toBeGreaterThan(0)
+			expect(screen.getByTestId("statistics-user-name-input")).toHaveValue("Team Nine")
+		})
+	})
+	// kilocode_change end
 
 	it("blocks save when webhook test fails", async () => {
 		const { activateTab } = renderSettingsView({
@@ -818,6 +869,7 @@ describe("SettingsView - Statistics Webhook Save Validation", () => {
 	it("skips webhook test when normalized url is empty", () => {
 		const { activateTab } = renderSettingsView({
 			aiCodeStatsWebhookUrl: "https://old.example.com/webhook",
+			aiCodeStatsUserName: "Old Name",
 		})
 		activateTab("statistics")
 
