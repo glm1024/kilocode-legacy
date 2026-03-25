@@ -48,21 +48,39 @@
 		"statistics": "统计"
 	},
 	"statistics": {
-		"tip": "本页用于统计 AI 生成代码行数，并支持历史数据补传。",
+		"tip": "本页用于统计 AI 建议代码行数、AI 写入工作区的生成代码行数，以及 AI 最终进入提交的采纳代码行数，并支持历史数据补传。",
+		"suggestedLines": {
+			"label": "AI 建议代码行数",
+			"empty": "暂无数据"
+		},
 		"webhook": {
 			"label": "上报服务器地址",
-			"placeholder": "https://example.com/webhook",
-			"description": "用于接收 AI 代码统计数据，填写后将按计划自动上报。",
+			"placeholder": "例如：http://100.7.132.102:8081",
+			"description": "用于接收 AI 代码统计数据，填写后系统将按计划自动上报。",
 			"test": {
 				"success": "连通测试成功",
 				"failed": "连通测试失败",
 				"failedPrefix": "上报服务器地址连通测试失败",
 				"required": "请先填写上报服务器地址。",
-				"timeout": "连通测试超时，请稍后重试。"
+				"timeout": "连通测试超时，请检查服务器是否启动或稍后重试。",
+				"invalidUrl": "上报服务器地址格式不正确，请填写以 http:// 或 https:// 开头的地址。",
+				"endpointNotFound": "连通测试失败，请检查上报服务器地址是否正确。",
+				"badRequest": "连通测试失败，请检查上报服务器地址是否正确。",
+				"unauthorized": "服务器拒绝访问该接口（401/403）。请检查网关、鉴权配置，或确认该接口允许匿名访问。",
+				"httpError": "服务器返回了异常响应",
+				"networkError": "无法连接到上报服务器，请检查地址、端口和服务是否已启动。"
 			}
 		},
 		"generatedLines": {
-			"label": "生成代码行数",
+			"label": "AI 生成代码行数",
+			"empty": "暂无数据"
+		},
+		"committedLines": {
+			"label": "AI 采纳代码行数",
+			"empty": "暂无数据"
+		},
+		"adoptionRate": {
+			"label": "采纳率",
 			"empty": "暂无数据"
 		},
 		"range": {

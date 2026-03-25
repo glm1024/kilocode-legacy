@@ -27,7 +27,10 @@ interface AiCodeStatsRange {
 }
 
 interface AiCodeStatsSummaryResponse {
+	suggestedLines: number
 	generatedLines: number
+	committedLines: number
+	adoptionRate: number
 	lastSuccessfulUploadAt?: number
 }
 
@@ -37,7 +40,10 @@ interface AiCodeStatsUploadTestResult {
 }
 
 const EMPTY_SUMMARY: AiCodeStatsSummaryResponse = {
+	suggestedLines: 0,
 	generatedLines: 0,
+	committedLines: 0,
+	adoptionRate: 0,
 	lastSuccessfulUploadAt: undefined,
 }
 
@@ -71,7 +77,10 @@ const normalizeSummary = (value: unknown): AiCodeStatsSummaryResponse => {
 
 	const raw = value as Record<string, unknown>
 	return {
+		suggestedLines: toSafeNumber(raw.suggestedLines),
 		generatedLines: toSafeNumber(raw.generatedLines),
+		committedLines: toSafeNumber(raw.committedLines),
+		adoptionRate: typeof raw.adoptionRate === "number" ? raw.adoptionRate : 0,
 		lastSuccessfulUploadAt: typeof raw.lastSuccessfulUploadAt === "number" ? raw.lastSuccessfulUploadAt : undefined,
 	}
 }
@@ -182,7 +191,16 @@ export const StatisticsSettings = ({
 		})
 	}
 
-	const hasGeneratedLines = summary.generatedLines > 0
+	const hasAnyStats = summary.suggestedLines > 0 || summary.generatedLines > 0 || summary.committedLines > 0
+	const hasAdoptionStats = summary.generatedLines > 0 || summary.committedLines > 0
+	const adoptionRateText = useMemo(
+		() =>
+			new Intl.NumberFormat(undefined, {
+				style: "percent",
+				maximumFractionDigits: 1,
+			}).format(summary.adoptionRate),
+		[summary.adoptionRate],
+	)
 
 	return (
 		<div {...props}>
@@ -287,14 +305,69 @@ export const StatisticsSettings = ({
 							</div>
 						)}
 
-						<div
-							className={
-								hasGeneratedLines
-									? "text-2xl font-semibold leading-none"
-									: "text-vscode-descriptionForeground text-sm"
-							}
-							data-testid="ai-code-stats-generated-lines">
-							{hasGeneratedLines ? summary.generatedLines : t("settings:statistics.generatedLines.empty")}
+						<div className="grid grid-cols-1 gap-3 sm:grid-cols-4">
+							<div>
+								<div className="text-vscode-descriptionForeground text-xs">
+									{t("settings:statistics.suggestedLines.label")}
+								</div>
+								<div
+									className={
+										hasAnyStats
+											? "text-2xl font-semibold leading-none"
+											: "text-vscode-descriptionForeground text-sm"
+									}
+									data-testid="ai-code-stats-suggested-lines">
+									{hasAnyStats
+										? summary.suggestedLines
+										: t("settings:statistics.suggestedLines.empty")}
+								</div>
+							</div>
+							<div>
+								<div className="text-vscode-descriptionForeground text-xs">
+									{t("settings:statistics.generatedLines.label")}
+								</div>
+								<div
+									className={
+										hasAnyStats
+											? "text-2xl font-semibold leading-none"
+											: "text-vscode-descriptionForeground text-sm"
+									}
+									data-testid="ai-code-stats-generated-lines">
+									{hasAnyStats
+										? summary.generatedLines
+										: t("settings:statistics.generatedLines.empty")}
+								</div>
+							</div>
+							<div>
+								<div className="text-vscode-descriptionForeground text-xs">
+									{t("settings:statistics.committedLines.label")}
+								</div>
+								<div
+									className={
+										hasAnyStats
+											? "text-2xl font-semibold leading-none"
+											: "text-vscode-descriptionForeground text-sm"
+									}
+									data-testid="ai-code-stats-committed-lines">
+									{hasAnyStats
+										? summary.committedLines
+										: t("settings:statistics.committedLines.empty")}
+								</div>
+							</div>
+							<div>
+								<div className="text-vscode-descriptionForeground text-xs">
+									{t("settings:statistics.adoptionRate.label")}
+								</div>
+								<div
+									className={
+										hasAdoptionStats
+											? "text-2xl font-semibold leading-none"
+											: "text-vscode-descriptionForeground text-sm"
+									}
+									data-testid="ai-code-stats-adoption-rate">
+									{hasAdoptionStats ? adoptionRateText : t("settings:statistics.adoptionRate.empty")}
+								</div>
+							</div>
 						</div>
 					</SearchableSetting>
 

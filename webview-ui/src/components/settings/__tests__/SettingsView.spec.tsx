@@ -791,6 +791,40 @@ describe("SettingsView - Statistics Webhook Save Validation", () => {
 		expect(updateSettings.updatedSettings.aiCodeStatsWebhookUrl).toBe("https://new.example.com/webhook")
 	})
 
+	it("normalizes a root server URL before testing but preserves the user input when saving", async () => {
+		const { activateTab } = renderSettingsView({
+			aiCodeStatsWebhookUrl: "",
+		})
+		activateTab("statistics")
+
+		fireEvent.change(screen.getByTestId("statistics-webhook-url-input"), {
+			target: { value: "http://localhost:8081" },
+		})
+		fireEvent.click(screen.getByTestId("save-button"))
+
+		expect(vscode.postMessage).toHaveBeenCalledWith({
+			type: "testAiCodeStatsWebhook",
+			text: "http://localhost:8081/api/v1/ingest/ai-code-stats",
+		})
+
+		window.postMessage(
+			{
+				type: "aiCodeStatsWebhookTestResult",
+				success: true,
+				text: "",
+			},
+			"*",
+		)
+
+		await waitFor(() => {
+			expect(getPostMessageCallsByType("updateSettings").length).toBeGreaterThan(0)
+		})
+
+		const updateSettings = getPostMessageCallsByType("updateSettings").at(-1)
+		expect(updateSettings.updatedSettings.aiCodeStatsWebhookUrl).toBe("http://localhost:8081")
+		expect(screen.getByTestId("statistics-webhook-url-input")).toHaveValue("http://localhost:8081")
+	})
+
 	// kilocode_change start
 	it("trims the user name during save", async () => {
 		const { activateTab } = renderSettingsView({
@@ -863,6 +897,36 @@ describe("SettingsView - Statistics Webhook Save Validation", () => {
 		})
 
 		expect(getPostMessageCallsByType("showSystemNotification")).toHaveLength(0)
+		expect(getPostMessageCallsByType("updateSettings")).toHaveLength(0)
+	})
+
+	it("shows a specific validation message when the ingest endpoint is not found", async () => {
+		const { activateTab } = renderSettingsView({
+			aiCodeStatsWebhookUrl: "",
+		})
+		activateTab("statistics")
+
+		fireEvent.change(screen.getByTestId("statistics-webhook-url-input"), {
+			target: { value: "http://localhost:8081" },
+		})
+		fireEvent.click(screen.getByTestId("save-button"))
+
+		window.postMessage(
+			{
+				type: "aiCodeStatsWebhookTestResult",
+				success: false,
+				text: "",
+				values: { errorCode: "endpoint_not_found" },
+			},
+			"*",
+		)
+
+		await waitFor(() => {
+			expect(screen.getByTestId("statistics-webhook-error")).toHaveTextContent(
+				"settings:statistics.webhook.test.endpointNotFound",
+			)
+		})
+
 		expect(getPostMessageCallsByType("updateSettings")).toHaveLength(0)
 	})
 

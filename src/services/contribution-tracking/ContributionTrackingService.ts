@@ -7,6 +7,7 @@ import { fetchWithRetries } from "../../shared/http"
 import { getCurrentBranch } from "../code-index/managed/git-utils"
 import { getProjectId } from "../../utils/kilo-config-file"
 import { getGitRepositoryInfo } from "../../utils/git"
+import { AiCodeStatsService } from "../ai-code-stats/AiCodeStatsService"
 import {
 	type ContributionPayload,
 	type LineChange,
@@ -38,6 +39,18 @@ export class ContributionTrackingService {
 	private static readonly TOKEN_REFRESH_BUFFER_MS = 60 * 1000
 
 	private constructor() {}
+
+	private async recordSuggestedLinesLocally(params: TrackContributionParams): Promise<void> {
+		const aiCodeStatsService = AiCodeStatsService.getInstance()
+		if (!aiCodeStatsService) {
+			return
+		}
+
+		await aiCodeStatsService.recordAgentSuggestion({
+			originalContent: params.originalContent,
+			newContent: params.newContent,
+		})
+	}
 
 	/**
 	 * Get the singleton instance
@@ -291,6 +304,12 @@ export class ContributionTrackingService {
 	 */
 	async trackContribution(params: TrackContributionParams): Promise<void> {
 		try {
+			try {
+				await this.recordSuggestedLinesLocally(params)
+			} catch (error) {
+				console.error("[ContributionTracking] Failed to record local suggested lines:", error)
+			}
+
 			// Skip tracking if telemetry is disabled (respects user's privacy preferences)
 			if (TelemetryService.hasInstance() && !TelemetryService.instance.isTelemetryEnabled()) {
 				return

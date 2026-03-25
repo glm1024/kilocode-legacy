@@ -48,21 +48,39 @@
 		"statistics": "Statistics"
 	},
 	"statistics": {
-		"tip": "This page is used to track AI-generated code line counts and supports historical data backfill.",
+		"tip": "This page tracks AI suggested lines, AI generated code lines written into the workspace, and AI committed adoption lines, and supports historical data backfill.",
+		"suggestedLines": {
+			"label": "AI Suggested Code Lines",
+			"empty": "No data yet"
+		},
 		"webhook": {
 			"label": "Upload Server URL",
-			"placeholder": "https://example.com/webhook",
+			"placeholder": "e.g. http://100.7.132.102:8081",
 			"description": "Used to receive AI code statistics data. Once filled, scheduled automatic uploads will run.",
 			"test": {
 				"success": "Connectivity test succeeded",
 				"failed": "Connectivity test failed",
 				"failedPrefix": "Upload server URL connectivity test failed",
 				"required": "Please configure the upload server URL first.",
-				"timeout": "Connectivity test timed out. Please try again."
+				"timeout": "Connectivity test timed out. Please check whether the server is running and try again.",
+				"invalidUrl": "The upload server URL is invalid. Please use an address starting with http:// or https://.",
+				"endpointNotFound": "Connectivity test failed. Please check whether the upload server address is correct.",
+				"badRequest": "Connectivity test failed. Please check whether the upload server address is correct.",
+				"unauthorized": "The server rejected access to this endpoint (401/403). Check the gateway/auth configuration or confirm the endpoint allows anonymous access.",
+				"httpError": "The server returned an unexpected response",
+				"networkError": "Could not connect to the upload server. Check the address, port, and whether the server is running."
 			}
 		},
 		"generatedLines": {
-			"label": "Generated Code Lines",
+			"label": "AI Generated Code Lines",
+			"empty": "No data yet"
+		},
+		"committedLines": {
+			"label": "AI Committed Adoption Lines",
+			"empty": "No data yet"
+		},
+		"adoptionRate": {
+			"label": "Adoption Rate",
 			"empty": "No data yet"
 		},
 		"range": {

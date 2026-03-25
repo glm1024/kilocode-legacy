@@ -2,6 +2,7 @@
 
 import { fetchWithRetries } from "../../shared/http"
 import { AiCodeStatsStore } from "./AiCodeStatsStore"
+import { resolveAiCodeStatsWebhookUrl } from "./AiCodeStatsWebhookUrl"
 import {
 	normalizePath,
 	type AiCodeStatsEvent,
@@ -17,15 +18,12 @@ const DEFAULT_MAX_PAYLOAD_BYTES = 450_000
 
 export interface AiCodeStatsUploadContext {
 	client: AiCodeStatsUploadClient
-	backfillDays: number
 	maxEventsPerBatch?: number
 	maxPayloadBytes?: number
 }
 
 export interface AiCodeStatsUploadResult {
-	incrementalUploaded: number
-	backfillUploaded: number
-	backfillError?: string
+	uploaded: number
 }
 
 export interface AiCodeStatsRangeUploadContext {
@@ -47,48 +45,26 @@ export class AiCodeStatsUploader {
 		context: AiCodeStatsUploadContext,
 	): Promise<AiCodeStatsUploadResult> {
 		if (!settings.webhookUrl?.trim()) {
-			return {
-				incrementalUploaded: 0,
-				backfillUploaded: 0,
-			}
+			return { uploaded: 0 }
 		}
 
-		const webhookUrl = settings.webhookUrl.trim()
+		const webhookUrl = resolveAiCodeStatsWebhookUrl(settings.webhookUrl)
 		const maxEventsPerBatch = context.maxEventsPerBatch ?? DEFAULT_MAX_EVENTS_PER_BATCH
 		const maxPayloadBytes = context.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES
 
-		let incrementalUploaded = 0
-		let backfillUploaded = 0
-		let backfillError: string | undefined
+		let uploaded = 0
 
 		const pendingEvents = this.filterUploadableEvents(await this.store.getPendingEvents())
 		if (pendingEvents.length > 0) {
 			const batches = this.createBatches(pendingEvents, maxEventsPerBatch, maxPayloadBytes)
 			for (const batch of batches) {
 				await this.postEnvelope(webhookUrl, "incremental", batch, context.client)
-				incrementalUploaded += batch.length
+				uploaded += batch.length
 				await this.store.markEventsUploaded(batch.map((event) => event.eventId))
 			}
 		}
 
-		const backfillEvents = this.filterUploadableEvents(await this.store.getRecentEvents(context.backfillDays))
-		if (backfillEvents.length > 0) {
-			try {
-				const batches = this.createBatches(backfillEvents, maxEventsPerBatch, maxPayloadBytes)
-				for (const batch of batches) {
-					await this.postEnvelope(webhookUrl, "backfill", batch, context.client)
-					backfillUploaded += batch.length
-				}
-			} catch (error) {
-				backfillError = error instanceof Error ? error.message : String(error)
-			}
-		}
-
-		return {
-			incrementalUploaded,
-			backfillUploaded,
-			backfillError,
-		}
+		return { uploaded }
 	}
 
 	async uploadRange(
@@ -99,7 +75,7 @@ export class AiCodeStatsUploader {
 			return { uploaded: 0 }
 		}
 
-		const webhookUrl = settings.webhookUrl.trim()
+		const webhookUrl = resolveAiCodeStatsWebhookUrl(settings.webhookUrl)
 		const maxEventsPerBatch = context.maxEventsPerBatch ?? DEFAULT_MAX_EVENTS_PER_BATCH
 		const maxPayloadBytes = context.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES
 

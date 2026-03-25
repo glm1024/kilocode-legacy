@@ -3,11 +3,21 @@ import { describe, it, expect, vi, beforeEach } from "vitest"
 import { ContributionTrackingService } from "../ContributionTrackingService"
 import type { TrackContributionParams } from "../contribution-tracking-types"
 
+const { mockGetAiCodeStatsInstance, mockRecordAgentSuggestion } = vi.hoisted(() => ({
+	mockGetAiCodeStatsInstance: vi.fn(),
+	mockRecordAgentSuggestion: vi.fn(),
+}))
+
 // Mock dependencies
 vi.mock("../../../shared/http")
 vi.mock("../../code-index/managed/git-utils")
 vi.mock("../../../utils/kilo-config-file")
 vi.mock("../../../utils/git")
+vi.mock("../../ai-code-stats/AiCodeStatsService", () => ({
+	AiCodeStatsService: {
+		getInstance: mockGetAiCodeStatsInstance,
+	},
+}))
 vi.mock("../FormatterService", () => ({
 	FormatterService: {
 		getInstance: () => ({
@@ -26,6 +36,9 @@ describe("ContributionTrackingService", () => {
 		service.clearCachedToken()
 		// Clear all mocks
 		vi.clearAllMocks()
+		mockGetAiCodeStatsInstance.mockReturnValue({
+			recordAgentSuggestion: mockRecordAgentSuggestion,
+		})
 	})
 
 	describe("singleton pattern", () => {
@@ -221,6 +234,24 @@ describe("ContributionTrackingService", () => {
 	})
 
 	describe("trackContribution", () => {
+		it("should record suggested lines locally even when remote tracking is skipped", async () => {
+			const params: TrackContributionParams = {
+				cwd: "/test/repo",
+				filePath: "test.ts",
+				originalContent: "const x = 1",
+				newContent: "const x = 1\nconst y = 2",
+				status: "rejected",
+				kilocodeToken: "token",
+			}
+
+			await service.trackContribution(params)
+
+			expect(mockRecordAgentSuggestion).toHaveBeenCalledWith({
+				originalContent: "const x = 1",
+				newContent: "const x = 1\nconst y = 2",
+			})
+		})
+
 		it("should skip tracking when no organization ID", async () => {
 			const { fetchWithRetries } = await import("../../../shared/http")
 			const mockFetchWithRetries = vi.mocked(fetchWithRetries)

@@ -5,14 +5,17 @@ import * as path from "path"
 
 import { beforeEach, describe, expect, it } from "vitest"
 
+import { extractLineFeatures } from "../AiCodeLineFeatures"
 import { AiCodeStatsStore } from "../AiCodeStatsStore"
-import { type AiCodeStatsEvent } from "../types"
+import { hashLineFingerprint } from "../AiCodeLineFingerprint"
+import { type AiCodePendingLineAttribution, type AiCodeStatsEvent } from "../types"
 
 const buildEvent = (overrides: Partial<AiCodeStatsEvent> = {}): AiCodeStatsEvent => ({
 	eventId: overrides.eventId ?? `evt-${Math.random().toString(36).slice(2)}`,
 	timestamp: overrides.timestamp ?? Date.now(),
 	sourceType: overrides.sourceType ?? "agent_insert",
 	ide: overrides.ide ?? "vscode",
+	metricType: overrides.metricType ?? "generated",
 	workspaceName: overrides.workspaceName ?? "project",
 	workspacePath: overrides.workspacePath ?? "/workspace/project",
 	filePath: overrides.filePath ?? "/workspace/project/src/a.ts",
@@ -22,7 +25,45 @@ const buildEvent = (overrides: Partial<AiCodeStatsEvent> = {}): AiCodeStatsEvent
 	lineCount: overrides.lineCount ?? 1,
 	codeSnippet: overrides.codeSnippet ?? "const x = 1",
 	taskId: overrides.taskId,
+	matchStrategy: overrides.matchStrategy,
+	matchConfidence: overrides.matchConfidence,
+	equivalentLineCount: overrides.equivalentLineCount,
+	commitHash: overrides.commitHash,
+	commitOccurredAt: overrides.commitOccurredAt,
 })
+
+const buildPendingLine = (overrides: Partial<AiCodePendingLineAttribution> = {}): AiCodePendingLineAttribution => {
+	const rawLine = overrides.rawLine ?? "const value = 1"
+	const features = extractLineFeatures(rawLine)
+
+	return {
+		id: overrides.id ?? `line-${Math.random().toString(36).slice(2)}`,
+		generatedEventId: overrides.generatedEventId ?? "generated-1",
+		blockId: overrides.blockId ?? overrides.generatedEventId ?? "generated-1",
+		timestamp: overrides.timestamp ?? Date.now(),
+		sourceType: overrides.sourceType ?? "agent_insert",
+		ide: overrides.ide ?? "vscode",
+		workspaceName: overrides.workspaceName ?? "workspace",
+		workspacePath: overrides.workspacePath ?? "/workspace",
+		projectKey: overrides.projectKey ?? "project-key",
+		filePath: overrides.filePath ?? "/repo/src/a.ts",
+		relativePath: overrides.relativePath ?? "src/a.ts",
+		repoRoot: overrides.repoRoot ?? "/repo",
+		repoRelativePath: overrides.repoRelativePath ?? "src/a.ts",
+		language: overrides.language ?? "typescript",
+		gitRemoteUrl: overrides.gitRemoteUrl ?? "https://github.com/example/repo.git",
+		gitBranch: overrides.gitBranch ?? "feature/stats",
+		taskId: overrides.taskId,
+		rawLine,
+		blockLineIndex: overrides.blockLineIndex ?? overrides.occurrenceIndex ?? 1,
+		blockLineCount: overrides.blockLineCount ?? 1,
+		lineHash: overrides.lineHash ?? hashLineFingerprint(rawLine),
+		occurrenceIndex: overrides.occurrenceIndex ?? 1,
+		normalizedLine: overrides.normalizedLine ?? features.normalizedLine,
+		normalizedTokenLine: overrides.normalizedTokenLine ?? features.normalizedTokenLine,
+		rareIdentifiers: overrides.rareIdentifiers ?? features.rareIdentifiers,
+	}
+}
 
 describe("AiCodeStatsStore", () => {
 	let tmpDir: string
@@ -39,11 +80,59 @@ describe("AiCodeStatsStore", () => {
 		await store.appendEvent(buildEvent({ eventId: "e2", timestamp: now, sourceType: "agent_insert", lineCount: 5 }))
 
 		const summary = await store.getSummary(now)
-		expect(summary.today.agentLines).toBe(5)
-		expect(summary.today.totalLines).toBe(5)
-		expect(summary.total.agentLines).toBe(5)
-		expect(summary.total.totalLines).toBe(5)
+		expect(summary.today.suggestedLines).toBe(0)
+		expect(summary.today.generatedLines).toBe(5)
+		expect(summary.today.committedLines).toBe(0)
+		expect(summary.total.suggestedLines).toBe(0)
+		expect(summary.total.generatedLines).toBe(5)
+		expect(summary.total.committedLines).toBe(0)
 		expect(summary.pendingEvents).toBe(1)
+	})
+
+	it("tracks strict and equivalent committed lines separately", async () => {
+		const now = new Date("2026-03-05T08:00:00.000Z").getTime()
+		await store.appendEvent(
+			buildEvent({
+				eventId: "generated-1",
+				timestamp: now,
+				lineCount: 4,
+			}),
+		)
+		await store.appendEvent(
+			buildEvent({
+				eventId: "committed-1",
+				timestamp: now,
+				metricType: "committed",
+				lineCount: 3,
+				equivalentLineCount: 2.7345,
+				matchStrategy: "partial_block",
+				matchConfidence: 0.9115,
+				commitHash: "abc123",
+				commitOccurredAt: now,
+			}),
+		)
+
+		const summary = await store.getSummary(now)
+		expect(summary.today.committedLines).toBe(3)
+		expect(summary.today.strictCommittedLines).toBe(3)
+		expect(summary.today.equivalentCommittedLines).toBe(2.7345)
+		expect(summary.today.adoptionRate).toBe(0.75)
+		expect(summary.today.strictAdoptionRate).toBe(0.75)
+		expect(summary.today.equivalentAdoptionRate).toBeCloseTo(0.683625, 6)
+		expect(summary.total.equivalentCommittedLines).toBe(2.7345)
+	})
+
+	it("records suggested lines without creating detailed events", async () => {
+		const now = new Date("2026-03-05T08:00:00.000Z").getTime()
+		await store.addSuggestedLines(7, now)
+
+		const summary = await store.getSummary(now)
+		expect(summary.today.suggestedLines).toBe(7)
+		expect(summary.total.suggestedLines).toBe(7)
+		expect(summary.total.generatedLines).toBe(0)
+		expect(summary.total.committedLines).toBe(0)
+		expect(await store.getPendingEventCount()).toBe(0)
+		expect(await store.getSuggestedLinesForRange({ type: "current" }, now)).toBe(7)
 	})
 
 	it("marks uploaded events and keeps pending cursor", async () => {
@@ -198,6 +287,66 @@ describe("AiCodeStatsStore", () => {
 				now,
 			),
 		).toBe(10)
+	})
+
+	it("loads legacy state files without repo commit cursors", async () => {
+		const baseDir = path.join(tmpDir, "ai-code-stats", "v1")
+		await fs.mkdir(baseDir, { recursive: true })
+		await fs.writeFile(
+			path.join(baseDir, "state.json"),
+			JSON.stringify({
+				version: 1,
+				dailyAggregates: {},
+				pendingEventIds: [],
+				lastUpload: { status: "idle" },
+			}),
+			"utf8",
+		)
+
+		const reloadedStore = new AiCodeStatsStore(tmpDir)
+		const state = await reloadedStore.getRawStateForTests()
+		expect(state.repoObservedCommits).toEqual({})
+	})
+
+	it("keeps legacy last upload triggers when loading old state", async () => {
+		const baseDir = path.join(tmpDir, "ai-code-stats", "v1")
+		await fs.mkdir(baseDir, { recursive: true })
+		await fs.writeFile(
+			path.join(baseDir, "state.json"),
+			JSON.stringify({
+				version: 1,
+				dailyAggregates: {},
+				pendingEventIds: [],
+				lastUpload: {
+					status: "success",
+					timestamp: 1_772_500_000_000,
+					mode: "incremental",
+					trigger: "daily",
+					uploadedEvents: 3,
+				},
+			}),
+			"utf8",
+		)
+
+		const reloadedStore = new AiCodeStatsStore(tmpDir)
+		const summary = await reloadedStore.getSummary()
+		expect(summary.lastUpload).toMatchObject({
+			status: "success",
+			trigger: "daily",
+			mode: "incremental",
+			uploadedEvents: 3,
+		})
+	})
+
+	it("clears repo commit cursors when a repo no longer has pending lines", async () => {
+		const pendingLine: AiCodePendingLineAttribution = buildPendingLine({ id: "line-1" })
+
+		await store.addPendingLineAttributions([pendingLine])
+		await store.setRepoObservedCommit("/repo", "abc123")
+		expect(await store.getRepoObservedCommit("/repo")).toBe("abc123")
+
+		await store.removePendingLineAttributions(["line-1"])
+		expect(await store.getRepoObservedCommit("/repo")).toBeUndefined()
 	})
 })
 

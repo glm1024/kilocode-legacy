@@ -100,6 +100,9 @@ importers:
         specifier: ^18.3.1
         version: 18.3.1(react@18.3.1)
     devDependencies:
+      '@roo-code/config-eslint':
+        specifier: workspace:^
+        version: link:../../packages/config-eslint
       '@testing-library/jest-dom':
         specifier: ^6.6.3
         version: 6.6.3

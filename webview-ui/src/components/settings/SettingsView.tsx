@@ -102,6 +102,24 @@ export const settingsTabTrigger =
 	"whitespace-nowrap overflow-hidden min-w-0 h-12 px-4 py-3 box-border flex items-center border-l-2 border-transparent text-vscode-foreground opacity-70 hover:bg-vscode-list-hoverBackground data-[compact=true]:w-12 data-[compact=true]:p-4 cursor-pointer" // kilocode_change add cursor-pointer
 export const settingsTabTriggerActive =
 	"opacity-100 border-vscode-focusBorder bg-vscode-list-activeSelectionBackground hover:bg-vscode-list-activeSelectionBackground cursor-default" // kilocode_change add hover:bg-* and cursor-default
+const AI_CODE_STATS_INGEST_PATH = "/api/v1/ingest/ai-code-stats"
+
+const normalizeAiCodeStatsWebhookUrl = (value: string): string => {
+	const trimmed = value.trim()
+	if (!trimmed) {
+		return ""
+	}
+
+	try {
+		const parsedUrl = new URL(trimmed)
+		const normalizedPathname = parsedUrl.pathname.replace(/\/+$/, "") || "/"
+		parsedUrl.pathname = normalizedPathname === "/" ? AI_CODE_STATS_INGEST_PATH : normalizedPathname
+		parsedUrl.hash = ""
+		return parsedUrl.toString()
+	} catch {
+		return trimmed
+	}
+}
 
 export interface SettingsViewRef {
 	checkUnsaveChanges: (then: () => void) => void
@@ -608,14 +626,37 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 
 					const rawMessage =
 						typeof message.text === "string" && message.text.trim().length > 0 ? message.text : ""
-					const errorCode = (message.values as Record<string, unknown> | undefined)?.errorCode
+					const details = message.values as Record<string, unknown> | undefined
+					const errorCode = details?.errorCode
+					const statusText =
+						typeof details?.statusText === "string" && details.statusText.trim().length > 0
+							? details.statusText
+							: ""
+					const httpStatusLabel =
+						typeof details?.status === "number"
+							? [String(details.status), statusText].filter(Boolean).join(" ")
+							: ""
 					const localizedMessage = message.success
 						? t("settings:statistics.webhook.test.success")
 						: errorCode === "webhook_required"
 							? t("settings:statistics.webhook.test.required")
-							: rawMessage
-								? `${t("settings:statistics.webhook.test.failed")}: ${rawMessage}`
-								: t("settings:statistics.webhook.test.failed")
+							: errorCode === "invalid_url" || errorCode === "unsupported_protocol"
+								? t("settings:statistics.webhook.test.invalidUrl")
+								: errorCode === "endpoint_not_found"
+									? t("settings:statistics.webhook.test.endpointNotFound")
+									: errorCode === "bad_request"
+										? t("settings:statistics.webhook.test.badRequest")
+										: errorCode === "unauthorized"
+											? t("settings:statistics.webhook.test.unauthorized")
+											: errorCode === "network_error"
+												? t("settings:statistics.webhook.test.networkError")
+												: errorCode === "http_error"
+													? httpStatusLabel
+														? `${t("settings:statistics.webhook.test.httpError")}: ${httpStatusLabel}`
+														: t("settings:statistics.webhook.test.httpError")
+													: rawMessage
+														? `${t("settings:statistics.webhook.test.failed")}: ${rawMessage}`
+														: t("settings:statistics.webhook.test.failed")
 
 					settle({
 						success: !!message.success,
@@ -626,7 +667,7 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 				window.addEventListener("message", handleMessage)
 				vscode.postMessage({
 					type: "testAiCodeStatsWebhook",
-					text: webhookUrl,
+					text: normalizeAiCodeStatsWebhookUrl(webhookUrl),
 				})
 			})
 		},
@@ -639,10 +680,11 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 			// kilocode_change start
 			setIsSubmitting(true)
 			try {
-				const normalizedWebhookUrl = (aiCodeStatsWebhookUrl ?? "").trim()
+				const trimmedWebhookUrl = (aiCodeStatsWebhookUrl ?? "").trim()
+				const normalizedWebhookUrl = normalizeAiCodeStatsWebhookUrl(trimmedWebhookUrl)
 				const normalizedUserName = (aiCodeStatsUserName ?? "").trim()
 				const originalWebhookUrl = (extensionState.aiCodeStatsWebhookUrl ?? "").trim()
-				const shouldTestWebhook = normalizedWebhookUrl.length > 0 && normalizedWebhookUrl !== originalWebhookUrl
+				const shouldTestWebhook = normalizedWebhookUrl.length > 0 && trimmedWebhookUrl !== originalWebhookUrl
 
 				if (shouldTestWebhook) {
 					const testResult = await testAiCodeStatsWebhook(normalizedWebhookUrl)
@@ -730,7 +772,7 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 						openRouterImageGenerationSelectedModel,
 						experiments,
 						customSupportPrompts,
-						aiCodeStatsWebhookUrl: normalizedWebhookUrl, // kilocode_change
+						aiCodeStatsWebhookUrl: trimmedWebhookUrl, // kilocode_change
 						aiCodeStatsUserName: normalizedUserName, // kilocode_change
 					},
 				})
@@ -777,12 +819,12 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 
 				// kilocode_change start
 				pendingSavedStatisticsStateRef.current = {
-					aiCodeStatsWebhookUrl: normalizedWebhookUrl,
+					aiCodeStatsWebhookUrl: trimmedWebhookUrl,
 					aiCodeStatsUserName: normalizedUserName,
 				}
 				setCachedState((prevState) => ({
 					...prevState,
-					aiCodeStatsWebhookUrl: normalizedWebhookUrl,
+					aiCodeStatsWebhookUrl: trimmedWebhookUrl,
 					aiCodeStatsUserName: normalizedUserName,
 				}))
 				// kilocode_change end

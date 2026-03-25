@@ -108,9 +108,13 @@ import { getTaskHistory } from "../../shared/kilocode/getTaskHistory" // kilocod
 import { fetchAndRefreshOrganizationModesOnStartup, refreshOrganizationModes } from "./kiloWebviewMessgeHandlerHelpers" // kilocode_change
 import { getSapAiCoreDeployments } from "../../api/providers/fetchers/sap-ai-core" // kilocode_change
 import { AutoPurgeScheduler } from "../../services/auto-purge" // kilocode_change
-import { fetchWithRetries } from "../../shared/http" // kilocode_change
+import { fetchWithRetries, RequestTimedOutError } from "../../shared/http" // kilocode_change
 // kilocode_change start
 import { AiCodeStatsService, type AiCodeStatsRange, type AiCodeStatsRangeType } from "../../services/ai-code-stats"
+import {
+	InvalidAiCodeStatsWebhookUrlError,
+	resolveAiCodeStatsWebhookUrl,
+} from "../../services/ai-code-stats/AiCodeStatsWebhookUrl"
 // kilocode_change end
 import { setPendingTodoList } from "../tools/UpdateTodoListTool"
 import { ManagedIndexer } from "../../services/code-index/managed/ManagedIndexer"
@@ -1926,8 +1930,9 @@ export const webviewMessageHandler = async (
 			}
 
 			try {
+				const resolvedWebhookUrl = resolveAiCodeStatsWebhookUrl(webhookUrl)
 				const response = await fetchWithRetries({
-					url: webhookUrl,
+					url: resolvedWebhookUrl,
 					method: "POST",
 					retries: 0,
 					timeout: 8_000,
@@ -1944,12 +1949,26 @@ export const webviewMessageHandler = async (
 
 				if (!response.ok) {
 					const errorBody = await response.text().catch(() => "")
+					const errorCode =
+						response.status === 404
+							? "endpoint_not_found"
+							: response.status === 400
+								? "bad_request"
+								: response.status === 401 || response.status === 403
+									? "unauthorized"
+									: "http_error"
 					await provider.postMessageToWebview({
 						type: "aiCodeStatsWebhookTestResult",
 						success: false,
-						text: `Webhook test failed (${response.status} ${response.statusText})${
-							errorBody ? `: ${errorBody.slice(0, 200)}` : ""
-						}`,
+						text:
+							errorCode === "http_error"
+								? `${response.status} ${response.statusText}${errorBody ? `: ${errorBody.slice(0, 200)}` : ""}`
+								: "",
+						values: {
+							errorCode,
+							status: response.status,
+							statusText: response.statusText,
+						},
 					})
 					break
 				}
@@ -1960,11 +1979,22 @@ export const webviewMessageHandler = async (
 					text: "",
 				})
 			} catch (error) {
-				const errorMessage = error instanceof Error ? error.message : String(error)
+				let errorCode = "network_error"
+				let errorMessage = ""
+				if (error instanceof InvalidAiCodeStatsWebhookUrlError) {
+					errorCode = error.code
+				} else if (error instanceof RequestTimedOutError) {
+					errorCode = "timeout"
+				} else {
+					errorMessage = error instanceof Error ? error.message : String(error)
+				}
 				await provider.postMessageToWebview({
 					type: "aiCodeStatsWebhookTestResult",
 					success: false,
 					text: errorMessage,
+					values: {
+						errorCode,
+					},
 				})
 			}
 			break
@@ -3951,20 +3981,26 @@ export const webviewMessageHandler = async (
 				const summary = aiCodeStatsService
 					? await aiCodeStatsService.getSummary()
 					: {
-							today: { agentLines: 0, totalLines: 0 },
-							total: { agentLines: 0, totalLines: 0 },
+							today: { suggestedLines: 0, generatedLines: 0, committedLines: 0, adoptionRate: 0 },
+							total: { suggestedLines: 0, generatedLines: 0, committedLines: 0, adoptionRate: 0 },
 							pendingEvents: 0,
 							lastUpload: { status: "idle" as const },
 							lastSuccessfulUploadAt: undefined,
 						}
+				const suggestedLines = aiCodeStatsService ? await aiCodeStatsService.getSuggestedLines(range) : 0
 				const generatedLines = aiCodeStatsService ? await aiCodeStatsService.getGeneratedLines(range) : 0
+				const committedLines = aiCodeStatsService ? await aiCodeStatsService.getCommittedLines(range) : 0
+				const adoptionRate = generatedLines > 0 ? committedLines / generatedLines : 0
 
 				await provider.postMessageToWebview({
 					type: "aiCodeStatsSummaryResponse",
 					values: {
 						...summary,
 						range,
+						suggestedLines,
 						generatedLines,
+						committedLines,
+						adoptionRate,
 					},
 				})
 			} catch (error) {
@@ -3973,10 +4009,13 @@ export const webviewMessageHandler = async (
 				await provider.postMessageToWebview({
 					type: "aiCodeStatsSummaryResponse",
 					values: {
-						today: { agentLines: 0, totalLines: 0 },
-						total: { agentLines: 0, totalLines: 0 },
+						today: { suggestedLines: 0, generatedLines: 0, committedLines: 0, adoptionRate: 0 },
+						total: { suggestedLines: 0, generatedLines: 0, committedLines: 0, adoptionRate: 0 },
 						pendingEvents: 0,
+						suggestedLines: 0,
 						generatedLines: 0,
+						committedLines: 0,
+						adoptionRate: 0,
 						range: { type: "current" as const },
 						lastSuccessfulUploadAt: undefined,
 						lastUpload: {

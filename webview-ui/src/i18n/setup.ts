@@ -37,7 +37,7 @@ Object.entries(localeFiles).forEach(([path, module]) => {
 	// Extract language and namespace from path
 	// Example path: './locales/en/common.json' -> language: 'en', namespace: 'common'
 	// kilocode_change start
-	const match = path.match(/\.\/locales\/([^/]+)\/([^.\/]+)(?:\.[^/]+)?\.json/)
+	const match = path.match(/\.\/locales\/([^/]+)\/([^./]+)(?:\.[^/]+)?\.json/)
 	// kilocode_change end
 
 	if (match) {

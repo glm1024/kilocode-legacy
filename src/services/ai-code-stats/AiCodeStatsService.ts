@@ -1,22 +1,25 @@
 import crypto from "crypto"
+import { exec as execCallback } from "child_process"
 import * as path from "path"
+import { promisify } from "util"
 import * as vscode from "vscode"
 
 import { Package } from "../../shared/package"
 import { getKiloCodeWrapperProperties } from "../../core/kilocode/wrapper"
+import { AiCodeCommitAttributionService } from "./AiCodeCommitAttributionService"
 import { AiCodeDiffExtractor } from "./AiCodeDiffExtractor"
+import { extractLineFeatures } from "./AiCodeLineFeatures"
+import { hashLineFingerprint } from "./AiCodeLineFingerprint"
 // kilocode_change start
 import { AiCodeStatsMetadataResolver } from "./AiCodeStatsMetadataResolver"
 // kilocode_change end
-import { AiCodeStatsScheduler } from "./AiCodeStatsScheduler"
 import { AiCodeStatsStore } from "./AiCodeStatsStore"
 import { AiCodeStatsUploader } from "./AiCodeStatsUploader"
 import {
-	AI_CODE_STATS_BACKFILL_DAYS,
 	AI_CODE_STATS_RETENTION_DAYS,
-	AI_CODE_STATS_THRESHOLD,
 	normalizePath,
 	type AiCodeIde,
+	type AiCodePendingLineAttribution,
 	type AiCodeStatsEvent,
 	type AiCodeStatsLastUpload,
 	type AiCodeStatsRange,
@@ -24,14 +27,53 @@ import {
 	type AiCodeStatsUploadSettings,
 } from "./types"
 
+const execAsync = promisify(execCallback)
+const EXEC_MAX_BUFFER_BYTES = 4 * 1024 * 1024
+
 const toRelativePath = (workspacePath: string, filePath: string): string => {
 	const relative = path.relative(workspacePath, filePath)
 	return normalizePath(relative || path.basename(filePath))
 }
 
+const normalizeContentLines = (content: string): string[] => {
+	const normalized = content.replace(/\r\n/g, "\n")
+	const lines = normalized.split("\n")
+	if (normalized.endsWith("\n")) {
+		lines.pop()
+	}
+	return lines
+}
+
+const buildLineOccurrenceIndexes = (content: string): number[] => {
+	const counts = new Map<string, number>()
+	const indexes: number[] = []
+
+	for (const line of normalizeContentLines(content)) {
+		const lineHash = hashLineFingerprint(line)
+		const nextIndex = (counts.get(lineHash) ?? 0) + 1
+		counts.set(lineHash, nextIndex)
+		indexes.push(nextIndex)
+	}
+
+	return indexes
+}
+
 const detectIde = (): AiCodeIde => {
 	const wrapper = getKiloCodeWrapperProperties()
 	return wrapper.kiloCodeWrapped && wrapper.kiloCodeWrapperJetbrains ? "jetbrains" : "vscode"
+}
+
+const resolveGitRepositoryRoot = async (cwd: string): Promise<string | undefined> => {
+	try {
+		const { stdout } = await execAsync("git rev-parse --show-toplevel", {
+			cwd,
+			maxBuffer: EXEC_MAX_BUFFER_BYTES,
+		})
+		const repoRoot = stdout.trim()
+		return repoRoot ? normalizePath(path.resolve(repoRoot)) : undefined
+	} catch {
+		return undefined
+	}
 }
 
 export interface AgentFileWriteRecord {
@@ -41,6 +83,12 @@ export interface AgentFileWriteRecord {
 	originalContent: string
 	newContent: string
 	taskId?: string
+}
+
+export interface AgentSuggestionRecord {
+	originalContent: string
+	newContent: string
+	timestamp?: number
 }
 
 export interface AiCodeStatsManualUploadResult {
@@ -53,13 +101,14 @@ export class AiCodeStatsService {
 
 	private readonly store: AiCodeStatsStore
 	private readonly uploader: AiCodeStatsUploader
-	private readonly scheduler: AiCodeStatsScheduler
 	private readonly extractor: AiCodeDiffExtractor
+	private readonly commitAttributionService: AiCodeCommitAttributionService
 	// kilocode_change start
 	private readonly metadataResolver: AiCodeStatsMetadataResolver
 	// kilocode_change end
 	private readonly ide: AiCodeIde
 	private isUploading = false
+	private uploadRequestedWhileRunning = false
 
 	private constructor(
 		globalStoragePath: string,
@@ -67,8 +116,12 @@ export class AiCodeStatsService {
 	) {
 		this.store = new AiCodeStatsStore(globalStoragePath)
 		this.uploader = new AiCodeStatsUploader(this.store)
-		this.scheduler = new AiCodeStatsScheduler(13)
 		this.extractor = new AiCodeDiffExtractor()
+		this.commitAttributionService = new AiCodeCommitAttributionService(this.store, {
+			onCommitComparisonCompleted: async () => {
+				await this.requestCommitTriggeredUpload()
+			},
+		})
 		// kilocode_change start
 		this.metadataResolver = new AiCodeStatsMetadataResolver()
 		// kilocode_change end
@@ -95,13 +148,13 @@ export class AiCodeStatsService {
 	}
 
 	start(): void {
-		this.scheduler.start(async () => {
-			await this.runUpload("daily")
+		void this.commitAttributionService.start().catch((error) => {
+			console.error("[AiCodeStats] Failed to start commit attribution service:", error)
 		})
 	}
 
 	stop(): void {
-		this.scheduler.stop()
+		this.commitAttributionService.stop()
 	}
 
 	async getSummary(): Promise<AiCodeStatsSummary> {
@@ -114,8 +167,42 @@ export class AiCodeStatsService {
 		return this.store.getGeneratedLinesForRange(range)
 	}
 
+	async getSuggestedLines(range: AiCodeStatsRange): Promise<number> {
+		await this.store.pruneOldData(AI_CODE_STATS_RETENTION_DAYS)
+		return this.store.getSuggestedLinesForRange(range)
+	}
+
+	async getCommittedLines(range: AiCodeStatsRange): Promise<number> {
+		await this.store.pruneOldData(AI_CODE_STATS_RETENTION_DAYS)
+		return this.store.getCommittedLinesForRange(range)
+	}
+
+	async recordAgentSuggestion(record: AgentSuggestionRecord): Promise<void> {
+		const blocks = this.extractor.extractAddedBlocks(record.originalContent, record.newContent, "suggested")
+		if (blocks.length === 0) {
+			return
+		}
+
+		const suggestedLines = blocks.reduce((total, block) => total + block.lineCount, 0)
+		if (suggestedLines === 0) {
+			return
+		}
+
+		await this.store.addSuggestedLines(suggestedLines, record.timestamp)
+	}
+
 	async triggerManualUpload(): Promise<void> {
-		await this.runUpload("manual")
+		if (this.isUploading) {
+			throw new Error("Upload is already in progress.")
+		}
+
+		this.isUploading = true
+		try {
+			await this.performIncrementalUpload("manual")
+		} finally {
+			this.isUploading = false
+			this.scheduleQueuedCommitUpload()
+		}
 	}
 
 	async triggerManualRangeUpload(range: AiCodeStatsRange): Promise<AiCodeStatsManualUploadResult> {
@@ -161,6 +248,7 @@ export class AiCodeStatsService {
 			throw error
 		} finally {
 			this.isUploading = false
+			this.scheduleQueuedCommitUpload()
 		}
 	}
 
@@ -181,12 +269,23 @@ export class AiCodeStatsService {
 			return
 		}
 
+		const repoRoot = await resolveGitRepositoryRoot(path.dirname(filePath))
+		const repoRelativePath =
+			repoRoot && this.isPathInsideRepo(repoRoot, filePath)
+				? normalizePath(path.relative(repoRoot, filePath))
+				: undefined
+		const lineOccurrenceIndexes = buildLineOccurrenceIndexes(record.newContent)
+		const pendingLineAttributions: AiCodePendingLineAttribution[] = []
+
 		for (const block of blocks) {
+			const eventId = crypto.randomUUID()
+			const timestamp = Date.now()
 			const event: AiCodeStatsEvent = {
-				eventId: crypto.randomUUID(),
-				timestamp: Date.now(),
+				eventId,
+				timestamp,
 				sourceType: "agent_insert",
 				ide: this.ide,
+				metricType: "generated",
 				// kilocode_change start
 				userName: metadata.userName,
 				userEmail: metadata.userEmail,
@@ -207,28 +306,103 @@ export class AiCodeStatsService {
 				lineCount: block.lineCount,
 				codeSnippet: block.codeSnippet,
 				taskId: record.taskId,
+				equivalentLineCount: block.lineCount,
 			}
 			await this.store.appendEvent(event)
+
+			if (!repoRoot || !repoRelativePath) {
+				continue
+			}
+
+			pendingLineAttributions.push(
+				...this.buildPendingLineAttributions(
+					event,
+					repoRoot,
+					repoRelativePath,
+					block.lineStart,
+					block.codeSnippet,
+					lineOccurrenceIndexes,
+				),
+			)
 		}
 
-		await this.maybeTriggerThresholdUpload()
-	}
-
-	private async maybeTriggerThresholdUpload(): Promise<void> {
-		const pendingCount = await this.store.getPendingEventCount()
-		if (pendingCount < AI_CODE_STATS_THRESHOLD) {
-			return
+		if (pendingLineAttributions.length > 0) {
+			await this.commitAttributionService.registerPendingLineAttributions(pendingLineAttributions)
 		}
-
-		await this.runUpload("threshold")
 	}
 
-	private async runUpload(trigger: "daily" | "threshold" | "manual"): Promise<void> {
+	private buildPendingLineAttributions(
+		event: AiCodeStatsEvent,
+		repoRoot: string,
+		repoRelativePath: string,
+		lineStart: number,
+		codeSnippet: string,
+		lineOccurrenceIndexes: number[],
+	): AiCodePendingLineAttribution[] {
+		const lines = normalizeContentLines(codeSnippet)
+
+		return lines.map((line, index) => {
+			const lineNumber = lineStart + index
+			const occurrenceIndex = lineOccurrenceIndexes[lineNumber - 1] ?? index + 1
+			const lineFeatures = extractLineFeatures(line)
+			return {
+				id: crypto.randomUUID(),
+				generatedEventId: event.eventId,
+				blockId: event.eventId,
+				timestamp: event.timestamp,
+				sourceType: event.sourceType,
+				ide: event.ide,
+				userName: event.userName,
+				userEmail: event.userEmail,
+				organizationId: event.organizationId,
+				organizationName: event.organizationName,
+				sourceIp: event.sourceIp,
+				workspaceName: event.workspaceName,
+				workspacePath: event.workspacePath,
+				projectKey: event.projectKey,
+				filePath: event.filePath,
+				relativePath: event.relativePath,
+				repoRoot,
+				repoRelativePath,
+				language: event.language,
+				gitRemoteUrl: event.gitRemoteUrl,
+				gitBranch: event.gitBranch,
+				taskId: event.taskId,
+				rawLine: lineFeatures.rawLine,
+				blockLineIndex: index + 1,
+				blockLineCount: lines.length,
+				lineHash: hashLineFingerprint(line),
+				occurrenceIndex,
+				normalizedLine: lineFeatures.normalizedLine,
+				normalizedTokenLine: lineFeatures.normalizedTokenLine,
+				rareIdentifiers: lineFeatures.rareIdentifiers,
+			}
+		})
+	}
+
+	private isPathInsideRepo(repoRoot: string, filePath: string): boolean {
+		const relative = path.relative(repoRoot, filePath)
+		return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative)
+	}
+
+	private async requestCommitTriggeredUpload(): Promise<void> {
 		if (this.isUploading) {
+			this.uploadRequestedWhileRunning = true
 			return
 		}
 
 		this.isUploading = true
+		try {
+			do {
+				this.uploadRequestedWhileRunning = false
+				await this.performIncrementalUpload("commit")
+			} while (this.uploadRequestedWhileRunning)
+		} finally {
+			this.isUploading = false
+		}
+	}
+
+	private async performIncrementalUpload(trigger: "commit" | "manual"): Promise<void> {
 		try {
 			await this.store.pruneOldData(AI_CODE_STATS_RETENTION_DAYS)
 			const settings = await this.getUploadSettings()
@@ -237,22 +411,15 @@ export class AiCodeStatsService {
 			}
 
 			const uploadResult = await this.uploader.upload(settings, {
-				backfillDays: AI_CODE_STATS_BACKFILL_DAYS,
 				client: this.buildUploadClient(),
 			})
-
-			const uploadedEvents = uploadResult.incrementalUploaded + uploadResult.backfillUploaded
-			const message = uploadResult.backfillError
-				? `Incremental upload succeeded; backfill failed: ${uploadResult.backfillError}`
-				: undefined
 
 			const lastUpload: AiCodeStatsLastUpload = {
 				status: "success",
 				timestamp: Date.now(),
-				uploadedEvents,
+				uploadedEvents: uploadResult.uploaded,
 				mode: "incremental",
 				trigger,
-				message,
 			}
 			await this.store.setLastUploadStatus(lastUpload)
 		} catch (error) {
@@ -265,9 +432,17 @@ export class AiCodeStatsService {
 				trigger,
 			}
 			await this.store.setLastUploadStatus(lastUpload)
-		} finally {
-			this.isUploading = false
 		}
+	}
+
+	private scheduleQueuedCommitUpload(): void {
+		if (!this.uploadRequestedWhileRunning || this.isUploading) {
+			return
+		}
+
+		void this.requestCommitTriggeredUpload().catch((error) => {
+			console.error("[AiCodeStats] Failed to upload pending commit-triggered events:", error)
+		})
 	}
 
 	private buildUploadClient() {

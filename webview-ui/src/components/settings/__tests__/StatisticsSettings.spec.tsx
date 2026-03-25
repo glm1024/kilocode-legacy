@@ -15,15 +15,21 @@ vi.mock("@/i18n/TranslationContext", () => ({
 			const translations: Record<string, string> = {
 				"settings:sections.statistics": "Statistics",
 				"settings:statistics.tip":
-					"This page is used to track AI-generated code line counts and supports historical data backfill.",
+					"This page tracks AI suggested lines, AI generated code lines written into the workspace, and AI committed adoption lines, and supports historical data backfill.",
 				"settings:statistics.webhook.label": "Upload Server URL",
-				"settings:statistics.webhook.placeholder": "https://example.com/webhook",
+				"settings:statistics.webhook.placeholder": "e.g. http://100.7.132.102:8081",
 				"settings:statistics.webhook.description":
 					"Used to receive AI code statistics data. Once filled, scheduled automatic uploads will run.",
 				"settings:statistics.userName.label": "Username",
 				"settings:statistics.userName.placeholder": "e.g. Alice Zhang",
-				"settings:statistics.generatedLines.label": "Generated Code Lines",
+				"settings:statistics.suggestedLines.label": "AI Suggested Code Lines",
+				"settings:statistics.suggestedLines.empty": "No data yet",
+				"settings:statistics.generatedLines.label": "AI Generated Code Lines",
 				"settings:statistics.generatedLines.empty": "No data yet",
+				"settings:statistics.committedLines.label": "AI Committed Adoption Lines",
+				"settings:statistics.committedLines.empty": "No data yet",
+				"settings:statistics.adoptionRate.label": "Adoption Rate",
+				"settings:statistics.adoptionRate.empty": "No data yet",
 				"settings:statistics.range.current": "This day",
 				"settings:statistics.range.last3days": "Last 3 days",
 				"settings:statistics.range.last7days": "This week",
@@ -139,7 +145,10 @@ describe("StatisticsSettings", () => {
 			{
 				type: "aiCodeStatsSummaryResponse",
 				values: {
+					suggestedLines: 18,
 					generatedLines: 12,
+					committedLines: 5,
+					adoptionRate: 5 / 12,
 					lastSuccessfulUploadAt: 1_772_500_000_000,
 				},
 			},
@@ -147,7 +156,10 @@ describe("StatisticsSettings", () => {
 		)
 
 		await waitFor(() => {
+			expect(screen.getByTestId("ai-code-stats-suggested-lines")).toHaveTextContent("18")
 			expect(screen.getByTestId("ai-code-stats-generated-lines")).toHaveTextContent("12")
+			expect(screen.getByTestId("ai-code-stats-committed-lines")).toHaveTextContent("5")
+			expect(screen.getByTestId("ai-code-stats-adoption-rate")).toHaveTextContent("41.7%")
 			expect(screen.getByTestId("ai-code-stats-last-successful-upload").textContent).toContain("2026")
 		})
 	})
