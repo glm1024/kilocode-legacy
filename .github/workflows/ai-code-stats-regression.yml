@@ -1,0 +1,110 @@
+name: AI Code Stats Regression
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, ready_for_review, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    name: detect-ai-code-stats-changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      ai_code_stats: ${{ steps.filter.outputs.ai_code_stats }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect relevant paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            ai_code_stats:
+              # Keep this filter aligned with direct ai-code-stats dependencies.
+              - 'src/services/ai-code-stats/**'
+              - 'src/shared/GitWatcher.ts'
+              - 'src/services/code-index/managed/git-utils.ts'
+              - 'src/utils/safeWriteJson.ts'
+              - 'src/core/kilocode/wrapper.ts'
+              - 'src/shared/package.ts'
+              - 'src/services/autocomplete/continuedev/core/autocomplete/constants/AutocompleteLanguageInfo.ts'
+              - 'src/package.json'
+              - 'src/vitest.config.ts'
+              - 'src/vitest.setup.ts'
+              - 'src/tsconfig.json'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
+              - 'turbo.json'
+              - '.github/workflows/ai-code-stats-regression.yml'
+
+  plugin_regression:
+    name: ai-code-stats-regression
+    needs: changes
+    if: needs.changes.outputs.ai_code_stats == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.8.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20.20.0
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run ai-code-stats regression suite
+        working-directory: src
+        run: >
+          pnpm exec vitest run
+          services/ai-code-stats/__tests__/AiCodeDiffExtractor.spec.ts
+          services/ai-code-stats/__tests__/AiCodeCommitAttributionService.spec.ts
+          services/ai-code-stats/__tests__/AiCodeStatsService.spec.ts
+          services/ai-code-stats/__tests__/AiCodeStatsScenario.spec.ts
+
+  status:
+    name: ai-code-stats-regression-status
+    needs: [changes, plugin_regression]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Finalize required check
+        run: |
+          if [ "${{ needs.changes.result }}" != "success" ]; then
+            echo "Path detection failed."
+            exit 1
+          fi
+
+          if [ "${{ needs.changes.outputs.ai_code_stats }}" != "true" ]; then
+            echo "No ai-code-stats changes detected."
+            exit 0
+          fi
+
+          if [ "${{ needs.plugin_regression.result }}" = "success" ]; then
+            echo "ai-code-stats regression passed."
+            exit 0
+          fi
+
+          echo "ai-code-stats regression did not succeed."
+          exit 1

@@ -548,6 +548,16 @@
 					"default": "",
 					"description": "%settings.customStoragePath.description%"
 				},
+				"kilo-code.aiCodeStatsUserName": {
+					"type": "string",
+					"default": "",
+					"description": "%settings.aiCodeStatsUserName.description%"
+				},
+				"kilo-code.aiCodeStatsWebhookUrl": {
+					"type": "string",
+					"default": "",
+					"description": "%settings.aiCodeStatsWebhookUrl.description%"
+				},
 				"kilo-code.enableCodeActions": {
 					"type": "boolean",
 					"default": true,

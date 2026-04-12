@@ -234,7 +234,6 @@ export interface ExtensionMessage {
 		| "manualPurge" // kilocode_change
 		| "aiCodeStatsSummaryResponse" // kilocode_change
 		| "aiCodeStatsWebhookTestResult" // kilocode_change
-		| "aiCodeStatsUploadTestResult" // kilocode_change
 		| "commands"
 		| "insertTextIntoTextarea"
 		| "dismissedUpsells"
@@ -886,7 +885,6 @@ export interface WebviewMessage {
 		| "getUsageData" // kilocode_change
 		| "getAiCodeStatsSummary" // kilocode_change
 		| "testAiCodeStatsWebhook" // kilocode_change
-		| "testAiCodeStatsUpload" // kilocode_change
 		| "usageDataResponse" // kilocode_change
 		| "showTaskTimeline" // kilocode_change
 		| "sendMessageOnEnter" // kilocode_change

@@ -115,6 +115,11 @@ import {
 	InvalidAiCodeStatsWebhookUrlError,
 	resolveAiCodeStatsWebhookUrl,
 } from "../../services/ai-code-stats/AiCodeStatsWebhookUrl"
+import { AiTokenUsageService } from "../../services/ai-token-usage"
+import {
+	InvalidAiTokenUsageWebhookUrlError,
+	resolveAiTokenUsageWebhookUrl,
+} from "../../services/ai-token-usage/AiTokenUsageWebhookUrl"
 // kilocode_change end
 import { setPendingTodoList } from "../tools/UpdateTodoListTool"
 import { ManagedIndexer } from "../../services/code-index/managed/ManagedIndexer"
@@ -137,7 +142,7 @@ export const webviewMessageHandler = async (
 
 	// kilocode_change start
 	const parseAiCodeStatsRange = (input: unknown): AiCodeStatsRange => {
-		const validTypes: AiCodeStatsRangeType[] = ["current", "last3days", "last7days", "last30days", "custom", "all"]
+		const validTypes: AiCodeStatsRangeType[] = ["current", "last7days", "last30days", "custom", "all"]
 		const fallback: AiCodeStatsRange = { type: "current" }
 		if (!input || typeof input !== "object") {
 			return fallback
@@ -1930,24 +1935,27 @@ export const webviewMessageHandler = async (
 			}
 
 			try {
-				const resolvedWebhookUrl = resolveAiCodeStatsWebhookUrl(webhookUrl)
-				const response = await fetchWithRetries({
-					url: resolvedWebhookUrl,
-					method: "POST",
-					retries: 0,
-					timeout: 8_000,
-					shouldRetry: () => false,
-					headers: {
-						"Content-Type": "application/json",
-					},
-					body: JSON.stringify({
-						type: "ai_code_stats_webhook_test",
-						source: "kilocode-settings",
-						timestamp: Date.now(),
-					}),
-				})
+				const runWebhookPing = async (
+					targetUrl: string,
+					payload: Record<string, unknown>,
+					endpoint: "ai-code-stats" | "ai-token-usage",
+				) => {
+					const response = await fetchWithRetries({
+						url: targetUrl,
+						method: "POST",
+						retries: 0,
+						timeout: 8_000,
+						shouldRetry: () => false,
+						headers: {
+							"Content-Type": "application/json",
+						},
+						body: JSON.stringify(payload),
+					})
 
-				if (!response.ok) {
+					if (response.ok) {
+						return null
+					}
+
 					const errorBody = await response.text().catch(() => "")
 					const errorCode =
 						response.status === 404
@@ -1957,17 +1965,62 @@ export const webviewMessageHandler = async (
 								: response.status === 401 || response.status === 403
 									? "unauthorized"
 									: "http_error"
+
+					return {
+						errorCode,
+						status: response.status,
+						statusText: response.statusText,
+						text:
+							errorCode === "http_error"
+								? `${endpoint}: ${response.status} ${response.statusText}${
+										errorBody ? `: ${errorBody.slice(0, 200)}` : ""
+									}`
+								: "",
+					}
+				}
+
+				const timestamp = Date.now()
+				const codeStatsError = await runWebhookPing(
+					resolveAiCodeStatsWebhookUrl(webhookUrl),
+					{
+						type: "ai_code_stats_webhook_test",
+						source: "kilocode-settings",
+						timestamp,
+					},
+					"ai-code-stats",
+				)
+				if (codeStatsError) {
 					await provider.postMessageToWebview({
 						type: "aiCodeStatsWebhookTestResult",
 						success: false,
-						text:
-							errorCode === "http_error"
-								? `${response.status} ${response.statusText}${errorBody ? `: ${errorBody.slice(0, 200)}` : ""}`
-								: "",
+						text: codeStatsError.text,
 						values: {
-							errorCode,
-							status: response.status,
-							statusText: response.statusText,
+							errorCode: codeStatsError.errorCode,
+							status: codeStatsError.status,
+							statusText: codeStatsError.statusText,
+						},
+					})
+					break
+				}
+
+				const tokenUsageError = await runWebhookPing(
+					resolveAiTokenUsageWebhookUrl(webhookUrl),
+					{
+						type: "ai_token_usage_webhook_test",
+						source: "kilocode-settings",
+						timestamp,
+					},
+					"ai-token-usage",
+				)
+				if (tokenUsageError) {
+					await provider.postMessageToWebview({
+						type: "aiCodeStatsWebhookTestResult",
+						success: false,
+						text: tokenUsageError.text,
+						values: {
+							errorCode: tokenUsageError.errorCode,
+							status: tokenUsageError.status,
+							statusText: tokenUsageError.statusText,
 						},
 					})
 					break
@@ -1983,6 +2036,8 @@ export const webviewMessageHandler = async (
 				let errorMessage = ""
 				if (error instanceof InvalidAiCodeStatsWebhookUrlError) {
 					errorCode = error.code
+				} else if (error instanceof InvalidAiTokenUsageWebhookUrlError) {
+					errorCode = error.code
 				} else if (error instanceof RequestTimedOutError) {
 					errorCode = "timeout"
 				} else {
@@ -1995,44 +2050,6 @@ export const webviewMessageHandler = async (
 					values: {
 						errorCode,
 					},
-				})
-			}
-			break
-		}
-		// kilocode_change end
-		// kilocode_change start
-		case "testAiCodeStatsUpload": {
-			const aiCodeStatsService = AiCodeStatsService.getInstance()
-			if (!aiCodeStatsService) {
-				await provider.postMessageToWebview({
-					type: "aiCodeStatsUploadTestResult",
-					success: false,
-					text: "AI code stats service is not initialized.",
-				})
-				break
-			}
-
-			try {
-				const range = parseAiCodeStatsRange((message.values as Record<string, unknown> | undefined)?.range)
-				const result = await aiCodeStatsService.triggerManualRangeUpload(range)
-				await provider.postMessageToWebview({
-					type: "aiCodeStatsUploadTestResult",
-					success: true,
-					text: "",
-					values: {
-						uploadedEvents: result.uploadedEvents,
-						timestamp: result.timestamp,
-					},
-				})
-			} catch (error) {
-				const errorMessage = error instanceof Error ? error.message : String(error)
-				const errorCode =
-					errorMessage === "Upload webhook URL is not configured." ? "webhook_not_configured" : undefined
-				await provider.postMessageToWebview({
-					type: "aiCodeStatsUploadTestResult",
-					success: false,
-					text: errorCode ? "" : errorMessage,
-					values: errorCode ? { errorCode } : undefined,
 				})
 			}
 			break
@@ -3977,20 +3994,55 @@ export const webviewMessageHandler = async (
 		case "getAiCodeStatsSummary": {
 			try {
 				const aiCodeStatsService = AiCodeStatsService.getInstance()
+				const aiTokenUsageService = AiTokenUsageService.getInstance()
 				const range = parseAiCodeStatsRange((message.values as Record<string, unknown> | undefined)?.range)
 				const summary = aiCodeStatsService
 					? await aiCodeStatsService.getSummary()
 					: {
-							today: { suggestedLines: 0, generatedLines: 0, committedLines: 0, adoptionRate: 0 },
-							total: { suggestedLines: 0, generatedLines: 0, committedLines: 0, adoptionRate: 0 },
+							today: {
+								suggestedLines: 0,
+								generatedLines: 0,
+								acceptedLines: 0,
+								committedLines: 0,
+								adoptionRate: 0,
+								retentionRate: 0,
+								strictCommittedLines: 0,
+								equivalentCommittedLines: 0,
+								strictAdoptionRate: 0,
+								equivalentAdoptionRate: 0,
+							},
+							total: {
+								suggestedLines: 0,
+								generatedLines: 0,
+								acceptedLines: 0,
+								committedLines: 0,
+								adoptionRate: 0,
+								retentionRate: 0,
+								strictCommittedLines: 0,
+								equivalentCommittedLines: 0,
+								strictAdoptionRate: 0,
+								equivalentAdoptionRate: 0,
+							},
 							pendingEvents: 0,
 							lastUpload: { status: "idle" as const },
-							lastSuccessfulUploadAt: undefined,
 						}
 				const suggestedLines = aiCodeStatsService ? await aiCodeStatsService.getSuggestedLines(range) : 0
-				const generatedLines = aiCodeStatsService ? await aiCodeStatsService.getGeneratedLines(range) : 0
-				const committedLines = aiCodeStatsService ? await aiCodeStatsService.getCommittedLines(range) : 0
-				const adoptionRate = generatedLines > 0 ? committedLines / generatedLines : 0
+				const rangeSummary = aiCodeStatsService
+					? await aiCodeStatsService.getRangeSummary(range)
+					: {
+							generatedLines: 0,
+							acceptedLines: 0,
+							committedLines: 0,
+							adoptionRate: 0,
+							retentionRate: 0,
+						}
+				const tokenSummary = aiTokenUsageService
+					? await aiTokenUsageService.getSummary(range)
+					: {
+							inputTokens: 0,
+							outputTokens: 0,
+							totalTokens: 0,
+						}
 
 				await provider.postMessageToWebview({
 					type: "aiCodeStatsSummaryResponse",
@@ -3998,9 +4050,10 @@ export const webviewMessageHandler = async (
 						...summary,
 						range,
 						suggestedLines,
-						generatedLines,
-						committedLines,
-						adoptionRate,
+						...rangeSummary,
+						inputTokens: tokenSummary.inputTokens,
+						outputTokens: tokenSummary.outputTokens,
+						totalTokens: tokenSummary.totalTokens,
 					},
 				})
 			} catch (error) {
@@ -4009,15 +4062,41 @@ export const webviewMessageHandler = async (
 				await provider.postMessageToWebview({
 					type: "aiCodeStatsSummaryResponse",
 					values: {
-						today: { suggestedLines: 0, generatedLines: 0, committedLines: 0, adoptionRate: 0 },
-						total: { suggestedLines: 0, generatedLines: 0, committedLines: 0, adoptionRate: 0 },
+						today: {
+							suggestedLines: 0,
+							generatedLines: 0,
+							acceptedLines: 0,
+							committedLines: 0,
+							adoptionRate: 0,
+							retentionRate: 0,
+							strictCommittedLines: 0,
+							equivalentCommittedLines: 0,
+							strictAdoptionRate: 0,
+							equivalentAdoptionRate: 0,
+						},
+						total: {
+							suggestedLines: 0,
+							generatedLines: 0,
+							acceptedLines: 0,
+							committedLines: 0,
+							adoptionRate: 0,
+							retentionRate: 0,
+							strictCommittedLines: 0,
+							equivalentCommittedLines: 0,
+							strictAdoptionRate: 0,
+							equivalentAdoptionRate: 0,
+						},
 						pendingEvents: 0,
 						suggestedLines: 0,
 						generatedLines: 0,
+						acceptedLines: 0,
 						committedLines: 0,
 						adoptionRate: 0,
+						retentionRate: 0,
+						inputTokens: 0,
+						outputTokens: 0,
+						totalTokens: 0,
 						range: { type: "current" as const },
-						lastSuccessfulUploadAt: undefined,
 						lastUpload: {
 							status: "failed",
 							message: errorMessage,

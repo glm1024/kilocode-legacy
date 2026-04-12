@@ -67,6 +67,8 @@ export interface ExtensionStateContextType extends ExtensionState {
 	autoPurgeLastRunTimestamp?: number
 	setAutoPurgeLastRunTimestamp: (value: number) => void
 	// kilocode_change end
+	setAiCodeStatsWebhookUrl: (value: string) => void
+	setAiCodeStatsUserName: (value: string) => void
 	didHydrateState: boolean
 	showWelcome: boolean
 	theme: any
@@ -753,6 +755,8 @@ export const ExtensionStateContextProvider: React.FC<{ children: React.ReactNode
 			setState((prevState) => ({ ...prevState, autoPurgeIncompleteTaskRetentionDays: value })),
 		setAutoPurgeLastRunTimestamp: (value) =>
 			setState((prevState) => ({ ...prevState, autoPurgeLastRunTimestamp: value })),
+		setAiCodeStatsWebhookUrl: (value) => setState((prevState) => ({ ...prevState, aiCodeStatsWebhookUrl: value })),
+		setAiCodeStatsUserName: (value) => setState((prevState) => ({ ...prevState, aiCodeStatsUserName: value })),
 		// kilocode_change end
 		includeTaskHistoryInEnhance,
 		setIncludeTaskHistoryInEnhance,

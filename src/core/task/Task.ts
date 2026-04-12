@@ -161,6 +161,7 @@ import { AutoApprovalHandler, checkAutoApproval } from "../auto-approval"
 import { MessageManager } from "../message-manager"
 import { validateAndFixToolResultIds } from "./validateToolResultIds"
 import { deduplicateToolUseBlocks } from "./deduplicateToolUseBlocks"
+import { AiTokenUsageService } from "../../services/ai-token-usage"
 
 const MAX_EXPONENTIAL_BACKOFF_SECONDS = 600 // 10 minutes
 const DEFAULT_USAGE_COLLECTION_TIMEOUT_MS = 5000 // 5 seconds
@@ -3489,6 +3490,24 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 									inferenceProvider,
 									// kilocode_change end
 								})
+
+								const aiTokenUsageService = AiTokenUsageService.getInstance()
+								if (aiTokenUsageService) {
+									try {
+										await aiTokenUsageService.recordRequestUsage({
+											workspacePath: this.cwd,
+											provider: inferenceProvider ?? this.apiConfiguration.apiProvider,
+											model: cachedModelId,
+											inputTokens: costResult.totalInputTokens,
+											outputTokens: costResult.totalOutputTokens,
+											cacheReadTokens: tokens.cacheRead,
+											cacheWriteTokens: tokens.cacheWrite,
+											occurredAt: Date.now(),
+										})
+									} catch (error) {
+										console.error(`[Task#${this.taskId}] Failed to record token usage:`, error)
+									}
+								}
 							}
 						}
 

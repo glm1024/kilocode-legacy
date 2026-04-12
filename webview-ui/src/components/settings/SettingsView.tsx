@@ -103,6 +103,26 @@ export const settingsTabTrigger =
 export const settingsTabTriggerActive =
 	"opacity-100 border-vscode-focusBorder bg-vscode-list-activeSelectionBackground hover:bg-vscode-list-activeSelectionBackground cursor-default" // kilocode_change add hover:bg-* and cursor-default
 const AI_CODE_STATS_INGEST_PATH = "/api/v1/ingest/ai-code-stats"
+const AI_TOKEN_USAGE_INGEST_PATH = "/api/v1/ingest/ai-token-usage"
+
+const resolveSettingsIngestPath = (pathname: string, targetPath: string): string => {
+	const normalizedPathname = pathname.replace(/\/+$/, "") || "/"
+	if (normalizedPathname === "/") {
+		return targetPath
+	}
+
+	for (const knownPath of [AI_CODE_STATS_INGEST_PATH, AI_TOKEN_USAGE_INGEST_PATH]) {
+		if (normalizedPathname === knownPath) {
+			return targetPath
+		}
+		if (normalizedPathname.endsWith(knownPath)) {
+			const basePath = normalizedPathname.slice(0, -knownPath.length)
+			return `${basePath || ""}${targetPath}`
+		}
+	}
+
+	return `${normalizedPathname}${targetPath}`
+}
 
 const normalizeAiCodeStatsWebhookUrl = (value: string): string => {
 	const trimmed = value.trim()
@@ -112,8 +132,7 @@ const normalizeAiCodeStatsWebhookUrl = (value: string): string => {
 
 	try {
 		const parsedUrl = new URL(trimmed)
-		const normalizedPathname = parsedUrl.pathname.replace(/\/+$/, "") || "/"
-		parsedUrl.pathname = normalizedPathname === "/" ? AI_CODE_STATS_INGEST_PATH : normalizedPathname
+		parsedUrl.pathname = resolveSettingsIngestPath(parsedUrl.pathname, AI_CODE_STATS_INGEST_PATH)
 		parsedUrl.hash = ""
 		return parsedUrl.toString()
 	} catch {
@@ -127,12 +146,12 @@ export interface SettingsViewRef {
 
 export const sectionNames = [
 	"providers",
+	"statistics", // kilocode_change
 	"autoApprove",
 	"slashCommands",
 	"browser",
 	"checkpoints",
 	"autocomplete", // kilocode_change
-	"statistics", // kilocode_change
 	"display", // kilocode_change
 	"notifications",
 	"contextManagement",
@@ -818,6 +837,8 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 				vscode.postMessage({ type: "debugSetting", bool: cachedState.debug })
 
 				// kilocode_change start
+				extensionState.setAiCodeStatsWebhookUrl?.(trimmedWebhookUrl)
+				extensionState.setAiCodeStatsUserName?.(normalizedUserName)
 				pendingSavedStatisticsStateRef.current = {
 					aiCodeStatsWebhookUrl: trimmedWebhookUrl,
 					aiCodeStatsUserName: normalizedUserName,
@@ -931,6 +952,7 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 	const sections: { id: SectionName; icon: LucideIcon }[] = useMemo(
 		() => [
 			{ id: "providers", icon: Plug },
+			{ id: "statistics" as const, icon: Activity }, // kilocode_change
 			{ id: "agentBehaviour", icon: Users2 }, // kilocode_change - renamed from "modes" and merged with "mcp"
 			{ id: "autoApprove", icon: CheckCheck },
 			// { id: "slashCommands", icon: SquareSlash }, // kilocode_change: needs work to be re-introduced
@@ -938,7 +960,6 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 			{ id: "checkpoints", icon: GitBranch },
 			{ id: "display", icon: Monitor }, // kilocode_change
 			{ id: "autocomplete" as const, icon: Bot }, // kilocode_change
-			{ id: "statistics" as const, icon: Activity }, // kilocode_change
 			{ id: "notifications", icon: Bell },
 			{ id: "contextManagement", icon: Database },
 			{ id: "terminal", icon: SquareTerminal },

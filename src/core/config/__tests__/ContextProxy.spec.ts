@@ -15,6 +15,12 @@ vi.mock("vscode", () => ({
 		Production: 2,
 		Test: 3,
 	},
+	ConfigurationTarget: {
+		Global: 1,
+	},
+	workspace: {
+		getConfiguration: vi.fn(),
+	},
 }))
 
 describe("ContextProxy", () => {
@@ -22,6 +28,7 @@ describe("ContextProxy", () => {
 	let mockContext: any
 	let mockGlobalState: any
 	let mockSecrets: any
+	let mockConfiguration: any
 
 	beforeEach(async () => {
 		// Reset mocks
@@ -39,6 +46,13 @@ describe("ContextProxy", () => {
 			store: vi.fn().mockResolvedValue(undefined),
 			delete: vi.fn().mockResolvedValue(undefined),
 		}
+
+		mockConfiguration = {
+			get: vi.fn(),
+			inspect: vi.fn().mockReturnValue({ globalValue: undefined }),
+			update: vi.fn().mockResolvedValue(undefined),
+		}
+		vi.mocked(vscode.workspace.getConfiguration).mockReturnValue(mockConfiguration)
 
 		// Mock the extension context
 		mockContext = {
@@ -142,6 +156,17 @@ describe("ContextProxy", () => {
 
 			// Should return default value when original context returns undefined
 			expect(result).toBe(historyItems)
+		})
+
+		it("should fall back to VS Code user settings for config-backed keys", async () => {
+			mockConfiguration.get.mockImplementation((key: string) => {
+				if (key === "aiCodeStatsWebhookUrl") {
+					return " https://stats.example.com/upload "
+				}
+				return undefined
+			})
+
+			expect(proxy.getGlobalState("aiCodeStatsWebhookUrl")).toBe("https://stats.example.com/upload")
 		})
 	})
 
@@ -249,6 +274,18 @@ describe("ContextProxy", () => {
 			// Should have stored the value in state cache
 			const storedValue = proxy.getGlobalState("apiModelId")
 			expect(storedValue).toBe("gpt-4")
+		})
+
+		it("should mirror config-backed global state keys into VS Code user settings", async () => {
+			await proxy.setValue("aiCodeStatsUserName", "  Team Nine  ")
+
+			expect(mockGlobalState.update).toHaveBeenCalledWith("aiCodeStatsUserName", "Team Nine")
+			expect(mockConfiguration.update).toHaveBeenCalledWith(
+				"aiCodeStatsUserName",
+				"Team Nine",
+				vscode.ConfigurationTarget.Global,
+			)
+			expect(proxy.getGlobalState("aiCodeStatsUserName")).toBe("Team Nine")
 		})
 	})
 
@@ -440,6 +477,21 @@ describe("ContextProxy", () => {
 			expect(mockSecrets.delete).toHaveBeenCalledTimes(SECRET_STATE_KEYS.length + GLOBAL_SECRET_KEYS.length)
 		})
 
+		it("should clear config-backed user settings", async () => {
+			await proxy.resetAllState()
+
+			expect(mockConfiguration.update).toHaveBeenCalledWith(
+				"aiCodeStatsWebhookUrl",
+				undefined,
+				vscode.ConfigurationTarget.Global,
+			)
+			expect(mockConfiguration.update).toHaveBeenCalledWith(
+				"aiCodeStatsUserName",
+				undefined,
+				vscode.ConfigurationTarget.Global,
+			)
+		})
+
 		it("should reinitialize caches after reset", async () => {
 			// Spy on initialization methods
 			const initializeSpy = vi.spyOn(proxy as any, "initialize")
@@ -487,6 +539,62 @@ describe("ContextProxy", () => {
 			const updateCalls = mockGlobalState.update.mock.calls
 			const apiProviderUpdateCalls = updateCalls.filter((call: any[]) => call[0] === "apiProvider")
 			expect(apiProviderUpdateCalls.length).toBe(0)
+		})
+	})
+
+	describe("config-backed AI code stats settings", () => {
+		it("should restore AI code stats settings from VS Code user settings during initialization", async () => {
+			vi.clearAllMocks()
+			mockConfiguration.get.mockImplementation((key: string) => {
+				if (key === "aiCodeStatsWebhookUrl") {
+					return " https://stats.example.com/upload "
+				}
+				if (key === "aiCodeStatsUserName") {
+					return " Alice Zhang "
+				}
+				return undefined
+			})
+
+			const proxyWithConfigBackedState = new ContextProxy(mockContext)
+			await proxyWithConfigBackedState.initialize()
+
+			expect(mockGlobalState.update).toHaveBeenCalledWith(
+				"aiCodeStatsWebhookUrl",
+				"https://stats.example.com/upload",
+			)
+			expect(mockGlobalState.update).toHaveBeenCalledWith("aiCodeStatsUserName", "Alice Zhang")
+			expect(proxyWithConfigBackedState.getGlobalState("aiCodeStatsWebhookUrl")).toBe(
+				"https://stats.example.com/upload",
+			)
+			expect(proxyWithConfigBackedState.getGlobalState("aiCodeStatsUserName")).toBe("Alice Zhang")
+		})
+
+		it("should backfill existing AI code stats global state into VS Code user settings", async () => {
+			vi.clearAllMocks()
+			mockGlobalState.get.mockImplementation((key: string) => {
+				if (key === "aiCodeStatsWebhookUrl") {
+					return " https://stats.example.com/upload "
+				}
+				if (key === "aiCodeStatsUserName") {
+					return " Alice Zhang "
+				}
+				return undefined
+			})
+			mockConfiguration.get.mockReturnValue(undefined)
+
+			const proxyWithLegacyState = new ContextProxy(mockContext)
+			await proxyWithLegacyState.initialize()
+
+			expect(mockConfiguration.update).toHaveBeenCalledWith(
+				"aiCodeStatsWebhookUrl",
+				"https://stats.example.com/upload",
+				vscode.ConfigurationTarget.Global,
+			)
+			expect(mockConfiguration.update).toHaveBeenCalledWith(
+				"aiCodeStatsUserName",
+				"Alice Zhang",
+				vscode.ConfigurationTarget.Global,
+			)
 		})
 	})
 

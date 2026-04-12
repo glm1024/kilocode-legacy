@@ -1,5 +1,6 @@
 // kilocode_change - new file
 import { describe, expect, it } from "vitest"
+import { createPatch } from "diff"
 
 import { AiCodeDiffExtractor } from "../AiCodeDiffExtractor"
 
@@ -49,5 +50,94 @@ describe("AiCodeDiffExtractor", () => {
 			lineCount: 2,
 			codeSnippet: "insert-b\ninsert-c",
 		})
+	})
+
+	it("ignores eof carry-over lines when appending content without a trailing newline", () => {
+		const extractor = new AiCodeDiffExtractor()
+		const original = "a\nline2"
+		const next = ["a", "line2", "new1", "new2"].join("\n")
+
+		expect(extractor.extractPatchHunks(original, next, "test.ts")).toEqual([
+			{
+				oldStart: 3,
+				oldLines: 0,
+				newStart: 3,
+				newLines: 2,
+			},
+		])
+		expect(extractor.extractAddedBlocks(original, next, "test.ts")).toEqual([
+			{
+				lineStart: 3,
+				lineEnd: 4,
+				lineCount: 2,
+				codeSnippet: "new1\nnew2",
+			},
+		])
+
+		const files = extractor.extractAddedLinesFromPatch(
+			createPatch("test.ts", original, next, "", "", { context: 0 }),
+		)
+		expect(files).toHaveLength(1)
+		expect(files[0].addedLines).toEqual([
+			{ lineNumber: 3, content: "new1" },
+			{ lineNumber: 4, content: "new2" },
+		])
+		expect(files[0].changedBlocks).toEqual([
+			{
+				startLine: 3,
+				endLine: 4,
+				lineCount: 2,
+				codeSnippet: "new1\nnew2",
+				displayOrder: 1,
+			},
+		])
+	})
+
+	it("ignores eof carry-over lines when appending a comment without a trailing newline", () => {
+		const extractor = new AiCodeDiffExtractor()
+		const original = ["def f():", "    return 1"].join("\n")
+		const next = ["def f():", "    return 1", "# tail"].join("\n")
+
+		expect(extractor.extractAddedBlocks(original, next, "test.py")).toEqual([
+			{
+				lineStart: 3,
+				lineEnd: 3,
+				lineCount: 1,
+				codeSnippet: "# tail",
+			},
+		])
+	})
+
+	it("does not create semantic additions when only a trailing newline is introduced", () => {
+		const extractor = new AiCodeDiffExtractor()
+
+		expect(extractor.extractPatchHunks("a\nline2", "a\nline2\n", "test.ts")).toEqual([])
+		expect(extractor.extractAddedBlocks("a\nline2", "a\nline2\n", "test.ts")).toEqual([])
+		expect(
+			extractor.extractAddedLinesFromPatch(
+				createPatch("test.ts", "a\nline2", "a\nline2\n", "", "", { context: 0 }),
+			),
+		).toEqual([])
+	})
+
+	it("keeps replacements on the last line semantic even without a trailing newline", () => {
+		const extractor = new AiCodeDiffExtractor()
+
+		expect(extractor.extractPatchHunks("a\nline2", "a\nlineX", "test.ts")).toEqual([
+			{
+				oldStart: 2,
+				oldLines: 1,
+				newStart: 2,
+				newLines: 1,
+			},
+		])
+		expect(extractor.extractAddedBlocks("a\nline2", "a\nlineX", "test.ts")).toEqual([
+			{
+				lineStart: 2,
+				lineEnd: 2,
+				lineCount: 1,
+				codeSnippet: "lineX",
+			},
+		])
 	})
 })

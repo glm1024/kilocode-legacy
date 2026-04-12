@@ -1,7 +1,7 @@
 // kilocode_change - new file
 
 import crypto from "crypto"
-import { exec as execCallback } from "child_process"
+import { exec as execCallback, execFile as execFileCallback } from "child_process"
 import * as path from "path"
 import { promisify } from "util"
 
@@ -12,13 +12,18 @@ import { computeLineSimilarity, extractLineFeatures, roundToFour } from "./AiCod
 import { hashLineFingerprint } from "./AiCodeLineFingerprint"
 import { AiCodeStatsStore } from "./AiCodeStatsStore"
 import {
+	DEFAULT_AI_CODE_COMMIT_ATTRIBUTION_CONFIG,
 	normalizePath,
+	type AiCodeCommitAttributionConfig,
+	type AiCodeCommitChangedFile,
+	type AiCodeStatsEvent,
+	type AiCodeCommittedBlock,
 	type AiCodeCommitMatchStrategy,
 	type AiCodePendingLineAttribution,
-	type AiCodeStatsEvent,
 } from "./types"
 
 const execAsync = promisify(execCallback)
+const execFileAsync = promisify(execFileCallback)
 const EXEC_MAX_BUFFER_BYTES = 16 * 1024 * 1024
 
 interface AiCodeCommitWatcher {
@@ -46,7 +51,6 @@ interface CommitAddedLine {
 interface ExactMatchResult {
 	matches: MatchedPendingLine[]
 	matchedLineIds: Set<string>
-	matchedBlockIds: Set<string>
 	unmatchedAddedLines: CommitAddedLine[]
 }
 
@@ -65,20 +69,36 @@ interface PartialBlockMatchResult {
 	matchedLineIds: Set<string>
 	matchedAddedLineIndexes: Set<number>
 	avgLineScore: number
-	coverage: number
 	equivalentLineCount: number
+}
+
+interface PartialLineCandidate {
+	blockId: string
+	pendingLine: AiCodePendingLineAttribution
+	addedLine: CommitAddedLine
+	lineScore: number
+	hasNeighborSupport: boolean
+	supportStrength: number
+	isGenericLine: boolean
 }
 
 export interface AiCodeCommitAttributionServiceOptions {
 	createWatcher?: (repoRoot: string) => AiCodeCommitWatcher
 	loadCommitPatch?: (repoRoot: string, previousCommit: string, newCommit: string) => Promise<string>
 	loadCommitTimestamp?: (repoRoot: string, commitHash: string) => Promise<number>
+	loadCommitFileContent?: (
+		repoRoot: string,
+		commitHash: string,
+		repoRelativePath: string,
+	) => Promise<string | undefined>
 	getCurrentBranch?: (repoRoot: string) => Promise<string>
 	getCurrentCommitSha?: (repoRoot: string) => Promise<string>
 	isDetachedHead?: (repoRoot: string) => Promise<boolean>
 	isAncestor?: (repoRoot: string, olderCommit: string, newerCommit: string) => Promise<boolean>
 	listCommitsBetween?: (repoRoot: string, fromExclusive: string, toInclusive: string) => Promise<string[]>
 	listCommitsSinceTimestamp?: (repoRoot: string, sinceTs: number) => Promise<string[]>
+	getAttributionConfig?: () => Promise<AiCodeCommitAttributionConfig>
+	onCommitMatched?: (payload: AiCodeCommitMatchedPayload) => Promise<void>
 	onCommitComparisonCompleted?: () => Promise<void>
 }
 
@@ -108,6 +128,26 @@ const defaultLoadCommitTimestamp = async (repoRoot: string, commitHash: string):
 	})
 	const seconds = Number.parseInt(stdout.trim(), 10)
 	return Number.isFinite(seconds) ? seconds * 1000 : Date.now()
+}
+
+const defaultLoadCommitFileContent = async (
+	repoRoot: string,
+	commitHash: string,
+	repoRelativePath: string,
+): Promise<string | undefined> => {
+	try {
+		const { stdout } = await execFileAsync("git", ["show", `${commitHash}:${normalizePath(repoRelativePath)}`], {
+			cwd: repoRoot,
+			maxBuffer: EXEC_MAX_BUFFER_BYTES,
+		})
+		return stdout
+	} catch (error) {
+		console.warn(
+			`[AiCodeCommitAttribution] Failed to load committed file snapshot for ${repoRelativePath} at ${commitHash}:`,
+			error,
+		)
+		return undefined
+	}
 }
 
 const defaultGetCurrentCommitSha = async (repoRoot: string): Promise<string> => {
@@ -157,9 +197,93 @@ const defaultListCommitsSinceTimestamp = async (repoRoot: string, sinceTs: numbe
 
 const buildBucketKey = (repoRelativePath: string, lineHash: string) => `${repoRelativePath}\u0000${lineHash}`
 
+const LANGUAGE_BY_EXTENSION: Record<string, string> = {
+	".js": "javascript",
+	".jsx": "javascript",
+	".ts": "typescript",
+	".tsx": "typescript",
+	".py": "python",
+	".java": "java",
+	".go": "go",
+	".rb": "ruby",
+	".php": "php",
+	".rs": "rust",
+	".cpp": "cpp",
+	".cc": "cpp",
+	".cxx": "cpp",
+	".c": "c",
+	".h": "c",
+	".hpp": "cpp",
+	".cs": "csharp",
+	".kt": "kotlin",
+	".swift": "swift",
+	".sh": "bash",
+	".bash": "bash",
+	".sql": "sql",
+	".json": "json",
+	".yml": "yaml",
+	".yaml": "yaml",
+	".xml": "xml",
+	".html": "html",
+	".css": "css",
+	".scss": "scss",
+	".less": "less",
+	".vue": "vue",
+}
+
+const inferLanguageFromPath = (filePath: string): string | undefined =>
+	LANGUAGE_BY_EXTENSION[path.extname(filePath).toLowerCase()]
+
+const buildLegacyCommittedEvent = (block: AiCodeCommittedBlock): AiCodeStatsEvent => ({
+	eventId: block.eventId,
+	generatedBlockId: block.generatedBlockId,
+	timestamp: block.timestamp,
+	sourceType: block.sourceType,
+	ide: block.ide,
+	metricType: "committed",
+	userName: block.userName,
+	userEmail: block.userEmail,
+	organizationId: block.organizationId,
+	organizationName: block.organizationName,
+	sourceIp: block.sourceIp,
+	workspaceName: block.workspaceName,
+	workspacePath: block.workspacePath,
+	projectKey: block.projectKey,
+	filePath: block.filePath,
+	relativePath: block.relativePath,
+	language: block.language,
+	gitRemoteUrl: block.gitRemoteUrl,
+	gitBranch: block.gitBranch,
+	lineStart: block.lineStart,
+	lineEnd: block.lineEnd,
+	lineCount: block.lineCount,
+	codeSnippet: block.codeSnippet,
+	fileSnapshotContent: block.fileSnapshotContent,
+	taskId: block.taskId,
+	commitHash: block.commitHash,
+	commitOccurredAt: block.commitOccurredAt,
+	matchStrategy: block.matchStrategy,
+	matchConfidence: block.matchConfidence,
+	equivalentLineCount: block.equivalentLineCount,
+})
+
 interface CommitProcessResult {
 	processed: boolean
 	remainingPendingLines: number
+	commitOccurredAt?: number
+	committedBlocks: AiCodeCommittedBlock[]
+	matchedLineIds: string[]
+}
+
+export interface AiCodeCommitMatchedPayload {
+	repoRoot: string
+	branch: string
+	commitHash: string
+	previousCommit: string
+	commitOccurredAt: number
+	committedBlocks: AiCodeCommittedBlock[]
+	changedFiles: AiCodeCommitChangedFile[]
+	matchedPendingLineIds: string[]
 }
 
 export class AiCodeCommitAttributionService {
@@ -169,6 +293,11 @@ export class AiCodeCommitAttributionService {
 	private readonly createWatcher: (repoRoot: string) => AiCodeCommitWatcher
 	private readonly loadCommitPatch: (repoRoot: string, previousCommit: string, newCommit: string) => Promise<string>
 	private readonly loadCommitTimestamp: (repoRoot: string, commitHash: string) => Promise<number>
+	private readonly loadCommitFileContent: (
+		repoRoot: string,
+		commitHash: string,
+		repoRelativePath: string,
+	) => Promise<string | undefined>
 	private readonly getCurrentBranch: (repoRoot: string) => Promise<string>
 	private readonly getCurrentCommitSha: (repoRoot: string) => Promise<string>
 	private readonly getIsDetachedHead: (repoRoot: string) => Promise<boolean>
@@ -179,6 +308,8 @@ export class AiCodeCommitAttributionService {
 		toInclusive: string,
 	) => Promise<string[]>
 	private readonly listCommitsSinceTimestamp: (repoRoot: string, sinceTs: number) => Promise<string[]>
+	private readonly getAttributionConfig: () => Promise<AiCodeCommitAttributionConfig>
+	private readonly onCommitMatched?: (payload: AiCodeCommitMatchedPayload) => Promise<void>
 	private readonly onCommitComparisonCompleted?: () => Promise<void>
 	private started = false
 
@@ -190,12 +321,16 @@ export class AiCodeCommitAttributionService {
 		this.createWatcher = options.createWatcher ?? defaultCreateWatcher
 		this.loadCommitPatch = options.loadCommitPatch ?? defaultLoadCommitPatch
 		this.loadCommitTimestamp = options.loadCommitTimestamp ?? defaultLoadCommitTimestamp
+		this.loadCommitFileContent = options.loadCommitFileContent ?? defaultLoadCommitFileContent
 		this.getCurrentBranch = options.getCurrentBranch ?? getCurrentBranch
 		this.getCurrentCommitSha = options.getCurrentCommitSha ?? defaultGetCurrentCommitSha
 		this.getIsDetachedHead = options.isDetachedHead ?? isDetachedHead
 		this.isAncestor = options.isAncestor ?? defaultIsAncestor
 		this.listCommitsBetween = options.listCommitsBetween ?? defaultListCommitsBetween
 		this.listCommitsSinceTimestamp = options.listCommitsSinceTimestamp ?? defaultListCommitsSinceTimestamp
+		this.getAttributionConfig =
+			options.getAttributionConfig ?? (async () => DEFAULT_AI_CODE_COMMIT_ATTRIBUTION_CONFIG)
+		this.onCommitMatched = options.onCommitMatched
 		this.onCommitComparisonCompleted = options.onCommitComparisonCompleted
 	}
 
@@ -235,6 +370,21 @@ export class AiCodeCommitAttributionService {
 		for (const repoRoot of repoRoots) {
 			await this.ensureWatcher(repoRoot)
 		}
+	}
+
+	async refreshRepoTracking(repoRoot: string): Promise<void> {
+		const normalizedRepoRoot = normalizePath(path.resolve(repoRoot))
+		if (!this.started) {
+			return
+		}
+
+		const pendingLines = await this.store.getPendingLineAttributions(normalizedRepoRoot)
+		if (pendingLines.length === 0) {
+			await this.cleanupRepo(normalizedRepoRoot)
+			return
+		}
+
+		await this.ensureWatcher(normalizedRepoRoot)
 	}
 
 	private async ensureWatcher(repoRoot: string): Promise<void> {
@@ -373,7 +523,7 @@ export class AiCodeCommitAttributionService {
 		for (const bucket of buckets.values()) {
 			bucket.sort((left, right) => {
 				if (left.timestamp !== right.timestamp) {
-					return left.timestamp - right.timestamp
+					return right.timestamp - left.timestamp
 				}
 				if (left.occurrenceIndex !== right.occurrenceIndex) {
 					return left.occurrenceIndex - right.occurrenceIndex
@@ -391,6 +541,7 @@ export class AiCodeCommitAttributionService {
 		previousFilePath: string | undefined,
 		addedLines: CommitAddedLine[],
 		pendingBuckets: Map<string, AiCodePendingLineAttribution[]>,
+		commitOccurredAt: number,
 	): ExactMatchResult {
 		const currentFilePath = normalizePath(filePath)
 		const previousPath = previousFilePath ? normalizePath(previousFilePath) : undefined
@@ -398,7 +549,6 @@ export class AiCodeCommitAttributionService {
 		const absoluteFilePath = normalizePath(path.join(repoRoot, currentFilePath))
 		const matches: MatchedPendingLine[] = []
 		const matchedLineIds = new Set<string>()
-		const matchedBlockIds = new Set<string>()
 		const matchedAddedLineIndexes = new Set<number>()
 
 		for (const addedLine of addedLines) {
@@ -408,7 +558,11 @@ export class AiCodeCommitAttributionService {
 			for (const lookupPath of lookupPaths) {
 				const bucket = pendingBuckets.get(buildBucketKey(lookupPath, lineHash))
 				if (bucket && bucket.length > 0) {
-					pendingLine = bucket.shift()
+					pendingLine = this.pickExactPendingLine(
+						bucket,
+						matches[matches.length - 1]?.pendingLine,
+						commitOccurredAt,
+					)
 					break
 				}
 			}
@@ -427,25 +581,64 @@ export class AiCodeCommitAttributionService {
 				lineScore: 1,
 			})
 			matchedLineIds.add(pendingLine.id)
-			matchedBlockIds.add(pendingLine.blockId || pendingLine.generatedEventId)
 			matchedAddedLineIndexes.add(addedLine.index)
 		}
 
 		return {
 			matches,
 			matchedLineIds,
-			matchedBlockIds,
 			unmatchedAddedLines: addedLines.filter((line) => !matchedAddedLineIndexes.has(line.index)),
 		}
 	}
 
-	private buildCommittedEvents(
+	private pickExactPendingLine(
+		bucket: AiCodePendingLineAttribution[],
+		previousPendingLine: AiCodePendingLineAttribution | undefined,
+		commitOccurredAt: number,
+	): AiCodePendingLineAttribution | undefined {
+		if (!bucket.length) {
+			return undefined
+		}
+
+		const findCandidateIndex = (requireTimestampFence: boolean, requireContinuation: boolean): number =>
+			bucket.findIndex((candidate) => {
+				if (requireTimestampFence && candidate.timestamp > commitOccurredAt) {
+					return false
+				}
+				if (!requireContinuation || !previousPendingLine) {
+					return true
+				}
+				return (
+					candidate.blockId === previousPendingLine.blockId &&
+					candidate.repoRelativePath === previousPendingLine.repoRelativePath &&
+					candidate.blockLineIndex === previousPendingLine.blockLineIndex + 1
+				)
+			})
+
+		const preferredCandidateIndex = (previousPendingLine && findCandidateIndex(true, true)) ?? -1
+		if (preferredCandidateIndex >= 0) {
+			return bucket.splice(preferredCandidateIndex, 1)[0]
+		}
+
+		const eligibleIndex = findCandidateIndex(true, false)
+		if (eligibleIndex < 0) {
+			const fallbackContinuationIndex = (previousPendingLine && findCandidateIndex(false, true)) ?? -1
+			if (fallbackContinuationIndex >= 0) {
+				return bucket.splice(fallbackContinuationIndex, 1)[0]
+			}
+			return bucket.shift()
+		}
+		return bucket.splice(eligibleIndex, 1)[0]
+	}
+
+	private buildCommittedBlocks(
 		matches: MatchedPendingLine[],
 		branch: string,
 		commitHash: string,
 		commitOccurredAt: number,
-	): AiCodeStatsEvent[] {
-		const events: AiCodeStatsEvent[] = []
+		fileSnapshotContent?: string,
+	): AiCodeCommittedBlock[] {
+		const blocks: AiCodeCommittedBlock[] = []
 		let currentBlock: {
 			pendingLine: AiCodePendingLineAttribution
 			filePath: string
@@ -466,12 +659,12 @@ export class AiCodeCommitAttributionService {
 			const pendingLine = currentBlock.pendingLine
 			const equivalentLineCount = roundToFour(currentBlock.scoreSum)
 			const matchConfidence = roundToFour(currentBlock.scoreSum / Math.max(currentBlock.scoreCount, 1))
-			events.push({
+			blocks.push({
 				eventId: crypto.randomUUID(),
+				generatedBlockId: pendingLine.generatedEventId,
 				timestamp: commitOccurredAt,
 				sourceType: pendingLine.sourceType,
 				ide: pendingLine.ide,
-				metricType: "committed",
 				userName: pendingLine.userName,
 				userEmail: pendingLine.userEmail,
 				organizationId: pendingLine.organizationId,
@@ -489,6 +682,7 @@ export class AiCodeCommitAttributionService {
 				lineEnd: currentBlock.lineEnd,
 				lineCount: currentBlock.lines.length,
 				codeSnippet: currentBlock.lines.join("\n"),
+				fileSnapshotContent,
 				taskId: pendingLine.taskId,
 				commitHash,
 				commitOccurredAt,
@@ -533,13 +727,12 @@ export class AiCodeCommitAttributionService {
 		}
 
 		flushCurrentBlock()
-		return events
+		return blocks
 	}
 
 	private buildPendingBlockCandidates(
 		pendingLines: AiCodePendingLineAttribution[],
 		matchedLineIds: Set<string>,
-		matchedBlockIds: Set<string>,
 		currentFilePath: string,
 		previousFilePath: string | undefined,
 		commitOccurredAt: number,
@@ -549,9 +742,6 @@ export class AiCodeCommitAttributionService {
 
 		for (const pendingLine of pendingLines) {
 			if (matchedLineIds.has(pendingLine.id)) {
-				continue
-			}
-			if (matchedBlockIds.has(pendingLine.blockId || pendingLine.generatedEventId)) {
 				continue
 			}
 			if (pendingLine.timestamp > commitOccurredAt) {
@@ -596,18 +786,17 @@ export class AiCodeCommitAttributionService {
 						(left, right) => left.blockLineIndex - right.blockLineIndex || left.id.localeCompare(right.id),
 					),
 			}))
-			.filter((candidate) => candidate.lines.length >= 2 && candidate.blockLineCount >= 2)
+			.filter((candidate) => candidate.lines.length > 0)
 	}
 
-	private findBestPartialBlockMatch(
-		repoRoot: string,
+	private alignPartialBlockCandidates(
 		block: PendingBlockCandidate,
 		addedLines: CommitAddedLine[],
-	): PartialBlockMatchResult | null {
-		if (addedLines.length < 2 || block.lines.length < 2) {
-			return null
+		config: AiCodeCommitAttributionConfig,
+	): PartialLineCandidate[] {
+		if (addedLines.length === 0 || block.lines.length === 0) {
+			return []
 		}
-
 		const scores: number[][] = Array.from({ length: block.lines.length + 1 }, () =>
 			new Array<number>(addedLines.length + 1).fill(0),
 		)
@@ -625,7 +814,7 @@ export class AiCodeCommitAttributionService {
 				const pendingLine = block.lines[blockIndex - 1]
 				const addedLine = addedLines[addedIndex - 1]
 				const similarity = computeLineSimilarity(pendingLine, extractLineFeatures(addedLine.content))
-				const score = similarity.lineScore >= 0.85 ? similarity.lineScore : 0
+				const score = similarity.lineScore >= config.candidateMinLineScore ? similarity.lineScore : 0
 				lineScores[blockIndex - 1][addedIndex - 1] = score
 
 				const up = scores[blockIndex - 1][addedIndex]
@@ -673,40 +862,50 @@ export class AiCodeCommitAttributionService {
 		}
 
 		alignedPairs.reverse()
-		if (alignedPairs.length < 2) {
-			return null
+		if (alignedPairs.length === 0) {
+			return []
 		}
 
-		const scoreSum = alignedPairs.reduce((sum, pair) => sum + pair.score, 0)
-		const avgLineScore = roundToFour(scoreSum / alignedPairs.length)
-		const coverage = roundToFour(alignedPairs.length / Math.max(block.blockLineCount, 1))
-		if (coverage < 0.6) {
-			return null
-		}
-		if (avgLineScore < 0.88) {
-			return null
-		}
-		if (coverage < 0.8 && avgLineScore < 0.92) {
-			return null
-		}
+		return alignedPairs.map((pair, index) => {
+			const previousPair = alignedPairs[index - 1]
+			const nextPair = alignedPairs[index + 1]
+			const hasPreviousSupport =
+				!!previousPair &&
+				previousPair.pendingLine.blockLineIndex + 1 === pair.pendingLine.blockLineIndex &&
+				previousPair.addedLine.index + 1 === pair.addedLine.index
+			const hasNextSupport =
+				!!nextPair &&
+				pair.pendingLine.blockLineIndex + 1 === nextPair.pendingLine.blockLineIndex &&
+				pair.addedLine.index + 1 === nextPair.addedLine.index
 
-		const filePath = normalizePath(path.join(repoRoot, block.relativePath))
-		return {
-			matches: alignedPairs.map(({ pendingLine, addedLine, score }) => ({
-				pendingLine,
-				lineNumber: addedLine.lineNumber,
-				content: addedLine.content,
-				filePath,
-				relativePath: block.relativePath,
-				matchStrategy: "partial_block",
-				lineScore: score,
-			})),
-			matchedLineIds: new Set(alignedPairs.map((pair) => pair.pendingLine.id)),
-			matchedAddedLineIndexes: new Set(alignedPairs.map((pair) => pair.addedLine.index)),
-			avgLineScore,
-			coverage,
-			equivalentLineCount: roundToFour(scoreSum),
+			return {
+				blockId: block.blockId,
+				pendingLine: pair.pendingLine,
+				addedLine: pair.addedLine,
+				lineScore: pair.score,
+				hasNeighborSupport: hasPreviousSupport || hasNextSupport,
+				supportStrength: Number(hasPreviousSupport) + Number(hasNextSupport),
+				isGenericLine: this.isGenericPendingLine(pair.pendingLine),
+			}
+		})
+	}
+
+	private isGenericPendingLine(pendingLine: AiCodePendingLineAttribution): boolean {
+		const normalizedTokens = (pendingLine.normalizedTokenLine || "").split(/\s+/).filter(Boolean)
+		return pendingLine.rareIdentifiers.length === 0 && normalizedTokens.length > 0 && normalizedTokens.length <= 4
+	}
+
+	private comparePartialCandidates(left: PartialLineCandidate, right: PartialLineCandidate): number {
+		if (left.lineScore !== right.lineScore) {
+			return right.lineScore - left.lineScore
 		}
+		if (left.supportStrength !== right.supportStrength) {
+			return right.supportStrength - left.supportStrength
+		}
+		if (left.pendingLine.timestamp !== right.pendingLine.timestamp) {
+			return left.pendingLine.timestamp - right.pendingLine.timestamp
+		}
+		return left.pendingLine.id.localeCompare(right.pendingLine.id)
 	}
 
 	private matchPartialPendingBlocks(
@@ -716,61 +915,115 @@ export class AiCodeCommitAttributionService {
 		addedLines: CommitAddedLine[],
 		pendingLines: AiCodePendingLineAttribution[],
 		matchedLineIds: Set<string>,
-		matchedBlockIds: Set<string>,
 		commitOccurredAt: number,
+		config: AiCodeCommitAttributionConfig,
 	): PartialBlockMatchResult[] {
+		if (addedLines.length === 0) {
+			return []
+		}
+
 		const currentFilePath = normalizePath(filePath)
 		const previousPath = previousFilePath ? normalizePath(previousFilePath) : undefined
-		let availableAddedLines = addedLines.slice()
-		const acceptedMatches: PartialBlockMatchResult[] = []
 		const blockCandidates = this.buildPendingBlockCandidates(
 			pendingLines,
 			matchedLineIds,
-			matchedBlockIds,
 			currentFilePath,
 			previousPath,
 			commitOccurredAt,
 		)
 		if (blockCandidates.length === 0) {
-			return acceptedMatches
+			return []
 		}
 
-		const remainingBlocks = new Map(blockCandidates.map((candidate) => [candidate.blockId, candidate]))
-		while (availableAddedLines.length >= 2 && remainingBlocks.size > 0) {
-			let bestCandidate: PartialBlockMatchResult | null = null
-			let bestBlockId: string | null = null
+		const lineCandidates = blockCandidates.flatMap((block) =>
+			this.alignPartialBlockCandidates(block, addedLines, config),
+		)
+		if (lineCandidates.length === 0) {
+			return []
+		}
 
-			for (const block of remainingBlocks.values()) {
-				const candidate = this.findBestPartialBlockMatch(repoRoot, block, availableAddedLines)
-				if (!candidate) {
-					continue
-				}
+		const candidatesByAddedLine = new Map<number, PartialLineCandidate[]>()
+		for (const candidate of lineCandidates) {
+			const existing = candidatesByAddedLine.get(candidate.addedLine.index) ?? []
+			existing.push(candidate)
+			candidatesByAddedLine.set(candidate.addedLine.index, existing)
+		}
+
+		const eligibleCandidates: PartialLineCandidate[] = []
+		for (const candidates of candidatesByAddedLine.values()) {
+			const rankedCandidates = candidates
+				.slice()
+				.sort((left, right) => this.comparePartialCandidates(left, right))
+			const bestCandidate = rankedCandidates[0]
+			if (!bestCandidate) {
+				continue
+			}
+			const secondBestCandidate = rankedCandidates[1]
+			if (secondBestCandidate && bestCandidate.lineScore - secondBestCandidate.lineScore < config.ambiguityGap) {
+				continue
+			}
+
+			const passesThreshold = bestCandidate.isGenericLine
+				? bestCandidate.hasNeighborSupport && bestCandidate.lineScore >= config.contextualMinLineScore
+				: bestCandidate.lineScore >= config.isolatedMinLineScore ||
+					(bestCandidate.hasNeighborSupport && bestCandidate.lineScore >= config.contextualMinLineScore)
+			if (!passesThreshold) {
+				continue
+			}
+
+			eligibleCandidates.push(bestCandidate)
+		}
+
+		if (eligibleCandidates.length === 0) {
+			return []
+		}
+
+		const usedAddedLineIndexes = new Set<number>()
+		const usedPendingLineIds = new Set<string>()
+		const acceptedMatches = eligibleCandidates
+			.slice()
+			.sort((left, right) => this.comparePartialCandidates(left, right))
+			.filter((candidate) => {
 				if (
-					!bestCandidate ||
-					candidate.avgLineScore > bestCandidate.avgLineScore ||
-					(candidate.avgLineScore === bestCandidate.avgLineScore &&
-						candidate.coverage > bestCandidate.coverage) ||
-					(candidate.avgLineScore === bestCandidate.avgLineScore &&
-						candidate.coverage === bestCandidate.coverage &&
-						candidate.equivalentLineCount > bestCandidate.equivalentLineCount)
+					usedAddedLineIndexes.has(candidate.addedLine.index) ||
+					usedPendingLineIds.has(candidate.pendingLine.id)
 				) {
-					bestCandidate = candidate
-					bestBlockId = block.blockId
+					return false
 				}
-			}
+				usedAddedLineIndexes.add(candidate.addedLine.index)
+				usedPendingLineIds.add(candidate.pendingLine.id)
+				return true
+			})
 
-			if (!bestCandidate || !bestBlockId) {
-				break
+		const filePathAbsolute = normalizePath(path.join(repoRoot, currentFilePath))
+		const resultsByBlock = new Map<string, PartialBlockMatchResult>()
+		for (const acceptedMatch of acceptedMatches.sort(
+			(left, right) => left.addedLine.lineNumber - right.addedLine.lineNumber,
+		)) {
+			const existing = resultsByBlock.get(acceptedMatch.blockId) ?? {
+				matches: [],
+				matchedLineIds: new Set<string>(),
+				matchedAddedLineIndexes: new Set<number>(),
+				avgLineScore: 0,
+				equivalentLineCount: 0,
 			}
-
-			acceptedMatches.push(bestCandidate)
-			remainingBlocks.delete(bestBlockId)
-			availableAddedLines = availableAddedLines.filter(
-				(line) => !bestCandidate?.matchedAddedLineIndexes.has(line.index),
-			)
+			existing.matches.push({
+				pendingLine: acceptedMatch.pendingLine,
+				lineNumber: acceptedMatch.addedLine.lineNumber,
+				content: acceptedMatch.addedLine.content,
+				filePath: filePathAbsolute,
+				relativePath: currentFilePath,
+				matchStrategy: "partial",
+				lineScore: acceptedMatch.lineScore,
+			})
+			existing.matchedLineIds.add(acceptedMatch.pendingLine.id)
+			existing.matchedAddedLineIndexes.add(acceptedMatch.addedLine.index)
+			existing.equivalentLineCount = roundToFour(existing.equivalentLineCount + acceptedMatch.lineScore)
+			existing.avgLineScore = roundToFour(existing.equivalentLineCount / existing.matches.length)
+			resultsByBlock.set(acceptedMatch.blockId, existing)
 		}
 
-		return acceptedMatches
+		return [...resultsByBlock.values()]
 	}
 
 	private async resolveCommitsToReplay(
@@ -832,7 +1085,7 @@ export class AiCodeCommitAttributionService {
 		const pendingLines = await this.store.getPendingLineAttributions(repoRoot)
 		if (pendingLines.length === 0) {
 			await this.cleanupRepo(repoRoot)
-			return { processed: false, remainingPendingLines: 0 }
+			return { processed: false, remainingPendingLines: 0, committedBlocks: [], matchedLineIds: [] }
 		}
 
 		let patchContent = ""
@@ -840,86 +1093,158 @@ export class AiCodeCommitAttributionService {
 			patchContent = await this.loadCommitPatch(repoRoot, previousCommit, commitHash)
 		} catch (error) {
 			console.error("[AiCodeCommitAttribution] Failed to load commit patch:", error)
-			return { processed: false, remainingPendingLines: pendingLines.length }
+			return {
+				processed: false,
+				remainingPendingLines: pendingLines.length,
+				committedBlocks: [],
+				matchedLineIds: [],
+			}
 		}
 
-		if (!patchContent.trim()) {
-			return { processed: true, remainingPendingLines: pendingLines.length }
-		}
-
-		const files = this.extractor.extractAddedLinesFromPatch(patchContent)
-		if (files.length === 0) {
-			return { processed: true, remainingPendingLines: pendingLines.length }
-		}
-
-		const pendingBuckets = this.buildPendingBuckets(pendingLines)
-		const matchedLineIds = new Set<string>()
-		const matchedBlockIds = new Set<string>()
 		const commitOccurredAt = await this.getCommitOccurredAt(repoRoot, commitHash)
-		const committedEvents: AiCodeStatsEvent[] = []
-
-		for (const file of files) {
-			const indexedAddedLines = file.addedLines.map((line, index) => ({
-				index,
-				lineNumber: line.lineNumber,
-				content: line.content,
-			}))
-			const exactMatchResult = this.matchExactPendingLines(
-				repoRoot,
-				file.filePath,
-				file.previousFilePath,
-				indexedAddedLines,
-				pendingBuckets,
+		let attributionConfig = DEFAULT_AI_CODE_COMMIT_ATTRIBUTION_CONFIG
+		try {
+			attributionConfig = await this.getAttributionConfig()
+		} catch (error) {
+			console.warn(
+				"[AiCodeCommitAttribution] Failed to load attribution config, falling back to defaults:",
+				error,
 			)
-			for (const lineId of exactMatchResult.matchedLineIds) {
-				matchedLineIds.add(lineId)
-			}
-			for (const blockId of exactMatchResult.matchedBlockIds) {
-				matchedBlockIds.add(blockId)
-			}
+		}
 
-			const partialMatches = this.matchPartialPendingBlocks(
-				repoRoot,
-				file.filePath,
-				file.previousFilePath,
-				exactMatchResult.unmatchedAddedLines,
-				pendingLines,
-				matchedLineIds,
-				matchedBlockIds,
-				commitOccurredAt,
-			)
-			const fileMatches = exactMatchResult.matches
-				.concat(...partialMatches.map((result) => result.matches))
-				.sort((left, right) => left.lineNumber - right.lineNumber)
+		const committedBlocks: AiCodeCommittedBlock[] = []
+		const changedFiles: AiCodeCommitChangedFile[] = []
+		const matchedLineIds = new Set<string>()
+		const commitFileContentCache = new Map<string, Promise<string | undefined>>()
+		if (patchContent.trim()) {
+			const files = this.extractor.extractAddedLinesFromPatch(patchContent)
+			if (files.length > 0) {
+				const pendingBuckets = this.buildPendingBuckets(pendingLines)
 
-			for (const partialMatch of partialMatches) {
-				for (const lineId of partialMatch.matchedLineIds) {
-					matchedLineIds.add(lineId)
+				for (const file of files) {
+					const indexedAddedLines = file.addedLines.map((line, index) => ({
+						index,
+						lineNumber: line.lineNumber,
+						content: line.content,
+					}))
+					const exactMatchResult = this.matchExactPendingLines(
+						repoRoot,
+						file.filePath,
+						file.previousFilePath,
+						indexedAddedLines,
+						pendingBuckets,
+						commitOccurredAt,
+					)
+					for (const lineId of exactMatchResult.matchedLineIds) {
+						matchedLineIds.add(lineId)
+					}
+
+					const partialMatches = this.matchPartialPendingBlocks(
+						repoRoot,
+						file.filePath,
+						file.previousFilePath,
+						exactMatchResult.unmatchedAddedLines,
+						pendingLines,
+						matchedLineIds,
+						commitOccurredAt,
+						attributionConfig,
+					)
+					const fileMatches = exactMatchResult.matches
+						.concat(...partialMatches.map((result) => result.matches))
+						.sort((left, right) => left.lineNumber - right.lineNumber)
+
+					for (const partialMatch of partialMatches) {
+						for (const lineId of partialMatch.matchedLineIds) {
+							matchedLineIds.add(lineId)
+						}
+					}
+
+					const normalizedRelativePath = normalizePath(file.filePath)
+					const fileSnapshotPromise =
+						commitFileContentCache.get(normalizedRelativePath) ??
+						this.loadCommitFileContent(repoRoot, commitHash, normalizedRelativePath)
+					commitFileContentCache.set(normalizedRelativePath, fileSnapshotPromise)
+					const fileSnapshotContent = await fileSnapshotPromise
+
+					if (fileMatches.length > 0) {
+						committedBlocks.push(
+							...this.buildCommittedBlocks(
+								fileMatches,
+								branch,
+								commitHash,
+								commitOccurredAt,
+								fileSnapshotContent,
+							),
+						)
+					}
+
+					changedFiles.push({
+						relativePath: normalizedRelativePath,
+						filePath: normalizePath(path.join(repoRoot, normalizedRelativePath)),
+						previousFilePath: file.previousFilePath
+							? normalizePath(path.join(repoRoot, normalizePath(file.previousFilePath)))
+							: undefined,
+						language:
+							fileMatches[0]?.pendingLine.language ||
+							this.resolveChangedFileLanguage(file.filePath, file.previousFilePath),
+						committedSnapshotContent: fileSnapshotContent,
+						changedBlocks: file.changedBlocks.map((block) => ({
+							startLine: block.startLine,
+							endLine: block.endLine,
+							lineCount: block.lineCount,
+							codeSnippet: block.codeSnippet,
+							displayOrder: block.displayOrder,
+						})),
+					})
 				}
 			}
-
-			if (fileMatches.length === 0) {
-				continue
-			}
-
-			committedEvents.push(...this.buildCommittedEvents(fileMatches, branch, commitHash, commitOccurredAt))
 		}
 
-		if (committedEvents.length > 0) {
-			for (const committedEvent of committedEvents) {
-				await this.store.appendEvent(committedEvent)
+		try {
+			if (this.onCommitMatched) {
+				await this.onCommitMatched({
+					repoRoot,
+					branch,
+					commitHash,
+					previousCommit,
+					commitOccurredAt,
+					committedBlocks,
+					changedFiles,
+					matchedPendingLineIds: [...matchedLineIds],
+				})
+			} else if (committedBlocks.length > 0) {
+				await this.store.appendHistoryEvents(committedBlocks.map((block) => buildLegacyCommittedEvent(block)))
+				await this.store.removePendingLineAttributions([...matchedLineIds])
 			}
-
-			await this.store.removePendingLineAttributions([...matchedLineIds])
+		} catch (error) {
+			console.error("[AiCodeCommitAttribution] Failed to persist commit attribution report:", error)
+			return {
+				processed: false,
+				remainingPendingLines: pendingLines.length,
+				committedBlocks: [],
+				matchedLineIds: [],
+			}
 		}
 
 		const remainingPendingLines = await this.store.getPendingLineAttributions(repoRoot)
 		if (remainingPendingLines.length === 0) {
 			await this.cleanupRepo(repoRoot)
-			return { processed: true, remainingPendingLines: 0 }
+			return {
+				processed: true,
+				remainingPendingLines: 0,
+				commitOccurredAt,
+				committedBlocks,
+				matchedLineIds: [...matchedLineIds],
+			}
 		}
 
-		return { processed: true, remainingPendingLines: remainingPendingLines.length }
+		return {
+			processed: true,
+			remainingPendingLines: remainingPendingLines.length,
+			commitOccurredAt,
+			committedBlocks,
+			matchedLineIds: [...matchedLineIds],
+		}
 	}
 
 	private async notifyCommitComparisonCompleted(): Promise<void> {
@@ -957,5 +1282,11 @@ export class AiCodeCommitAttributionService {
 	private async cleanupRepo(repoRoot: string): Promise<void> {
 		this.stopWatcher(repoRoot)
 		await this.store.removeRepoObservedCommit(repoRoot)
+	}
+
+	private resolveChangedFileLanguage(filePath: string, previousFilePath?: string): string | undefined {
+		return (
+			inferLanguageFromPath(filePath) || (previousFilePath ? inferLanguageFromPath(previousFilePath) : undefined)
+		)
 	}
 }

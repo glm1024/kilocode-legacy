@@ -319,7 +319,12 @@ export class DiffViewProvider {
 			this.newProblemsMessage = newProblemsMessage
 			this.userEdits = userEdits
 			// kilocode_change start
-			await this.recordAgentInsertForStats(this.relPath, this.originalContent ?? "", normalizedEditedContent)
+			await this.recordAgentInsertForStats(
+				this.relPath,
+				this.originalContent ?? "",
+				normalizedNewContent,
+				normalizedEditedContent,
+			)
 			// kilocode_change end
 
 			return { newProblemsMessage, userEdits, finalContent: normalizedEditedContent }
@@ -329,7 +334,12 @@ export class DiffViewProvider {
 			this.newProblemsMessage = newProblemsMessage
 			this.userEdits = undefined
 			// kilocode_change start
-			await this.recordAgentInsertForStats(this.relPath, this.originalContent ?? "", normalizedEditedContent)
+			await this.recordAgentInsertForStats(
+				this.relPath,
+				this.originalContent ?? "",
+				normalizedNewContent,
+				normalizedEditedContent,
+			)
 			// kilocode_change end
 
 			return { newProblemsMessage, userEdits: undefined, finalContent: normalizedEditedContent }
@@ -691,6 +701,7 @@ export class DiffViewProvider {
 	private async recordAgentInsertForStats(
 		relPath: string,
 		originalContent: string,
+		proposedContent: string,
 		newContent: string,
 	): Promise<void> {
 		const aiCodeStatsService = AiCodeStatsService.getInstance()
@@ -705,6 +716,7 @@ export class DiffViewProvider {
 				filePath: path.resolve(this.cwd, relPath),
 				relativePath: relPath,
 				originalContent,
+				proposedContent,
 				newContent,
 				taskId: task?.taskId,
 			})
@@ -833,7 +845,7 @@ export class DiffViewProvider {
 		this.relPath = relPath
 		this.newContent = content
 		// kilocode_change start
-		await this.recordAgentInsertForStats(relPath, originalContent, content)
+		await this.recordAgentInsertForStats(relPath, originalContent, content, content)
 		// kilocode_change end
 
 		return {

@@ -1,5 +1,6 @@
 // pnpm --filter @roo-code/vscode-webview test src/components/settings/__tests__/SettingsView.spec.tsx
 
+import { useState } from "react"
 import { render, screen, fireEvent, waitFor, within } from "@/utils/test-utils"
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
 
@@ -637,10 +638,14 @@ describe("SettingsView - Allowed Commands", () => {
 		})
 
 		// kilocode_change start
-		it("renders statistics tab", () => {
+		it("renders coding analysis tab in the second position", () => {
 			renderSettingsView()
 
-			expect(screen.getByTestId("tab-statistics")).toBeInTheDocument()
+			const providersTab = screen.getByTestId("tab-providers")
+			const statisticsTab = screen.getByTestId("tab-statistics")
+
+			expect(statisticsTab).toBeInTheDocument()
+			expect(providersTab.compareDocumentPosition(statisticsTab) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
 		})
 		// kilocode_change end
 
@@ -770,7 +775,7 @@ describe("SettingsView - Statistics Webhook Save Validation", () => {
 
 		expect(vscode.postMessage).toHaveBeenCalledWith({
 			type: "testAiCodeStatsWebhook",
-			text: "https://new.example.com/webhook",
+			text: "https://new.example.com/webhook/api/v1/ingest/ai-code-stats",
 		})
 		expect(getPostMessageCallsByType("updateSettings")).toHaveLength(0)
 
@@ -863,6 +868,67 @@ describe("SettingsView - Statistics Webhook Save Validation", () => {
 			expect(screen.getByTestId("statistics-user-name-input")).toHaveValue("Team Nine")
 		})
 	})
+
+	it("keeps saved statistics values after leaving and reopening settings before extension state round-trips back", async () => {
+		const queryClient = new QueryClient()
+
+		const ReopenableSettings = () => {
+			const [isOpen, setIsOpen] = useState(true)
+
+			return isOpen ? (
+				<SettingsView onDone={() => setIsOpen(false)} targetSection="statistics" />
+			) : (
+				<button data-testid="reopen-settings" onClick={() => setIsOpen(true)}>
+					reopen
+				</button>
+			)
+		}
+
+		render(
+			<ExtensionStateContextProvider>
+				<QueryClientProvider client={queryClient}>
+					<ReopenableSettings />
+				</QueryClientProvider>
+			</ExtensionStateContextProvider>,
+		)
+
+		mockPostMessage({
+			aiCodeStatsWebhookUrl: "",
+			aiCodeStatsUserName: "",
+		})
+
+		fireEvent.change(screen.getByTestId("statistics-user-name-input"), {
+			target: { value: "glm" },
+		})
+		fireEvent.change(screen.getByTestId("statistics-webhook-url-input"), {
+			target: { value: "http://localhost:8081" },
+		})
+		fireEvent.click(screen.getByTestId("save-button"))
+
+		expect(vscode.postMessage).toHaveBeenCalledWith({
+			type: "testAiCodeStatsWebhook",
+			text: "http://localhost:8081/api/v1/ingest/ai-code-stats",
+		})
+
+		window.postMessage(
+			{
+				type: "aiCodeStatsWebhookTestResult",
+				success: true,
+				text: "",
+			},
+			"*",
+		)
+
+		await waitFor(() => {
+			expect(getPostMessageCallsByType("updateSettings").length).toBeGreaterThan(0)
+		})
+
+		fireEvent.click(screen.getByText("settings:common.done").closest("button")!)
+		fireEvent.click(screen.getByTestId("reopen-settings"))
+
+		expect(screen.getByTestId("statistics-user-name-input")).toHaveValue("glm")
+		expect(screen.getByTestId("statistics-webhook-url-input")).toHaveValue("http://localhost:8081")
+	})
 	// kilocode_change end
 
 	it("blocks save when webhook test fails", async () => {
@@ -878,7 +944,7 @@ describe("SettingsView - Statistics Webhook Save Validation", () => {
 
 		expect(vscode.postMessage).toHaveBeenCalledWith({
 			type: "testAiCodeStatsWebhook",
-			text: "https://new.example.com/webhook",
+			text: "https://new.example.com/webhook/api/v1/ingest/ai-code-stats",
 		})
 
 		window.postMessage(

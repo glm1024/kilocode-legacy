@@ -80,6 +80,7 @@ import { SessionManager } from "../../shared/kilocode/cli-sessions/core/SessionM
 import { SkillsManager } from "../../services/skills/SkillsManager"
 // kilocode_change start
 import { AiCodeStatsService } from "../../services/ai-code-stats"
+import { AiTokenUsageService } from "../../services/ai-token-usage"
 // kilocode_change end
 
 import { fileExistsAtPath } from "../../utils/fs"
@@ -342,6 +343,7 @@ export class ClineProvider
 		// kilocode_change start - Initialize auto-purge scheduler
 		this.initializeAutoPurgeScheduler()
 		this.initializeAiCodeStatsService()
+		this.initializeAiTokenUsageService()
 		// kilocode_change end
 	}
 
@@ -392,9 +394,9 @@ export class ClineProvider
 		try {
 			const globalStoragePath = this.contextProxy.globalStorageUri.fsPath
 			const aiCodeStatsService = AiCodeStatsService.initialize(globalStoragePath, async () => ({
-				webhookUrl: this.contextProxy.getValue("aiCodeStatsWebhookUrl") ?? "",
+				webhookUrl: this.getPersistedAiCodeStatsSetting("aiCodeStatsWebhookUrl"),
 				// kilocode_change start
-				userName: this.contextProxy.getValue("aiCodeStatsUserName") ?? "",
+				userName: this.getPersistedAiCodeStatsSetting("aiCodeStatsUserName"),
 				// kilocode_change end
 			}))
 			aiCodeStatsService.start()
@@ -404,6 +406,36 @@ export class ClineProvider
 				`Failed to initialize AI code stats service: ${error instanceof Error ? error.message : String(error)}`,
 			)
 		}
+	}
+
+	private initializeAiTokenUsageService() {
+		try {
+			const globalStoragePath = this.contextProxy.globalStorageUri.fsPath
+			const aiTokenUsageService = AiTokenUsageService.initialize(globalStoragePath, async () => ({
+				webhookUrl: this.getPersistedAiCodeStatsSetting("aiCodeStatsWebhookUrl"),
+				userName: this.getPersistedAiCodeStatsSetting("aiCodeStatsUserName"),
+			}))
+			aiTokenUsageService.start()
+			this.log("AI token usage service initialized")
+		} catch (error) {
+			this.log(
+				`Failed to initialize AI token usage service: ${error instanceof Error ? error.message : String(error)}`,
+			)
+		}
+	}
+
+	private getPersistedAiCodeStatsSetting(key: "aiCodeStatsWebhookUrl" | "aiCodeStatsUserName"): string {
+		const configuration = vscode.workspace.getConfiguration(Package.name)
+		const inspectedValue = configuration.inspect?.(key)
+		const configuredValue =
+			inspectedValue?.workspaceFolderValue ?? inspectedValue?.workspaceValue ?? inspectedValue?.globalValue
+
+		if (typeof configuredValue === "string") {
+			return configuredValue.trim()
+		}
+
+		const stateValue = this.context.globalState.get<string>(key)
+		return typeof stateValue === "string" ? stateValue.trim() : ""
 	}
 	// kilocode_change end
 
@@ -732,6 +764,7 @@ export class ClineProvider
 		// kilocode_change start
 		if (ClineProvider.activeInstances.size === 0) {
 			AiCodeStatsService.disposeInstance()
+			AiTokenUsageService.disposeInstance()
 		}
 		// kilocode_change end
 
@@ -2346,6 +2379,8 @@ export class ClineProvider
 			yoloMode, // kilocode_change
 			yoloGatekeeperApiConfigId, // kilocode_change: AI gatekeeper for YOLO mode
 			selectedMicrophoneDevice, // kilocode_change: Selected microphone device for STT
+			aiCodeStatsWebhookUrl,
+			aiCodeStatsUserName,
 			isBrowserSessionActive,
 		} = await this.getState()
 
@@ -2563,6 +2598,8 @@ export class ClineProvider
 			includeCurrentTime: includeCurrentTime ?? true,
 			includeCurrentCost: includeCurrentCost ?? true,
 			maxGitStatusFiles: maxGitStatusFiles ?? 0,
+			aiCodeStatsWebhookUrl,
+			aiCodeStatsUserName,
 			taskSyncEnabled,
 			remoteControlEnabled,
 			imageGenerationProvider,
@@ -2629,6 +2666,8 @@ export class ClineProvider
 		>
 	> {
 		const stateValues = this.contextProxy.getValues()
+		const aiCodeStatsWebhookUrl = this.getPersistedAiCodeStatsSetting("aiCodeStatsWebhookUrl")
+		const aiCodeStatsUserName = this.getPersistedAiCodeStatsSetting("aiCodeStatsUserName")
 		const customModes = await this.customModesManager.getCustomModes()
 
 		// Determine apiProvider with the same logic as before.
@@ -2802,9 +2841,9 @@ export class ClineProvider
 			autoPurgeIncompleteTaskRetentionDays: stateValues.autoPurgeIncompleteTaskRetentionDays ?? 7,
 			autoPurgeLastRunTimestamp: stateValues.autoPurgeLastRunTimestamp,
 			aiCodeStatsUploadEnabled: stateValues.aiCodeStatsUploadEnabled ?? false,
-			aiCodeStatsWebhookUrl: stateValues.aiCodeStatsWebhookUrl ?? "",
+			aiCodeStatsWebhookUrl,
 			// kilocode_change start - AI code stats user name
-			aiCodeStatsUserName: stateValues.aiCodeStatsUserName ?? "",
+			aiCodeStatsUserName,
 			// kilocode_change end
 			selectedMicrophoneDevice: stateValues.selectedMicrophoneDevice, // kilocode_change: Selected microphone device for STT
 			// kilocode_change end

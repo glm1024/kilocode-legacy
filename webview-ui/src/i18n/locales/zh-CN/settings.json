@@ -45,18 +45,19 @@
 		"autoPurge": "自动清理",
 		"agentBehaviour": "智能体行为",
 		"autocomplete": "自动补全",
-		"statistics": "统计"
+		"statistics": "编码分析"
 	},
 	"statistics": {
-		"tip": "本页用于统计 AI 建议代码行数、AI 写入工作区的生成代码行数，以及 AI 最终进入提交的采纳代码行数，并支持历史数据补传。",
-		"suggestedLines": {
-			"label": "AI 建议代码行数",
-			"empty": "暂无数据"
+		"tip": "本页展示当前插件本地记录的编码分析指标，包括入库率、入库行数、采纳率、采纳行数、生成行数，以及 Token 消耗量。",
+		"userName": {
+			"label": "用户名",
+			"placeholder": "例如：张三…",
+			"description": "请填写真实姓名。"
 		},
 		"webhook": {
 			"label": "上报服务器地址",
-			"placeholder": "例如：http://100.7.132.102:8081",
-			"description": "用于接收 AI 代码统计数据，填写后系统将按计划自动上报。",
+			"placeholder": "例如：http://100.7.132.102:8081…",
+			"description": "用于接收 AI 代码统计与 Token 消耗数据。",
 			"test": {
 				"success": "连通测试成功",
 				"failed": "连通测试失败",
@@ -71,38 +72,58 @@
 				"networkError": "无法连接到上报服务器，请检查地址、端口和服务是否已启动。"
 			}
 		},
+		"analysis": {
+			"label": "分析范围"
+		},
+		"customDate": {
+			"startLabel": "开始日期",
+			"endLabel": "结束日期"
+		},
+		"retentionRate": {
+			"label": "入库率",
+			"empty": "暂无数据",
+			"tooltip": "入库行数 / 采纳行数",
+			"ariaLabel": "查看入库率说明"
+		},
 		"generatedLines": {
-			"label": "AI 生成代码行数",
-			"empty": "暂无数据"
+			"label": "生成行数",
+			"empty": "暂无数据",
+			"tooltip": "AI 生成代码行数汇总",
+			"ariaLabel": "查看生成行数说明"
+		},
+		"acceptedLines": {
+			"label": "采纳行数",
+			"empty": "暂无数据",
+			"tooltip": "被采纳的 AI 代码行数汇总",
+			"ariaLabel": "查看采纳行数说明"
 		},
 		"committedLines": {
-			"label": "AI 采纳代码行数",
-			"empty": "暂无数据"
+			"label": "入库行数",
+			"empty": "暂无数据",
+			"tooltip": "最终进入 commit 的 AI 代码行数汇总",
+			"ariaLabel": "查看入库行数说明"
 		},
 		"adoptionRate": {
 			"label": "采纳率",
-			"empty": "暂无数据"
+			"empty": "暂无数据",
+			"tooltip": "采纳行数 / 生成行数",
+			"ariaLabel": "查看采纳率说明"
+		},
+		"tokenUsage": {
+			"label": "Token 消耗量",
+			"empty": "暂无数据",
+			"tooltip": "当前范围内输入、输出与总 Token 累计",
+			"ariaLabel": "查看 Token 消耗量说明",
+			"input": "输入",
+			"output": "输出",
+			"total": "总 Token"
 		},
 		"range": {
 			"current": "当天",
-			"last3days": "最近 3 天",
 			"last7days": "本周",
 			"last30days": "本月",
 			"custom": "自定义时间段",
 			"all": "全部"
-		},
-		"lastSuccessfulUpload": {
-			"label": "最近一次成功上报时间",
-			"empty": "尚无成功上报"
-		},
-		"uploadTest": {
-			"title": "历史数据补传",
-			"description": "可按所选时间范围补传历史数据；填写上报服务器地址后，系统会在本地时间每日 13:00 自动上报。",
-			"button": "点击补传",
-			"testing": "补传中...",
-			"success": "补传成功",
-			"failed": "补传失败",
-			"webhookRequired": "请先填写上报服务器地址。"
 		}
 	},
 	"about": {

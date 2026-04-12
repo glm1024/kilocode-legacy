@@ -45,18 +45,19 @@
 		"autoPurge": "Auto-Cleanup",
 		"agentBehaviour": "Agent Behaviour",
 		"autocomplete": "Autocomplete",
-		"statistics": "Statistics"
+		"statistics": "Coding Analysis"
 	},
 	"statistics": {
-		"tip": "This page tracks AI suggested lines, AI generated code lines written into the workspace, and AI committed adoption lines, and supports historical data backfill.",
-		"suggestedLines": {
-			"label": "AI Suggested Code Lines",
-			"empty": "No data yet"
+		"tip": "This page shows locally recorded coding analysis metrics for this plugin, including retention rate, committed lines, adoption rate, accepted lines, generated lines, and token usage.",
+		"userName": {
+			"label": "Username",
+			"placeholder": "e.g. Alice Zhang…",
+			"description": "Please enter your real name."
 		},
 		"webhook": {
 			"label": "Upload Server URL",
-			"placeholder": "e.g. http://100.7.132.102:8081",
-			"description": "Used to receive AI code statistics data. Once filled, scheduled automatic uploads will run.",
+			"placeholder": "e.g. http://100.7.132.102:8081…",
+			"description": "Used to receive AI code statistics and token usage uploads. After you configure it, scheduled uploads will run and both ingest endpoints are validated on save.",
 			"test": {
 				"success": "Connectivity test succeeded",
 				"failed": "Connectivity test failed",
@@ -71,38 +72,58 @@
 				"networkError": "Could not connect to the upload server. Check the address, port, and whether the server is running."
 			}
 		},
+		"analysis": {
+			"label": "Analysis Range"
+		},
+		"customDate": {
+			"startLabel": "Start Date",
+			"endLabel": "End Date"
+		},
+		"retentionRate": {
+			"label": "Retention Rate",
+			"empty": "No data yet",
+			"tooltip": "Committed lines / accepted lines",
+			"ariaLabel": "Show retention rate details"
+		},
 		"generatedLines": {
-			"label": "AI Generated Code Lines",
-			"empty": "No data yet"
+			"label": "Generated Lines",
+			"empty": "No data yet",
+			"tooltip": "Total AI-generated code lines in the selected range",
+			"ariaLabel": "Show generated lines details"
+		},
+		"acceptedLines": {
+			"label": "Accepted Lines",
+			"empty": "No data yet",
+			"tooltip": "Total AI code lines that were accepted",
+			"ariaLabel": "Show accepted lines details"
 		},
 		"committedLines": {
-			"label": "AI Committed Adoption Lines",
-			"empty": "No data yet"
+			"label": "Committed Lines",
+			"empty": "No data yet",
+			"tooltip": "Total AI code lines that ultimately entered a commit",
+			"ariaLabel": "Show committed lines details"
 		},
 		"adoptionRate": {
 			"label": "Adoption Rate",
-			"empty": "No data yet"
+			"empty": "No data yet",
+			"tooltip": "Accepted lines / generated lines",
+			"ariaLabel": "Show adoption rate details"
+		},
+		"tokenUsage": {
+			"label": "Token Usage",
+			"empty": "No data yet",
+			"tooltip": "Cumulative input, output, and total token usage in the selected range",
+			"ariaLabel": "Show token usage details",
+			"input": "Input",
+			"output": "Output",
+			"total": "Total Tokens"
 		},
 		"range": {
 			"current": "Today",
-			"last3days": "Last 3 days",
 			"last7days": "This week",
 			"last30days": "This month",
 			"custom": "Custom range",
 			"all": "All"
-		},
-		"lastSuccessfulUpload": {
-			"label": "Last successful upload time",
-			"empty": "No successful uploads yet"
-		},
-		"uploadTest": {
-			"title": "Historical data backfill",
-			"description": "You can backfill historical data for the selected range. After the upload URL is configured, automatic uploads run daily at 13:00 local time.",
-			"button": "Backfill now",
-			"testing": "Backfilling...",
-			"success": "Backfill succeeded",
-			"failed": "Backfill failed",
-			"webhookRequired": "Please configure the upload server URL first."
 		}
 	},
 	"about": {

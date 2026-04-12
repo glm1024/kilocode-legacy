@@ -186,6 +186,9 @@ vi.mock("vscode", () => ({
 		Development: 2,
 		Test: 3,
 	},
+	ConfigurationTarget: {
+		Global: 1,
+	},
 	// kilocode_change start
 	UIKind: {
 		1: "Desktop",
@@ -399,6 +402,9 @@ describe("ClineProvider", () => {
 	let mockWebviewView: vscode.WebviewView
 	let mockPostMessage: any
 	let updateGlobalStateSpy: any
+	let mockWorkspaceConfigurationGet: ReturnType<typeof vi.fn>
+	let mockWorkspaceConfigurationUpdate: ReturnType<typeof vi.fn>
+	let mockWorkspaceConfigurationInspect: ReturnType<typeof vi.fn>
 
 	beforeEach(() => {
 		vi.clearAllMocks()
@@ -413,6 +419,15 @@ describe("ClineProvider", () => {
 		}
 
 		const secrets: Record<string, string | undefined> = {}
+
+		mockWorkspaceConfigurationGet = vi.fn()
+		mockWorkspaceConfigurationUpdate = vi.fn().mockResolvedValue(undefined)
+		mockWorkspaceConfigurationInspect = vi.fn().mockReturnValue(undefined)
+		vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
+			get: mockWorkspaceConfigurationGet,
+			update: mockWorkspaceConfigurationUpdate,
+			inspect: mockWorkspaceConfigurationInspect,
+		} as unknown as vscode.WorkspaceConfiguration)
 
 		mockContext = {
 			extensionPath: "/test/path",
@@ -836,6 +851,58 @@ describe("ClineProvider", () => {
 		expect(state.writeDelayMs).toBe(1000)
 	})
 
+	test("getState prefers persisted VS Code settings for AI code stats fields", async () => {
+		mockWorkspaceConfigurationInspect.mockImplementation((key: string) => {
+			if (key === "aiCodeStatsWebhookUrl") {
+				return { globalValue: "  https://stats.example.com/upload  " }
+			}
+			if (key === "aiCodeStatsUserName") {
+				return { globalValue: "  Alice Zhang  " }
+			}
+			return undefined
+		})
+		;(mockContext.globalState.get as any).mockImplementation((key: string) => {
+			if (key === "aiCodeStatsWebhookUrl") {
+				return "https://old.example.com/upload"
+			}
+			if (key === "aiCodeStatsUserName") {
+				return "Old Name"
+			}
+			return undefined
+		})
+
+		const state = await provider.getState()
+
+		expect(state.aiCodeStatsWebhookUrl).toBe("https://stats.example.com/upload")
+		expect(state.aiCodeStatsUserName).toBe("Alice Zhang")
+	})
+
+	test("getStateToPostToWebview includes persisted VS Code settings for AI code stats fields", async () => {
+		mockWorkspaceConfigurationInspect.mockImplementation((key: string) => {
+			if (key === "aiCodeStatsWebhookUrl") {
+				return { globalValue: "  http://localhost:8081  " }
+			}
+			if (key === "aiCodeStatsUserName") {
+				return { globalValue: "  glm  " }
+			}
+			return undefined
+		})
+		;(mockContext.globalState.get as any).mockImplementation((key: string) => {
+			if (key === "aiCodeStatsWebhookUrl") {
+				return ""
+			}
+			if (key === "aiCodeStatsUserName") {
+				return ""
+			}
+			return undefined
+		})
+
+		const state = await provider.getStateToPostToWebview()
+
+		expect(state.aiCodeStatsWebhookUrl).toBe("http://localhost:8081")
+		expect(state.aiCodeStatsUserName).toBe("glm")
+	})
+
 	test("handles writeDelayMs message", async () => {
 		await provider.resolveWebviewView(mockWebviewView)
 		const messageHandler = (mockWebviewView.webview.onDidReceiveMessage as any).mock.calls[0][0]
@@ -844,6 +911,38 @@ describe("ClineProvider", () => {
 
 		expect(updateGlobalStateSpy).toHaveBeenCalledWith("writeDelayMs", 2000)
 		expect(mockContext.globalState.update).toHaveBeenCalledWith("writeDelayMs", 2000)
+		expect(mockPostMessage).toHaveBeenCalled()
+	})
+
+	test("handles ai code stats settings message with persistent storage", async () => {
+		await provider.resolveWebviewView(mockWebviewView)
+		const messageHandler = (mockWebviewView.webview.onDidReceiveMessage as any).mock.calls[0][0]
+
+		await messageHandler({
+			type: "updateSettings",
+			updatedSettings: {
+				aiCodeStatsWebhookUrl: "  https://stats.example.com/upload  ",
+				aiCodeStatsUserName: "  Alice Zhang  ",
+			},
+		})
+
+		expect(updateGlobalStateSpy).toHaveBeenCalledWith("aiCodeStatsWebhookUrl", "https://stats.example.com/upload")
+		expect(updateGlobalStateSpy).toHaveBeenCalledWith("aiCodeStatsUserName", "Alice Zhang")
+		expect(mockContext.globalState.update).toHaveBeenCalledWith(
+			"aiCodeStatsWebhookUrl",
+			"https://stats.example.com/upload",
+		)
+		expect(mockContext.globalState.update).toHaveBeenCalledWith("aiCodeStatsUserName", "Alice Zhang")
+		expect(mockWorkspaceConfigurationUpdate).toHaveBeenCalledWith(
+			"aiCodeStatsWebhookUrl",
+			"https://stats.example.com/upload",
+			vscode.ConfigurationTarget.Global,
+		)
+		expect(mockWorkspaceConfigurationUpdate).toHaveBeenCalledWith(
+			"aiCodeStatsUserName",
+			"Alice Zhang",
+			vscode.ConfigurationTarget.Global,
+		)
 		expect(mockPostMessage).toHaveBeenCalled()
 	})
 

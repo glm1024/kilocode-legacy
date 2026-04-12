@@ -1,13 +1,13 @@
-export const AI_CODE_STATS_INGEST_PATH = "/api/v1/ingest/ai-code-stats"
-const AI_TOKEN_USAGE_INGEST_PATH = "/api/v1/ingest/ai-token-usage"
+export const AI_TOKEN_USAGE_INGEST_PATH = "/api/v1/ingest/ai-token-usage"
+const AI_CODE_STATS_INGEST_PATH = "/api/v1/ingest/ai-code-stats"
 
-export class InvalidAiCodeStatsWebhookUrlError extends Error {
+export class InvalidAiTokenUsageWebhookUrlError extends Error {
 	constructor(
 		public readonly code: "invalid_url" | "unsupported_protocol",
 		message: string,
 	) {
 		super(message)
-		this.name = "InvalidAiCodeStatsWebhookUrlError"
+		this.name = "InvalidAiTokenUsageWebhookUrlError"
 	}
 }
 
@@ -35,7 +35,7 @@ const resolveIngestPath = (pathname: string, targetPath: string): string => {
 	return `${normalizedPathname}${targetPath}`
 }
 
-export const resolveAiCodeStatsWebhookUrl = (rawValue: string): string => {
+export const resolveAiTokenUsageWebhookUrl = (rawValue: string): string => {
 	const trimmed = rawValue.trim()
 	if (!trimmed) {
 		return ""
@@ -45,17 +45,17 @@ export const resolveAiCodeStatsWebhookUrl = (rawValue: string): string => {
 	try {
 		parsedUrl = new URL(trimmed)
 	} catch {
-		throw new InvalidAiCodeStatsWebhookUrlError("invalid_url", "Upload server URL is not a valid URL.")
+		throw new InvalidAiTokenUsageWebhookUrlError("invalid_url", "Upload server URL is not a valid URL.")
 	}
 
 	if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
-		throw new InvalidAiCodeStatsWebhookUrlError(
+		throw new InvalidAiTokenUsageWebhookUrlError(
 			"unsupported_protocol",
 			"Upload server URL must start with http:// or https://.",
 		)
 	}
 
-	parsedUrl.pathname = resolveIngestPath(parsedUrl.pathname, AI_CODE_STATS_INGEST_PATH)
+	parsedUrl.pathname = resolveIngestPath(parsedUrl.pathname, AI_TOKEN_USAGE_INGEST_PATH)
 	parsedUrl.hash = ""
 	return parsedUrl.toString()
 }

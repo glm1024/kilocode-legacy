@@ -40,6 +40,8 @@
 	"settings.vsCodeLmModelSelector.vendor.description": "语言模型的供应商（例如：copilot）",
 	"settings.vsCodeLmModelSelector.family.description": "语言模型的系列（例如：gpt-4）",
 	"settings.customStoragePath.description": "自定义存储路径。留空以使用默认位置。支持绝对路径（例如：'D:\\KiloCodeStorage'）",
+	"settings.aiCodeStatsUserName.description": "AI 编码统计上报使用的持久化用户名。与统计设置页共享，并会在 VS Code 重启或扩展重装后保留。",
+	"settings.aiCodeStatsWebhookUrl.description": "AI 编码统计上报使用的持久化服务器地址。与统计设置页共享，并会在 VS Code 重启或扩展重装后保留。",
 	"settings.enableCodeActions.description": "启用 Kilo Code 快速修复",
 	"settings.enableSettingsSync.description": "启用通过 VS Code Settings Sync 跨设备同步 Kilo Code 设置。启用后，当您登录 VS Code Settings Sync 时，您的 API 配置、自定义模式和首选项将自动同步。",
 	"settings.autoImportSettingsPath.description": "Kilo Code 配置文件的路径，用于在扩展启动时自动导入。支持绝对路径和相对于主目录的路径（例如 '~/Documents/kilo-code-settings.json'）。留空以禁用自动导入。",

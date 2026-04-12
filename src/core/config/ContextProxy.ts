@@ -21,6 +21,7 @@ import {
 import { TelemetryService } from "@roo-code/telemetry"
 
 import { logger } from "../../utils/logging"
+import { Package } from "../../shared/package"
 
 // kilocode_change start: Configuration change event types
 export interface ManagedIndexerConfig {
@@ -35,8 +36,30 @@ type SecretStateKey = keyof SecretState
 type RooCodeSettingsKey = keyof RooCodeSettings
 
 const PASS_THROUGH_STATE_KEYS = ["taskHistory"]
+const CONFIG_BACKED_GLOBAL_STATE_KEYS = ["aiCodeStatsWebhookUrl", "aiCodeStatsUserName"] as const
 
 export const isPassThroughStateKey = (key: string) => PASS_THROUGH_STATE_KEYS.includes(key)
+
+type ConfigBackedGlobalStateKey = (typeof CONFIG_BACKED_GLOBAL_STATE_KEYS)[number]
+
+const isConfigBackedGlobalStateKey = (key: string): key is ConfigBackedGlobalStateKey =>
+	CONFIG_BACKED_GLOBAL_STATE_KEYS.includes(key as ConfigBackedGlobalStateKey)
+
+const normalizeConfigBackedGlobalStateValue = <K extends ConfigBackedGlobalStateKey>(
+	value: GlobalState[K],
+): GlobalState[K] => {
+	if (typeof value === "string") {
+		return value.trim() as GlobalState[K]
+	}
+	return value
+}
+
+const hasConfigBackedGlobalStateValue = <K extends ConfigBackedGlobalStateKey>(value: GlobalState[K]) => {
+	if (typeof value === "string") {
+		return value.trim().length > 0
+	}
+	return value !== undefined
+}
 
 const globalSettingsExportSchema = globalSettingsSchema.omit({
 	taskHistory: true,
@@ -108,6 +131,9 @@ export class ContextProxy {
 		// Migration: Sanitize invalid/removed API providers
 		await this.migrateInvalidApiProvider()
 
+		// Keep a durable copy of selected user-facing settings in VS Code user settings.
+		await this.syncConfigBackedGlobalState()
+
 		this._isInitialized = true
 	}
 
@@ -174,6 +200,39 @@ export class ContextProxy {
 		}
 	}
 
+	private async syncConfigBackedGlobalState() {
+		const configuration = vscode.workspace.getConfiguration(Package.name)
+
+		for (const key of CONFIG_BACKED_GLOBAL_STATE_KEYS) {
+			const configValue = normalizeConfigBackedGlobalStateValue(configuration.get(key) as GlobalState[typeof key])
+			const stateValue = normalizeConfigBackedGlobalStateValue(this.stateCache[key] as GlobalState[typeof key])
+
+			if (hasConfigBackedGlobalStateValue(configValue)) {
+				if (stateValue !== configValue) {
+					this.stateCache[key] = configValue
+					await this.originalContext.globalState.update(key, configValue)
+				}
+				continue
+			}
+
+			if (hasConfigBackedGlobalStateValue(stateValue)) {
+				await configuration.update(key, stateValue, vscode.ConfigurationTarget.Global)
+			}
+		}
+	}
+
+	private async updateConfigBackedGlobalState<K extends ConfigBackedGlobalStateKey>(key: K, value: GlobalState[K]) {
+		const normalizedValue = normalizeConfigBackedGlobalStateValue(value)
+		this.stateCache[key] = normalizedValue
+
+		await Promise.all([
+			this.originalContext.globalState.update(key, normalizedValue),
+			vscode.workspace
+				.getConfiguration(Package.name)
+				.update(key, normalizedValue, vscode.ConfigurationTarget.Global),
+		])
+	}
+
 	public get extensionUri() {
 		return this.originalContext.extensionUri
 	}
@@ -211,11 +270,24 @@ export class ContextProxy {
 			return value === undefined || value === null ? defaultValue : value
 		}
 
+		if (isConfigBackedGlobalStateKey(key)) {
+			const configurationValue = normalizeConfigBackedGlobalStateValue(
+				vscode.workspace.getConfiguration(Package.name).get(key) as GlobalState[K],
+			)
+			if (hasConfigBackedGlobalStateValue(configurationValue)) {
+				return configurationValue
+			}
+		}
+
 		const value = this.stateCache[key]
 		return value !== undefined ? value : defaultValue
 	}
 
 	updateGlobalState<K extends GlobalStateKey>(key: K, value: GlobalState[K]) {
+		if (isConfigBackedGlobalStateKey(key)) {
+			return this.updateConfigBackedGlobalState(key, value)
+		}
+
 		if (isPassThroughStateKey(key)) {
 			return this.originalContext.globalState.update(key, value)
 		}
@@ -416,6 +488,10 @@ export class ContextProxy {
 	 */
 
 	public async setValue<K extends RooCodeSettingsKey>(key: K, value: RooCodeSettings[K]) {
+		if (!isSecretStateKey(key) && isConfigBackedGlobalStateKey(key)) {
+			return this.updateConfigBackedGlobalState(key, value as GlobalState[typeof key])
+		}
+
 		return isSecretStateKey(key)
 			? this.storeSecret(key as SecretStateKey, value as string)
 			: this.updateGlobalState(key as GlobalStateKey, value)
@@ -473,6 +549,11 @@ export class ContextProxy {
 
 		await Promise.all([
 			...GLOBAL_STATE_KEYS.map((key) => this.originalContext.globalState.update(key, undefined)),
+			...CONFIG_BACKED_GLOBAL_STATE_KEYS.map((key) =>
+				vscode.workspace
+					.getConfiguration(Package.name)
+					.update(key, undefined, vscode.ConfigurationTarget.Global),
+			),
 			...SECRET_STATE_KEYS.map((key) => this.originalContext.secrets.delete(key)),
 			...GLOBAL_SECRET_KEYS.map((key) => this.originalContext.secrets.delete(key)),
 		])

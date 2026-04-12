@@ -1,3 +1,4 @@
+import crypto from "crypto"
 import * as vscode from "vscode"
 import {
 	extractPrefixSuffix,
@@ -26,6 +27,7 @@ import { shouldSkipAutocomplete } from "./contextualSkip"
 import { RooIgnoreController } from "../../../core/ignore/RooIgnoreController"
 import { ClineProvider } from "../../../core/webview/ClineProvider"
 import { AutocompleteTelemetry } from "./AutocompleteTelemetry"
+import { AiCodeStatsService } from "../../ai-code-stats/AiCodeStatsService"
 
 const MAX_SUGGESTIONS_HISTORY = 20
 
@@ -275,6 +277,7 @@ export class AutocompleteInlineCompletionProvider implements vscode.InlineComple
 	private telemetry: AutocompleteTelemetry | null
 	/** Information about the last suggestion shown to the user */
 	private lastSuggestion: LastSuggestionInfo | null = null
+	private lastShownSuggestionKey: string | null = null
 
 	constructor(
 		context: vscode.ExtensionContext,
@@ -310,9 +313,109 @@ export class AutocompleteInlineCompletionProvider implements vscode.InlineComple
 		this.recentlyVisitedRangesService = new RecentlyVisitedRangesService(ide)
 		this.recentlyEditedTracker = new RecentlyEditedTracker(ide)
 
-		this.acceptedCommand = vscode.commands.registerCommand(INLINE_COMPLETION_ACCEPTED_COMMAND, () =>
-			this.telemetry?.captureAcceptSuggestion(this.lastSuggestion?.length),
-		)
+		this.acceptedCommand = vscode.commands.registerCommand(INLINE_COMPLETION_ACCEPTED_COMMAND, () => {
+			this.telemetry?.captureAcceptSuggestion(this.lastSuggestion?.length)
+
+			if (!this.lastSuggestion) {
+				return
+			}
+
+			const aiCodeStatsService = AiCodeStatsService.getInstance()
+			if (!aiCodeStatsService) {
+				return
+			}
+
+			void aiCodeStatsService
+				.recordAutocompleteSuggestionAccepted({
+					suggestionId: this.lastSuggestion.suggestionId,
+					document: this.lastSuggestion.document,
+					position: this.lastSuggestion.position,
+					suggestionText: this.lastSuggestion.suggestionText,
+				})
+				.catch((error) => {
+					console.warn(
+						`[AutocompleteInlineCompletionProvider] Failed to record accepted autocomplete suggestion: ${
+							error instanceof Error ? error.message : String(error)
+						}`,
+					)
+				})
+		})
+	}
+
+	private clearLastSuggestion(): void {
+		this.lastSuggestion = null
+		this.lastShownSuggestionKey = null
+	}
+
+	private buildSuggestionDisplayKey(
+		document: vscode.TextDocument,
+		position: vscode.Position,
+		fillInAtCursor: FillInAtCursorSuggestion,
+		displayedText: string,
+	): string {
+		return [
+			document.uri.toString(),
+			position.line,
+			position.character,
+			fillInAtCursor.prefix,
+			fillInAtCursor.suffix,
+			displayedText,
+		].join("|")
+	}
+
+	private recordDisplayedSuggestion(
+		document: vscode.TextDocument,
+		position: vscode.Position,
+		fillInAtCursor: FillInAtCursorSuggestion,
+		displayedText: string,
+		telemetryContext: AutocompleteContext,
+	): void {
+		if (!displayedText) {
+			this.clearLastSuggestion()
+			return
+		}
+
+		const displayKey = this.buildSuggestionDisplayKey(document, position, fillInAtCursor, displayedText)
+		const previousDisplayKey = this.lastShownSuggestionKey
+		const previousSuggestionId =
+			previousDisplayKey === displayKey && this.lastSuggestion ? this.lastSuggestion.suggestionId : undefined
+		const shouldRecordGenerated = !previousSuggestionId
+		const suggestionId = previousSuggestionId ?? crypto.randomUUID()
+
+		this.lastShownSuggestionKey = displayKey
+		this.lastSuggestion = {
+			...telemetryContext,
+			length: displayedText.length,
+			lineCount: countLines(displayedText),
+			suggestionId,
+			suggestionText: displayedText,
+			document,
+			position,
+		}
+
+		if (!shouldRecordGenerated) {
+			return
+		}
+
+		const aiCodeStatsService = AiCodeStatsService.getInstance()
+		if (!aiCodeStatsService) {
+			return
+		}
+
+		void aiCodeStatsService
+			.recordAutocompleteSuggestionShown({
+				suggestionId,
+				document,
+				position,
+				suggestionText: displayedText,
+			})
+			.catch((error) => {
+				console.warn(
+					`[AutocompleteInlineCompletionProvider] Failed to record shown autocomplete suggestion: ${
+						error instanceof Error ? error.message : String(error)
+					}`,
+				)
+			})
 	}
 
 	public updateSuggestions(fillInAtCursor: FillInAtCursorSuggestion): void {
@@ -519,16 +622,20 @@ export class AutocompleteInlineCompletionProvider implements vscode.InlineComple
 			)
 
 			if (matchingResult !== null) {
-				this.lastSuggestion = {
-					...telemetryContext,
-					length: matchingResult.text.length,
-				}
+				this.recordDisplayedSuggestion(
+					document,
+					position,
+					matchingResult.fillInAtCursor,
+					matchingResult.text,
+					telemetryContext,
+				)
 				this.telemetry?.captureCacheHit(matchingResult.matchType, telemetryContext, matchingResult.text.length)
 				this.telemetry?.startVisibilityTracking(matchingResult.fillInAtCursor, "cache", telemetryContext)
 				return stringToInlineCompletions(matchingResult.text, position)
 			}
 
 			this.telemetry?.cancelVisibilityTracking() // No suggestion to show - cancel any pending visibility tracking
+			this.clearLastSuggestion()
 
 			// Only skip new LLM requests during mid-word typing or at end of statement
 			// Cache lookups above are still allowed
@@ -548,14 +655,18 @@ export class AutocompleteInlineCompletionProvider implements vscode.InlineComple
 				prefix,
 			)
 			if (cachedResult) {
-				this.lastSuggestion = {
-					...telemetryContext,
-					length: cachedResult.text.length,
-				}
+				this.recordDisplayedSuggestion(
+					document,
+					position,
+					cachedResult.fillInAtCursor,
+					cachedResult.text,
+					telemetryContext,
+				)
 				this.telemetry?.captureLlmSuggestionReturned(telemetryContext, cachedResult.text.length)
 				this.telemetry?.startVisibilityTracking(cachedResult.fillInAtCursor, "llm", telemetryContext)
 			} else {
 				this.telemetry?.cancelVisibilityTracking() // No suggestion to show - cancel any pending visibility tracking
+				this.clearLastSuggestion()
 			}
 
 			return stringToInlineCompletions(cachedResult?.text ?? "", position)
