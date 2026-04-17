@@ -36,6 +36,7 @@ const buildEvent = (overrides: Partial<AiCodeStatsEvent> = {}): AiCodeStatsEvent
 	equivalentLineCount: overrides.equivalentLineCount,
 	commitHash: overrides.commitHash,
 	commitOccurredAt: overrides.commitOccurredAt,
+	matchDetail: overrides.matchDetail,
 })
 
 const buildCommitReport = (overrides: Partial<AiCodeCommitReport> = {}): AiCodeCommitReport => ({
@@ -350,6 +351,93 @@ describe("AiCodeStatsUploader", () => {
 			],
 		})
 		expect(await store.getQueuedReportsForTests()).toHaveLength(0)
+	})
+
+	it("keeps committed partial matchDetail when uploading queued commit reports", async () => {
+		await store.queueCommitReport(
+			buildQueuedReport({
+				report: buildCommitReport({
+					reportId: "report-score-detail",
+					commitHash: "commit-score-detail",
+					acceptedBlocks: [],
+					generatedBlocks: [],
+					committedBlocks: [
+						{
+							eventId: "committed-partial-score",
+							generatedBlockId: "generated-score",
+							timestamp: Date.now(),
+							sourceType: "agent_insert",
+							ide: "vscode",
+							workspaceName: "project",
+							workspacePath: "/workspace/project",
+							projectKey: "project-key",
+							filePath: "/workspace/project/src/a.ts",
+							relativePath: "src/a.ts",
+							language: "typescript",
+							gitRemoteUrl: "https://github.com/example/repo.git",
+							gitBranch: "feature/stats",
+							lineStart: 2,
+							lineEnd: 2,
+							lineCount: 1,
+							codeSnippet: "return total - tax",
+							commitHash: "commit-score-detail",
+							commitOccurredAt: Date.now(),
+							matchStrategy: "partial",
+							matchConfidence: 0.724,
+							equivalentLineCount: 0.724,
+							matchDetail: {
+								scoreSource: "attribution",
+								finalScore: 0.724,
+								baseScore: 0.694,
+								editSimilarity: 0.812,
+								tokenSimilarity: 0.7,
+								overlapSimilarity: 0.5,
+								adjustments: ["inline_comment_bonus"],
+								lineDetails: [
+									{
+										committedLineNumber: 2,
+										generatedLineNumber: 2,
+										scoreSource: "attribution",
+										finalScore: 0.724,
+										baseScore: 0.694,
+										editSimilarity: 0.812,
+										tokenSimilarity: 0.7,
+										overlapSimilarity: 0.5,
+										overlapKind: "identifier",
+										adjustments: ["inline_comment_bonus"],
+									},
+								],
+							},
+						},
+					],
+					changedFiles: [],
+				}),
+			}),
+		)
+
+		const fetchMock = vi.fn().mockResolvedValue(new Response("ok", { status: 200 }))
+		vi.stubGlobal("fetch", fetchMock)
+
+		await uploader.uploadQueuedReports(
+			{ enabled: true, webhookUrl: "https://example.com/webhook" },
+			{ client: { ide: "vscode" } },
+		)
+
+		expect(fetchMock.mock.calls).toHaveLength(1)
+		const requestBody = JSON.parse(fetchMock.mock.calls[0][1].body as string)
+		expect(requestBody.committedBlocks[0].matchDetail).toMatchObject({
+			scoreSource: "attribution",
+			finalScore: 0.724,
+			baseScore: 0.694,
+			adjustments: ["inline_comment_bonus"],
+			lineDetails: [
+				{
+					committedLineNumber: 2,
+					generatedLineNumber: 2,
+					overlapKind: "identifier",
+				},
+			],
+		})
 	})
 
 	it("keeps queued commit reports frozen when upload fails and retries them later", async () => {

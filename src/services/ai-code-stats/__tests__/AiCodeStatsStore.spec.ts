@@ -37,6 +37,7 @@ const buildEvent = (overrides: Partial<AiCodeStatsEvent> = {}): AiCodeStatsEvent
 	commitHash: overrides.commitHash,
 	commitOccurredAt: overrides.commitOccurredAt,
 	generatedBlockId: overrides.generatedBlockId,
+	matchDetail: overrides.matchDetail,
 })
 
 const buildPendingLine = (overrides: Partial<AiCodePendingLineAttribution> = {}): AiCodePendingLineAttribution => {
@@ -465,6 +466,99 @@ describe("AiCodeStatsStore", () => {
 		await store.acknowledgeQueuedCommitReport("report-1")
 		const persistedPendingLines = await store.getPendingLineAttributions("/repo")
 		expect(persistedPendingLines.map((line) => line.id)).toEqual(["line-2"])
+	})
+
+	it("persists committed partial matchDetail across queued report reloads", async () => {
+		await store.queueCommitReport(
+			buildQueuedReport({
+				report: {
+					version: "v2",
+					source: "kilocode-ai-code-stats",
+					mode: "commit_report",
+					reportId: "report-score-detail",
+					reportGeneratedAt: Date.now(),
+					semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
+					client: { ide: "vscode" },
+					repoRoot: "/repo",
+					workspaceName: "workspace",
+					workspacePath: "/workspace",
+					projectKey: "project-key",
+					gitBranch: "feature/stats",
+					commitHash: "commit-score-detail",
+					previousCommitHash: "commit-0",
+					commitOccurredAt: Date.now(),
+					acceptedBlocks: [],
+					generatedBlocks: [],
+					committedBlocks: [
+						{
+							eventId: "committed-score-detail",
+							generatedBlockId: "generated-score-detail",
+							timestamp: Date.now(),
+							semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
+							sourceType: "agent_insert",
+							ide: "vscode",
+							workspaceName: "workspace",
+							workspacePath: "/workspace",
+							projectKey: "project-key",
+							filePath: "/repo/src/a.ts",
+							relativePath: "src/a.ts",
+							language: "typescript",
+							gitBranch: "feature/stats",
+							lineStart: 2,
+							lineEnd: 2,
+							lineCount: 1,
+							codeSnippet: "return total - tax",
+							commitHash: "commit-score-detail",
+							commitOccurredAt: Date.now(),
+							matchStrategy: "partial",
+							matchConfidence: 0.724,
+							equivalentLineCount: 0.724,
+							matchDetail: {
+								scoreSource: "attribution",
+								finalScore: 0.724,
+								baseScore: 0.694,
+								editSimilarity: 0.812,
+								tokenSimilarity: 0.7,
+								overlapSimilarity: 0.5,
+								adjustments: ["inline_comment_bonus"],
+								lineDetails: [
+									{
+										committedLineNumber: 2,
+										generatedLineNumber: 2,
+										scoreSource: "attribution",
+										finalScore: 0.724,
+										baseScore: 0.694,
+										editSimilarity: 0.812,
+										tokenSimilarity: 0.7,
+										overlapSimilarity: 0.5,
+										overlapKind: "identifier",
+										adjustments: ["inline_comment_bonus"],
+									},
+								],
+							},
+						},
+					],
+					changedFiles: [],
+				},
+			}),
+		)
+
+		const reloadedStore = new AiCodeStatsStore(tmpDir)
+		const queuedReports = await reloadedStore.getQueuedReportsForTests()
+		expect(queuedReports).toHaveLength(1)
+		expect(queuedReports[0]?.report.committedBlocks[0]?.matchDetail).toMatchObject({
+			scoreSource: "attribution",
+			finalScore: 0.724,
+			baseScore: 0.694,
+			adjustments: ["inline_comment_bonus"],
+			lineDetails: [
+				expect.objectContaining({
+					committedLineNumber: 2,
+					generatedLineNumber: 2,
+					overlapKind: "identifier",
+				}),
+			],
+		})
 	})
 
 	it("reattributes pending generated and accepted lines to the commit day when queueing a report", async () => {

@@ -8,14 +8,31 @@ import { promisify } from "util"
 import { GitWatcher, type GitWatcherEvent } from "../../shared/GitWatcher"
 import { getCurrentBranch, isDetachedHead } from "../code-index/managed/git-utils"
 import { AiCodeDiffExtractor } from "./AiCodeDiffExtractor"
-import { computeLineSimilarity, extractLineFeatures, roundToFour } from "./AiCodeLineFeatures"
+import { roundToFour } from "./AiCodeLineFeatures"
 import { hashLineFingerprint } from "./AiCodeLineFingerprint"
+import {
+	createSharedPartialMatcherExecutor,
+	type AiCodeCommitPartialMatcherExecutor,
+} from "./AiCodeCommitPartialMatcherWorkerClient"
+import {
+	AiCodeCommitPartialMatcher,
+	PartialMatcherCancelledError,
+	type AddedLineCandidate,
+	type CommitAddedLine,
+	type PartialAlignmentDebugStats,
+	type PartialBlockMatchResult,
+	type PartialLineCandidate,
+	type PendingBlockCandidate,
+} from "./AiCodeCommitPartialMatcher"
 import { AiCodeStatsStore } from "./AiCodeStatsStore"
 import {
 	DEFAULT_AI_CODE_COMMIT_ATTRIBUTION_CONFIG,
 	normalizePath,
 	type AiCodeCommitAttributionConfig,
 	type AiCodeCommitChangedFile,
+	type AiCodeCommitLineMatchDetail,
+	type AiCodeCommitMatchAdjustment,
+	type AiCodeCommitMatchDetail,
 	type AiCodeStatsEvent,
 	type AiCodeCommittedBlock,
 	type AiCodeCommitMatchStrategy,
@@ -35,51 +52,34 @@ interface AiCodeCommitWatcher {
 interface MatchedPendingLine {
 	pendingLine: AiCodePendingLineAttribution
 	lineNumber: number
+	addedIndex?: number
 	content: string
 	filePath: string
 	relativePath: string
 	matchStrategy: AiCodeCommitMatchStrategy
 	lineScore: number
-}
-
-interface CommitAddedLine {
-	index: number
-	lineNumber: number
-	content: string
+	lineMatchDetail?: AiCodeCommitLineMatchDetail
+	exactMeta?: {
+		pendingBlockId: string
+		pendingBlockLineIndex: number
+		isContinuousWithPreviousExact: boolean
+		selectedFromDuplicateCandidate: boolean
+	}
 }
 
 interface ExactMatchResult {
 	matches: MatchedPendingLine[]
 	matchedLineIds: Set<string>
+	matchedAddedLineIndexes: Set<number>
 	unmatchedAddedLines: CommitAddedLine[]
 }
 
-interface PendingBlockCandidate {
-	blockId: string
-	repoRelativePath: string
-	filePath: string
-	relativePath: string
-	blockLineCount: number
-	timestamp: number
-	lines: AiCodePendingLineAttribution[]
-}
-
-interface PartialBlockMatchResult {
+interface SuspiciousExactResolution {
 	matches: MatchedPendingLine[]
 	matchedLineIds: Set<string>
 	matchedAddedLineIndexes: Set<number>
-	avgLineScore: number
-	equivalentLineCount: number
-}
-
-interface PartialLineCandidate {
-	blockId: string
-	pendingLine: AiCodePendingLineAttribution
-	addedLine: CommitAddedLine
-	lineScore: number
-	hasNeighborSupport: boolean
-	supportStrength: number
-	isGenericLine: boolean
+	unmatchedAddedLines: CommitAddedLine[]
+	partialMatches: PartialBlockMatchResult[]
 }
 
 export interface AiCodeCommitAttributionServiceOptions {
@@ -100,6 +100,7 @@ export interface AiCodeCommitAttributionServiceOptions {
 	getAttributionConfig?: () => Promise<AiCodeCommitAttributionConfig>
 	onCommitMatched?: (payload: AiCodeCommitMatchedPayload) => Promise<void>
 	onCommitComparisonCompleted?: () => Promise<void>
+	partialMatcherExecutor?: AiCodeCommitPartialMatcherExecutor
 }
 
 const defaultCreateWatcher = (repoRoot: string): AiCodeCommitWatcher => new GitWatcher({ cwd: repoRoot })
@@ -196,6 +197,8 @@ const defaultListCommitsSinceTimestamp = async (repoRoot: string, sinceTs: numbe
 }
 
 const buildBucketKey = (repoRelativePath: string, lineHash: string) => `${repoRelativePath}\u0000${lineHash}`
+const SUSPICIOUS_EXACT_CONTEXT_LINES = 3
+const SUSPICIOUS_EXACT_MAX_WINDOW_LINES = 12
 
 const LANGUAGE_BY_EXTENSION: Record<string, string> = {
 	".js": "javascript",
@@ -265,7 +268,53 @@ const buildLegacyCommittedEvent = (block: AiCodeCommittedBlock): AiCodeStatsEven
 	matchStrategy: block.matchStrategy,
 	matchConfidence: block.matchConfidence,
 	equivalentLineCount: block.equivalentLineCount,
+	matchDetail: block.matchDetail,
 })
+
+const aggregateCommittedBlockMatchDetail = (
+	lineDetails: AiCodeCommitLineMatchDetail[],
+): AiCodeCommitMatchDetail | undefined => {
+	if (lineDetails.length === 0) {
+		return undefined
+	}
+
+	const totals = lineDetails.reduce(
+		(result, detail) => {
+			result.finalScore += detail.finalScore
+			result.baseScore += detail.baseScore
+			result.editSimilarity += detail.editSimilarity
+			result.tokenSimilarity += detail.tokenSimilarity
+			result.overlapSimilarity += detail.overlapSimilarity
+			for (const adjustment of detail.adjustments) {
+				result.adjustments.add(adjustment)
+			}
+			return result
+		},
+		{
+			finalScore: 0,
+			baseScore: 0,
+			editSimilarity: 0,
+			tokenSimilarity: 0,
+			overlapSimilarity: 0,
+			adjustments: new Set<AiCodeCommitMatchAdjustment>(),
+		},
+	)
+	const divisor = Math.max(lineDetails.length, 1)
+
+	return {
+		scoreSource: "attribution",
+		finalScore: roundToFour(totals.finalScore / divisor),
+		baseScore: roundToFour(totals.baseScore / divisor),
+		editSimilarity: roundToFour(totals.editSimilarity / divisor),
+		tokenSimilarity: roundToFour(totals.tokenSimilarity / divisor),
+		overlapSimilarity: roundToFour(totals.overlapSimilarity / divisor),
+		adjustments: [...totals.adjustments].sort((left, right) => left.localeCompare(right)),
+		lineDetails: lineDetails.map((detail) => ({
+			...detail,
+			adjustments: [...detail.adjustments],
+		})),
+	}
+}
 
 interface CommitProcessResult {
 	processed: boolean
@@ -311,6 +360,8 @@ export class AiCodeCommitAttributionService {
 	private readonly getAttributionConfig: () => Promise<AiCodeCommitAttributionConfig>
 	private readonly onCommitMatched?: (payload: AiCodeCommitMatchedPayload) => Promise<void>
 	private readonly onCommitComparisonCompleted?: () => Promise<void>
+	private readonly partialMatcherExecutor: AiCodeCommitPartialMatcherExecutor
+	private readonly partialMatcher = new AiCodeCommitPartialMatcher()
 	private started = false
 
 	constructor(
@@ -332,6 +383,7 @@ export class AiCodeCommitAttributionService {
 			options.getAttributionConfig ?? (async () => DEFAULT_AI_CODE_COMMIT_ATTRIBUTION_CONFIG)
 		this.onCommitMatched = options.onCommitMatched
 		this.onCommitComparisonCompleted = options.onCommitComparisonCompleted
+		this.partialMatcherExecutor = options.partialMatcherExecutor ?? createSharedPartialMatcherExecutor()
 	}
 
 	async start(): Promise<void> {
@@ -349,6 +401,7 @@ export class AiCodeCommitAttributionService {
 
 	stop(): void {
 		this.started = false
+		this.partialMatcherExecutor.dispose()
 		for (const watcher of this.watchers.values()) {
 			watcher.dispose()
 		}
@@ -554,10 +607,12 @@ export class AiCodeCommitAttributionService {
 		for (const addedLine of addedLines) {
 			const lineHash = hashLineFingerprint(addedLine.content)
 			let pendingLine: AiCodePendingLineAttribution | undefined
+			let selectedFromDuplicateCandidate = false
 
 			for (const lookupPath of lookupPaths) {
 				const bucket = pendingBuckets.get(buildBucketKey(lookupPath, lineHash))
 				if (bucket && bucket.length > 0) {
+					selectedFromDuplicateCandidate = bucket.length > 1
 					pendingLine = this.pickExactPendingLine(
 						bucket,
 						matches[matches.length - 1]?.pendingLine,
@@ -571,14 +626,28 @@ export class AiCodeCommitAttributionService {
 				continue
 			}
 
+			const previousExactLine = matches[matches.length - 1]?.pendingLine
+			const isContinuousWithPreviousExact =
+				!!previousExactLine &&
+				pendingLine.blockId === previousExactLine.blockId &&
+				pendingLine.repoRelativePath === previousExactLine.repoRelativePath &&
+				pendingLine.blockLineIndex === previousExactLine.blockLineIndex + 1
+
 			matches.push({
 				pendingLine,
 				lineNumber: addedLine.lineNumber,
+				addedIndex: addedLine.index,
 				content: addedLine.content,
 				filePath: absoluteFilePath,
 				relativePath: currentFilePath,
 				matchStrategy: "exact",
 				lineScore: 1,
+				exactMeta: {
+					pendingBlockId: pendingLine.blockId || pendingLine.generatedEventId,
+					pendingBlockLineIndex: pendingLine.blockLineIndex,
+					isContinuousWithPreviousExact,
+					selectedFromDuplicateCandidate,
+				},
 			})
 			matchedLineIds.add(pendingLine.id)
 			matchedAddedLineIndexes.add(addedLine.index)
@@ -587,6 +656,7 @@ export class AiCodeCommitAttributionService {
 		return {
 			matches,
 			matchedLineIds,
+			matchedAddedLineIndexes,
 			unmatchedAddedLines: addedLines.filter((line) => !matchedAddedLineIndexes.has(line.index)),
 		}
 	}
@@ -631,6 +701,320 @@ export class AiCodeCommitAttributionService {
 		return bucket.splice(eligibleIndex, 1)[0]
 	}
 
+	private resolveSuspiciousExactWindows(params: {
+		repoRoot: string
+		filePath: string
+		previousFilePath?: string
+		addedLines: CommitAddedLine[]
+		pendingLines: AiCodePendingLineAttribution[]
+		exactMatchResult: ExactMatchResult
+		commitOccurredAt: number
+		config: AiCodeCommitAttributionConfig
+	}): SuspiciousExactResolution {
+		let exactMatches = params.exactMatchResult.matches.slice()
+		const partialMatches: PartialBlockMatchResult[] = []
+		const visitedSuspiciousAddedIndexes = new Set<number>()
+
+		while (true) {
+			const suspiciousMatch = this.findSuspiciousExactMatch(
+				exactMatches,
+				params.addedLines,
+				params.pendingLines,
+				visitedSuspiciousAddedIndexes,
+			)
+			if (!suspiciousMatch) {
+				break
+			}
+			visitedSuspiciousAddedIndexes.add(suspiciousMatch.current.addedIndex!)
+
+			let localPartialMatches: PartialBlockMatchResult[]
+			try {
+				localPartialMatches = this.tryResolveSuspiciousExactMatchWithPartial({
+					...params,
+					exactMatches,
+					previous: suspiciousMatch.previous,
+					current: suspiciousMatch.current,
+				})
+			} catch (error) {
+				console.warn("[AiCodeCommitAttribution] Failed to resolve suspicious exact match:", error)
+				continue
+			}
+			if (localPartialMatches.length === 0) {
+				continue
+			}
+
+			const replacedAddedIndexes = this.collectMatchedAddedIndexes(localPartialMatches)
+			if (!replacedAddedIndexes.has(suspiciousMatch.current.addedIndex!)) {
+				continue
+			}
+
+			exactMatches = exactMatches.filter(
+				(match) => match.addedIndex === undefined || !replacedAddedIndexes.has(match.addedIndex),
+			)
+			partialMatches.push(...localPartialMatches)
+		}
+
+		return this.buildSuspiciousExactResolution(params.addedLines, exactMatches, partialMatches)
+	}
+
+	private findSuspiciousExactMatch(
+		exactMatches: MatchedPendingLine[],
+		addedLines: CommitAddedLine[],
+		pendingLines: AiCodePendingLineAttribution[],
+		visitedAddedIndexes: Set<number>,
+	): { previous: MatchedPendingLine; current: MatchedPendingLine } | undefined {
+		const sortedMatches = exactMatches
+			.filter((match) => match.addedIndex !== undefined)
+			.slice()
+			.sort((left, right) => left.addedIndex! - right.addedIndex!)
+
+		for (let currentIndex = 0; currentIndex < sortedMatches.length; currentIndex += 1) {
+			const current = sortedMatches[currentIndex]
+			if (current.addedIndex === undefined || visitedAddedIndexes.has(current.addedIndex)) {
+				continue
+			}
+			if (!this.hasMeaningfulLineContent(current.content)) {
+				continue
+			}
+
+			for (let previousIndex = currentIndex - 1; previousIndex >= 0; previousIndex -= 1) {
+				const previous = sortedMatches[previousIndex]
+				if (!this.isSamePendingBlock(previous.pendingLine, current.pendingLine)) {
+					continue
+				}
+				if (previous.addedIndex === undefined) {
+					continue
+				}
+
+				const addedDistance = current.addedIndex - previous.addedIndex
+				const blockDistance = current.pendingLine.blockLineIndex - previous.pendingLine.blockLineIndex
+				if (addedDistance <= 0) {
+					break
+				}
+				if (blockDistance <= 0) {
+					return { previous, current }
+				}
+				if (blockDistance <= addedDistance) {
+					break
+				}
+				if (!this.hasMeaningfulSkippedPendingLine(pendingLines, previous.pendingLine, current.pendingLine)) {
+					break
+				}
+				if (!this.hasMeaningfulAddedLineInRange(addedLines, previous.addedIndex + 1, current.addedIndex)) {
+					break
+				}
+				return { previous, current }
+			}
+		}
+
+		return undefined
+	}
+
+	private tryResolveSuspiciousExactMatchWithPartial(params: {
+		repoRoot: string
+		filePath: string
+		previousFilePath?: string
+		addedLines: CommitAddedLine[]
+		pendingLines: AiCodePendingLineAttribution[]
+		exactMatches: MatchedPendingLine[]
+		previous: MatchedPendingLine
+		current: MatchedPendingLine
+		commitOccurredAt: number
+		config: AiCodeCommitAttributionConfig
+	}): PartialBlockMatchResult[] {
+		if (params.previous.addedIndex === undefined || params.current.addedIndex === undefined) {
+			return []
+		}
+
+		const windowStart = Math.max(
+			params.previous.addedIndex + 1,
+			params.current.addedIndex - SUSPICIOUS_EXACT_CONTEXT_LINES,
+		)
+		const windowEnd = Math.min(
+			params.addedLines.length - 1,
+			params.current.addedIndex + SUSPICIOUS_EXACT_CONTEXT_LINES,
+			windowStart + SUSPICIOUS_EXACT_MAX_WINDOW_LINES - 1,
+		)
+		const localAddedLines = params.addedLines.filter((line) => line.index >= windowStart && line.index <= windowEnd)
+		if (!localAddedLines.some((line) => this.hasMeaningfulLineContent(line.content))) {
+			return []
+		}
+
+		const localMatchedLineIds = this.buildLocalPartialBlockedLineIds(
+			params.pendingLines,
+			params.exactMatches,
+			params.previous,
+			params.current,
+			windowStart,
+			windowEnd,
+			params.current.pendingLine.blockLineIndex <= params.previous.pendingLine.blockLineIndex,
+		)
+		const localPartialMatches = this.partialMatcher.matchPartialPendingBlocks({
+			repoRoot: params.repoRoot,
+			filePath: params.filePath,
+			previousFilePath: params.previousFilePath,
+			addedLines: localAddedLines,
+			pendingLines: params.pendingLines,
+			matchedLineIds: localMatchedLineIds,
+			exactMatches: params.exactMatches.filter((match) => match.addedIndex !== params.current.addedIndex),
+			commitOccurredAt: params.commitOccurredAt,
+			config: params.config,
+		})
+		if (!this.isAcceptableSuspiciousPartialReplacement(localPartialMatches, params.current.addedIndex)) {
+			return []
+		}
+		return localPartialMatches
+	}
+
+	private buildLocalPartialBlockedLineIds(
+		pendingLines: AiCodePendingLineAttribution[],
+		exactMatches: MatchedPendingLine[],
+		previous: MatchedPendingLine,
+		current: MatchedPendingLine,
+		windowStart: number,
+		windowEnd: number,
+		isOutOfOrderExact: boolean,
+	): Set<string> {
+		const allowedStart = previous.pendingLine.blockLineIndex + 1
+		const allowedEnd = isOutOfOrderExact
+			? previous.pendingLine.blockLineIndex + Math.max(1, current.addedIndex! - previous.addedIndex!)
+			: current.pendingLine.blockLineIndex - 1
+		const allowedLineIds = new Set(
+			pendingLines
+				.filter(
+					(line) =>
+						this.isSamePendingBlock(line, current.pendingLine) &&
+						line.blockLineIndex >= allowedStart &&
+						line.blockLineIndex <= allowedEnd,
+				)
+				.map((line) => line.id),
+		)
+		const blockedLineIds = new Set(
+			pendingLines.filter((line) => !allowedLineIds.has(line.id)).map((line) => line.id),
+		)
+		for (const exactMatch of exactMatches) {
+			if (
+				exactMatch.addedIndex !== undefined &&
+				exactMatch.addedIndex >= windowStart &&
+				exactMatch.addedIndex <= windowEnd
+			) {
+				continue
+			}
+			if (allowedLineIds.has(exactMatch.pendingLine.id)) {
+				continue
+			}
+			blockedLineIds.add(exactMatch.pendingLine.id)
+		}
+		return blockedLineIds
+	}
+
+	private isAcceptableSuspiciousPartialReplacement(
+		partialMatches: PartialBlockMatchResult[],
+		currentExactAddedIndex: number,
+	): boolean {
+		const matchedAddedIndexes = this.collectMatchedAddedIndexes(partialMatches)
+		if (!matchedAddedIndexes.has(currentExactAddedIndex)) {
+			return false
+		}
+
+		return partialMatches.some((partialMatch) => {
+			if (!this.isMonotonicPartialMatch(partialMatch.matches)) {
+				return false
+			}
+			return partialMatch.matches.some((match) => this.hasMeaningfulLineContent(match.content))
+		})
+	}
+
+	private isMonotonicPartialMatch(matches: MatchedPendingLine[]): boolean {
+		const sortedMatches = matches.slice().sort((left, right) => left.lineNumber - right.lineNumber)
+		for (let index = 1; index < sortedMatches.length; index += 1) {
+			const previous = sortedMatches[index - 1]
+			const current = sortedMatches[index]
+			if (!this.isSamePendingBlock(previous.pendingLine, current.pendingLine)) {
+				continue
+			}
+			if (current.pendingLine.blockLineIndex <= previous.pendingLine.blockLineIndex) {
+				return false
+			}
+		}
+		return true
+	}
+
+	private buildSuspiciousExactResolution(
+		addedLines: CommitAddedLine[],
+		exactMatches: MatchedPendingLine[],
+		partialMatches: PartialBlockMatchResult[],
+	): SuspiciousExactResolution {
+		const matchedLineIds = new Set<string>()
+		const matchedAddedLineIndexes = new Set<number>()
+		for (const exactMatch of exactMatches) {
+			matchedLineIds.add(exactMatch.pendingLine.id)
+			if (exactMatch.addedIndex !== undefined) {
+				matchedAddedLineIndexes.add(exactMatch.addedIndex)
+			}
+		}
+		for (const partialMatch of partialMatches) {
+			for (const lineId of partialMatch.matchedLineIds) {
+				matchedLineIds.add(lineId)
+			}
+			for (const addedIndex of partialMatch.matchedAddedLineIndexes) {
+				matchedAddedLineIndexes.add(addedIndex)
+			}
+		}
+
+		return {
+			matches: exactMatches,
+			matchedLineIds,
+			matchedAddedLineIndexes,
+			unmatchedAddedLines: addedLines.filter((line) => !matchedAddedLineIndexes.has(line.index)),
+			partialMatches,
+		}
+	}
+
+	private collectMatchedAddedIndexes(partialMatches: PartialBlockMatchResult[]): Set<number> {
+		const matchedAddedIndexes = new Set<number>()
+		for (const partialMatch of partialMatches) {
+			for (const addedIndex of partialMatch.matchedAddedLineIndexes) {
+				matchedAddedIndexes.add(addedIndex)
+			}
+		}
+		return matchedAddedIndexes
+	}
+
+	private hasMeaningfulSkippedPendingLine(
+		pendingLines: AiCodePendingLineAttribution[],
+		previous: AiCodePendingLineAttribution,
+		current: AiCodePendingLineAttribution,
+	): boolean {
+		return pendingLines.some(
+			(line) =>
+				this.isSamePendingBlock(line, current) &&
+				line.blockLineIndex > previous.blockLineIndex &&
+				line.blockLineIndex < current.blockLineIndex &&
+				this.hasMeaningfulLineContent(line.rawLine),
+		)
+	}
+
+	private hasMeaningfulAddedLineInRange(
+		addedLines: CommitAddedLine[],
+		startIndex: number,
+		endIndex: number,
+	): boolean {
+		return addedLines.some(
+			(line) => line.index >= startIndex && line.index <= endIndex && this.hasMeaningfulLineContent(line.content),
+		)
+	}
+
+	private hasMeaningfulLineContent(value: string | undefined): boolean {
+		return !!value && value.trim().length > 0
+	}
+
+	private isSamePendingBlock(left: AiCodePendingLineAttribution, right: AiCodePendingLineAttribution): boolean {
+		const leftBlockId = left.blockId || left.generatedEventId
+		const rightBlockId = right.blockId || right.generatedEventId
+		return leftBlockId === rightBlockId && left.repoRelativePath === right.repoRelativePath
+	}
+
 	private buildCommittedBlocks(
 		matches: MatchedPendingLine[],
 		branch: string,
@@ -647,8 +1031,10 @@ export class AiCodeCommitAttributionService {
 			lineEnd: number
 			lines: string[]
 			matchStrategy: AiCodeCommitMatchStrategy
+			lastPendingLine: AiCodePendingLineAttribution
 			scoreSum: number
 			scoreCount: number
+			lineMatchDetails: AiCodeCommitLineMatchDetail[]
 		} | null = null
 
 		const flushCurrentBlock = () => {
@@ -689,18 +1075,28 @@ export class AiCodeCommitAttributionService {
 				matchStrategy: currentBlock.matchStrategy,
 				matchConfidence,
 				equivalentLineCount,
+				matchDetail:
+					currentBlock.matchStrategy === "partial"
+						? aggregateCommittedBlockMatchDetail(currentBlock.lineMatchDetails)
+						: undefined,
 			})
 			currentBlock = null
 		}
 
 		for (const match of matches) {
 			const nextAverageScore = currentBlock ? currentBlock.scoreSum / Math.max(currentBlock.scoreCount, 1) : 0
+			const hasContinuousExactPendingLine =
+				!currentBlock ||
+				match.matchStrategy !== "exact" ||
+				currentBlock.matchStrategy !== "exact" ||
+				match.pendingLine.blockLineIndex === currentBlock.lastPendingLine.blockLineIndex + 1
 			const canExtendCurrentBlock =
 				currentBlock &&
 				currentBlock.pendingLine.blockId === match.pendingLine.blockId &&
 				currentBlock.filePath === match.filePath &&
 				currentBlock.lineEnd + 1 === match.lineNumber &&
 				currentBlock.matchStrategy === match.matchStrategy &&
+				hasContinuousExactPendingLine &&
 				Math.abs(nextAverageScore - match.lineScore) <= 0.02
 
 			if (!canExtendCurrentBlock) {
@@ -713,8 +1109,10 @@ export class AiCodeCommitAttributionService {
 					lineEnd: match.lineNumber,
 					lines: [match.content],
 					matchStrategy: match.matchStrategy,
+					lastPendingLine: match.pendingLine,
 					scoreSum: match.lineScore,
 					scoreCount: 1,
+					lineMatchDetails: match.lineMatchDetail ? [match.lineMatchDetail] : [],
 				}
 				continue
 			}
@@ -722,8 +1120,12 @@ export class AiCodeCommitAttributionService {
 			const activeBlock = currentBlock!
 			activeBlock.lineEnd = match.lineNumber
 			activeBlock.lines.push(match.content)
+			activeBlock.lastPendingLine = match.pendingLine
 			activeBlock.scoreSum += match.lineScore
 			activeBlock.scoreCount += 1
+			if (match.lineMatchDetail) {
+				activeBlock.lineMatchDetails.push(match.lineMatchDetail)
+			}
 		}
 
 		flushCurrentBlock()
@@ -737,175 +1139,43 @@ export class AiCodeCommitAttributionService {
 		previousFilePath: string | undefined,
 		commitOccurredAt: number,
 	): PendingBlockCandidate[] {
-		const lookupPaths = new Set([currentFilePath, previousFilePath].filter(Boolean) as string[])
-		const candidates = new Map<string, PendingBlockCandidate>()
+		return this.partialMatcher.buildPendingBlockCandidates(
+			pendingLines,
+			matchedLineIds,
+			currentFilePath,
+			previousFilePath,
+			commitOccurredAt,
+		)
+	}
 
-		for (const pendingLine of pendingLines) {
-			if (matchedLineIds.has(pendingLine.id)) {
-				continue
-			}
-			if (pendingLine.timestamp > commitOccurredAt) {
-				continue
-			}
-			if (!lookupPaths.has(pendingLine.repoRelativePath)) {
-				continue
-			}
-			if (
-				(pendingLine.normalizedLine || "").length === 0 ||
-				(pendingLine.normalizedTokenLine || "").length === 0
-			) {
-				continue
-			}
+	private buildAddedLineCandidates(
+		addedLines: CommitAddedLine[],
+		filePath?: string,
+		language?: string,
+	): AddedLineCandidate[] {
+		return this.partialMatcher.buildAddedLineCandidates(addedLines, filePath, language)
+	}
 
-			const blockId = pendingLine.blockId || pendingLine.generatedEventId
-			const existing = candidates.get(blockId)
-			if (!existing) {
-				candidates.set(blockId, {
-					blockId,
-					repoRelativePath: pendingLine.repoRelativePath,
-					filePath: pendingLine.filePath,
-					relativePath: currentFilePath,
-					blockLineCount: Math.max(pendingLine.blockLineCount || 0, 1),
-					timestamp: pendingLine.timestamp,
-					lines: [pendingLine],
-				})
-				continue
-			}
-
-			existing.lines.push(pendingLine)
-			existing.timestamp = Math.min(existing.timestamp, pendingLine.timestamp)
-			existing.blockLineCount = Math.max(existing.blockLineCount, pendingLine.blockLineCount || 0)
-		}
-
-		return [...candidates.values()]
-			.map((candidate) => ({
-				...candidate,
-				lines: candidate.lines
-					.slice()
-					.sort(
-						(left, right) => left.blockLineIndex - right.blockLineIndex || left.id.localeCompare(right.id),
-					),
-			}))
-			.filter((candidate) => candidate.lines.length > 0)
+	private alignPartialBlockCandidatesDenseReference(
+		block: PendingBlockCandidate,
+		addedLines: AddedLineCandidate[],
+		config: AiCodeCommitAttributionConfig,
+		debugStats?: PartialAlignmentDebugStats,
+	): PartialLineCandidate[] {
+		return this.partialMatcher.alignPartialBlockCandidatesDenseReference(block, addedLines, config, debugStats)
 	}
 
 	private alignPartialBlockCandidates(
 		block: PendingBlockCandidate,
-		addedLines: CommitAddedLine[],
+		addedLines: AddedLineCandidate[],
 		config: AiCodeCommitAttributionConfig,
+		debugStats?: PartialAlignmentDebugStats,
 	): PartialLineCandidate[] {
-		if (addedLines.length === 0 || block.lines.length === 0) {
-			return []
-		}
-		const scores: number[][] = Array.from({ length: block.lines.length + 1 }, () =>
-			new Array<number>(addedLines.length + 1).fill(0),
-		)
-		const decisions: Array<Array<"up" | "left" | "diag" | null>> = Array.from(
-			{ length: block.lines.length + 1 },
-			() => new Array<"up" | "left" | "diag" | null>(addedLines.length + 1).fill(null),
-		)
-
-		const lineScores = Array.from({ length: block.lines.length }, () =>
-			new Array<number>(addedLines.length).fill(0),
-		)
-
-		for (let blockIndex = 1; blockIndex <= block.lines.length; blockIndex += 1) {
-			for (let addedIndex = 1; addedIndex <= addedLines.length; addedIndex += 1) {
-				const pendingLine = block.lines[blockIndex - 1]
-				const addedLine = addedLines[addedIndex - 1]
-				const similarity = computeLineSimilarity(pendingLine, extractLineFeatures(addedLine.content))
-				const score = similarity.lineScore >= config.candidateMinLineScore ? similarity.lineScore : 0
-				lineScores[blockIndex - 1][addedIndex - 1] = score
-
-				const up = scores[blockIndex - 1][addedIndex]
-				const left = scores[blockIndex][addedIndex - 1]
-				const diagonal = score > 0 ? scores[blockIndex - 1][addedIndex - 1] + score : Number.NEGATIVE_INFINITY
-
-				if (diagonal >= up && diagonal >= left) {
-					scores[blockIndex][addedIndex] = diagonal
-					decisions[blockIndex][addedIndex] = "diag"
-				} else if (up >= left) {
-					scores[blockIndex][addedIndex] = up
-					decisions[blockIndex][addedIndex] = "up"
-				} else {
-					scores[blockIndex][addedIndex] = left
-					decisions[blockIndex][addedIndex] = "left"
-				}
-			}
-		}
-
-		const alignedPairs: Array<{
-			pendingLine: AiCodePendingLineAttribution
-			addedLine: CommitAddedLine
-			score: number
-		}> = []
-		let blockCursor = block.lines.length
-		let addedCursor = addedLines.length
-		while (blockCursor > 0 && addedCursor > 0) {
-			const decision = decisions[blockCursor][addedCursor]
-			if (decision === "diag") {
-				const score = lineScores[blockCursor - 1][addedCursor - 1]
-				if (score > 0) {
-					alignedPairs.push({
-						pendingLine: block.lines[blockCursor - 1],
-						addedLine: addedLines[addedCursor - 1],
-						score,
-					})
-				}
-				blockCursor -= 1
-				addedCursor -= 1
-			} else if (decision === "up") {
-				blockCursor -= 1
-			} else {
-				addedCursor -= 1
-			}
-		}
-
-		alignedPairs.reverse()
-		if (alignedPairs.length === 0) {
-			return []
-		}
-
-		return alignedPairs.map((pair, index) => {
-			const previousPair = alignedPairs[index - 1]
-			const nextPair = alignedPairs[index + 1]
-			const hasPreviousSupport =
-				!!previousPair &&
-				previousPair.pendingLine.blockLineIndex + 1 === pair.pendingLine.blockLineIndex &&
-				previousPair.addedLine.index + 1 === pair.addedLine.index
-			const hasNextSupport =
-				!!nextPair &&
-				pair.pendingLine.blockLineIndex + 1 === nextPair.pendingLine.blockLineIndex &&
-				pair.addedLine.index + 1 === nextPair.addedLine.index
-
-			return {
-				blockId: block.blockId,
-				pendingLine: pair.pendingLine,
-				addedLine: pair.addedLine,
-				lineScore: pair.score,
-				hasNeighborSupport: hasPreviousSupport || hasNextSupport,
-				supportStrength: Number(hasPreviousSupport) + Number(hasNextSupport),
-				isGenericLine: this.isGenericPendingLine(pair.pendingLine),
-			}
-		})
-	}
-
-	private isGenericPendingLine(pendingLine: AiCodePendingLineAttribution): boolean {
-		const normalizedTokens = (pendingLine.normalizedTokenLine || "").split(/\s+/).filter(Boolean)
-		return pendingLine.rareIdentifiers.length === 0 && normalizedTokens.length > 0 && normalizedTokens.length <= 4
+		return this.partialMatcher.alignPartialBlockCandidates(block, addedLines, config, debugStats)
 	}
 
 	private comparePartialCandidates(left: PartialLineCandidate, right: PartialLineCandidate): number {
-		if (left.lineScore !== right.lineScore) {
-			return right.lineScore - left.lineScore
-		}
-		if (left.supportStrength !== right.supportStrength) {
-			return right.supportStrength - left.supportStrength
-		}
-		if (left.pendingLine.timestamp !== right.pendingLine.timestamp) {
-			return left.pendingLine.timestamp - right.pendingLine.timestamp
-		}
-		return left.pendingLine.id.localeCompare(right.pendingLine.id)
+		return this.partialMatcher.comparePartialCandidates(left, right)
 	}
 
 	private matchPartialPendingBlocks(
@@ -917,113 +1187,43 @@ export class AiCodeCommitAttributionService {
 		matchedLineIds: Set<string>,
 		commitOccurredAt: number,
 		config: AiCodeCommitAttributionConfig,
+		debugStats?: PartialAlignmentDebugStats,
 	): PartialBlockMatchResult[] {
-		if (addedLines.length === 0) {
-			return []
-		}
-
-		const currentFilePath = normalizePath(filePath)
-		const previousPath = previousFilePath ? normalizePath(previousFilePath) : undefined
-		const blockCandidates = this.buildPendingBlockCandidates(
+		return this.partialMatcher.matchPartialPendingBlocks({
+			repoRoot,
+			filePath,
+			previousFilePath,
+			addedLines,
 			pendingLines,
 			matchedLineIds,
-			currentFilePath,
-			previousPath,
 			commitOccurredAt,
-		)
-		if (blockCandidates.length === 0) {
-			return []
-		}
+			config,
+			debugStats,
+		})
+	}
 
-		const lineCandidates = blockCandidates.flatMap((block) =>
-			this.alignPartialBlockCandidates(block, addedLines, config),
-		)
-		if (lineCandidates.length === 0) {
-			return []
-		}
-
-		const candidatesByAddedLine = new Map<number, PartialLineCandidate[]>()
-		for (const candidate of lineCandidates) {
-			const existing = candidatesByAddedLine.get(candidate.addedLine.index) ?? []
-			existing.push(candidate)
-			candidatesByAddedLine.set(candidate.addedLine.index, existing)
-		}
-
-		const eligibleCandidates: PartialLineCandidate[] = []
-		for (const candidates of candidatesByAddedLine.values()) {
-			const rankedCandidates = candidates
-				.slice()
-				.sort((left, right) => this.comparePartialCandidates(left, right))
-			const bestCandidate = rankedCandidates[0]
-			if (!bestCandidate) {
-				continue
-			}
-			const secondBestCandidate = rankedCandidates[1]
-			if (secondBestCandidate && bestCandidate.lineScore - secondBestCandidate.lineScore < config.ambiguityGap) {
-				continue
-			}
-
-			const passesThreshold = bestCandidate.isGenericLine
-				? bestCandidate.hasNeighborSupport && bestCandidate.lineScore >= config.contextualMinLineScore
-				: bestCandidate.lineScore >= config.isolatedMinLineScore ||
-					(bestCandidate.hasNeighborSupport && bestCandidate.lineScore >= config.contextualMinLineScore)
-			if (!passesThreshold) {
-				continue
-			}
-
-			eligibleCandidates.push(bestCandidate)
-		}
-
-		if (eligibleCandidates.length === 0) {
-			return []
-		}
-
-		const usedAddedLineIndexes = new Set<number>()
-		const usedPendingLineIds = new Set<string>()
-		const acceptedMatches = eligibleCandidates
-			.slice()
-			.sort((left, right) => this.comparePartialCandidates(left, right))
-			.filter((candidate) => {
-				if (
-					usedAddedLineIndexes.has(candidate.addedLine.index) ||
-					usedPendingLineIds.has(candidate.pendingLine.id)
-				) {
-					return false
-				}
-				usedAddedLineIndexes.add(candidate.addedLine.index)
-				usedPendingLineIds.add(candidate.pendingLine.id)
-				return true
-			})
-
-		const filePathAbsolute = normalizePath(path.join(repoRoot, currentFilePath))
-		const resultsByBlock = new Map<string, PartialBlockMatchResult>()
-		for (const acceptedMatch of acceptedMatches.sort(
-			(left, right) => left.addedLine.lineNumber - right.addedLine.lineNumber,
-		)) {
-			const existing = resultsByBlock.get(acceptedMatch.blockId) ?? {
-				matches: [],
-				matchedLineIds: new Set<string>(),
-				matchedAddedLineIndexes: new Set<number>(),
-				avgLineScore: 0,
-				equivalentLineCount: 0,
-			}
-			existing.matches.push({
-				pendingLine: acceptedMatch.pendingLine,
-				lineNumber: acceptedMatch.addedLine.lineNumber,
-				content: acceptedMatch.addedLine.content,
-				filePath: filePathAbsolute,
-				relativePath: currentFilePath,
-				matchStrategy: "partial",
-				lineScore: acceptedMatch.lineScore,
-			})
-			existing.matchedLineIds.add(acceptedMatch.pendingLine.id)
-			existing.matchedAddedLineIndexes.add(acceptedMatch.addedLine.index)
-			existing.equivalentLineCount = roundToFour(existing.equivalentLineCount + acceptedMatch.lineScore)
-			existing.avgLineScore = roundToFour(existing.equivalentLineCount / existing.matches.length)
-			resultsByBlock.set(acceptedMatch.blockId, existing)
-		}
-
-		return [...resultsByBlock.values()]
+	private async matchPartialPendingBlocksAsync(
+		repoRoot: string,
+		filePath: string,
+		previousFilePath: string | undefined,
+		addedLines: CommitAddedLine[],
+		pendingLines: AiCodePendingLineAttribution[],
+		matchedLineIds: Set<string>,
+		exactMatches: MatchedPendingLine[],
+		commitOccurredAt: number,
+		config: AiCodeCommitAttributionConfig,
+	): Promise<PartialBlockMatchResult[]> {
+		return this.partialMatcherExecutor.matchPartialPendingBlocks({
+			repoRoot,
+			filePath,
+			previousFilePath,
+			addedLines,
+			pendingLines,
+			matchedLineIds,
+			exactMatches,
+			commitOccurredAt,
+			config,
+		})
 	}
 
 	private async resolveCommitsToReplay(
@@ -1135,21 +1335,46 @@ export class AiCodeCommitAttributionService {
 						pendingBuckets,
 						commitOccurredAt,
 					)
-					for (const lineId of exactMatchResult.matchedLineIds) {
+					const exactResolution = this.resolveSuspiciousExactWindows({
+						repoRoot,
+						filePath: file.filePath,
+						previousFilePath: file.previousFilePath,
+						addedLines: indexedAddedLines,
+						pendingLines,
+						exactMatchResult,
+						commitOccurredAt,
+						config: attributionConfig,
+					})
+					for (const lineId of exactResolution.matchedLineIds) {
 						matchedLineIds.add(lineId)
 					}
 
-					const partialMatches = this.matchPartialPendingBlocks(
-						repoRoot,
-						file.filePath,
-						file.previousFilePath,
-						exactMatchResult.unmatchedAddedLines,
-						pendingLines,
-						matchedLineIds,
-						commitOccurredAt,
-						attributionConfig,
-					)
-					const fileMatches = exactMatchResult.matches
+					let partialMatches: PartialBlockMatchResult[]
+					try {
+						partialMatches = await this.matchPartialPendingBlocksAsync(
+							repoRoot,
+							file.filePath,
+							file.previousFilePath,
+							exactResolution.unmatchedAddedLines,
+							pendingLines,
+							matchedLineIds,
+							exactResolution.matches,
+							commitOccurredAt,
+							attributionConfig,
+						)
+					} catch (error) {
+						if (error instanceof PartialMatcherCancelledError) {
+							return {
+								processed: false,
+								remainingPendingLines: pendingLines.length,
+								committedBlocks: [],
+								matchedLineIds: [],
+							}
+						}
+						throw error
+					}
+					partialMatches = exactResolution.partialMatches.concat(partialMatches)
+					const fileMatches = exactResolution.matches
 						.concat(...partialMatches.map((result) => result.matches))
 						.sort((left, right) => left.lineNumber - right.lineNumber)
 

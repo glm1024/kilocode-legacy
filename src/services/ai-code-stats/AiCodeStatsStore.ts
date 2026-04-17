@@ -11,7 +11,11 @@ import {
 	emptySummary,
 	normalizePath,
 	toLocalDateKey,
+	type AiCodeCommitLineMatchDetail,
+	type AiCodeCommitMatchAdjustment,
+	type AiCodeCommitMatchDetail,
 	type AiCodeCommittedBlock,
+	type AiCodeGeneratedBlock,
 	type AiCodePendingCommitMetricBlock,
 	type AiCodeGeneratedBlockState,
 	type AiCodeMetricType,
@@ -45,7 +49,7 @@ const createEmptyState = (): AiCodeStatsPersistedState => ({
 const isCurrentSemanticsVersion = (semanticsVersion?: number): boolean =>
 	semanticsVersion === CURRENT_AI_CODE_STATS_SEMANTICS_VERSION
 
-const buildGeneratedMetricEvent = (block: AiCodeGeneratedBlockState): AiCodeStatsEvent => ({
+const buildGeneratedMetricEvent = (block: AiCodeGeneratedBlock): AiCodeStatsEvent => ({
 	eventId: block.eventId,
 	generatedBlockId: block.generatedBlockId,
 	timestamp: block.timestamp,
@@ -75,7 +79,7 @@ const buildGeneratedMetricEvent = (block: AiCodeGeneratedBlockState): AiCodeStat
 	equivalentLineCount: block.lineCount,
 })
 
-const buildAcceptedMetricEvent = (block: AiCodeGeneratedBlockState): AiCodeStatsEvent => ({
+const buildAcceptedMetricEvent = (block: AiCodeGeneratedBlock): AiCodeStatsEvent => ({
 	eventId: block.eventId,
 	generatedBlockId: block.generatedBlockId,
 	timestamp: block.timestamp,
@@ -137,10 +141,81 @@ const buildCommittedMetricEvent = (block: AiCodeCommittedBlock): AiCodeStatsEven
 	matchStrategy: block.matchStrategy,
 	matchConfidence: block.matchConfidence,
 	equivalentLineCount: block.equivalentLineCount,
+	matchDetail: block.matchDetail,
 })
 
+const normalizeAdjustmentArray = (value: unknown): AiCodeCommitMatchAdjustment[] => {
+	if (!Array.isArray(value)) {
+		return []
+	}
+	return value.filter((item): item is AiCodeCommitMatchAdjustment => item === "inline_comment_bonus")
+}
+
+const normalizeLineMatchDetail = (value: unknown): AiCodeCommitLineMatchDetail | undefined => {
+	if (!value || typeof value !== "object") {
+		return undefined
+	}
+	const record = value as Record<string, unknown>
+	if (record.scoreSource !== "attribution") {
+		return undefined
+	}
+	if (
+		typeof record.committedLineNumber !== "number" ||
+		typeof record.generatedLineNumber !== "number" ||
+		typeof record.finalScore !== "number" ||
+		typeof record.baseScore !== "number" ||
+		typeof record.editSimilarity !== "number" ||
+		typeof record.tokenSimilarity !== "number" ||
+		typeof record.overlapSimilarity !== "number" ||
+		(record.overlapKind !== "identifier" && record.overlapKind !== "term")
+	) {
+		return undefined
+	}
+	return {
+		committedLineNumber: record.committedLineNumber,
+		generatedLineNumber: record.generatedLineNumber,
+		scoreSource: "attribution",
+		finalScore: roundToFour(record.finalScore),
+		baseScore: roundToFour(record.baseScore),
+		editSimilarity: roundToFour(record.editSimilarity),
+		tokenSimilarity: roundToFour(record.tokenSimilarity),
+		overlapSimilarity: roundToFour(record.overlapSimilarity),
+		overlapKind: record.overlapKind,
+		adjustments: normalizeAdjustmentArray(record.adjustments),
+	}
+}
+
+const normalizeMatchDetail = (value: unknown): AiCodeCommitMatchDetail | undefined => {
+	if (!value || typeof value !== "object") {
+		return undefined
+	}
+	const record = value as Record<string, unknown>
+	if (record.scoreSource !== "attribution" && record.scoreSource !== "inferred") {
+		return undefined
+	}
+	if (typeof record.finalScore !== "number") {
+		return undefined
+	}
+	const lineDetails = Array.isArray(record.lineDetails)
+		? record.lineDetails
+				.map((detail) => normalizeLineMatchDetail(detail))
+				.filter((detail): detail is AiCodeCommitLineMatchDetail => !!detail)
+		: []
+	return {
+		scoreSource: record.scoreSource,
+		finalScore: roundToFour(record.finalScore),
+		baseScore: typeof record.baseScore === "number" ? roundToFour(record.baseScore) : undefined,
+		editSimilarity: typeof record.editSimilarity === "number" ? roundToFour(record.editSimilarity) : undefined,
+		tokenSimilarity: typeof record.tokenSimilarity === "number" ? roundToFour(record.tokenSimilarity) : undefined,
+		overlapSimilarity:
+			typeof record.overlapSimilarity === "number" ? roundToFour(record.overlapSimilarity) : undefined,
+		adjustments: normalizeAdjustmentArray(record.adjustments),
+		lineDetails,
+	}
+}
+
 const buildGeneratedMetricEventForCommitReport = (
-	block: AiCodeGeneratedBlockState,
+	block: AiCodeGeneratedBlock,
 	commitOccurredAt: number,
 ): AiCodeStatsEvent => ({
 	...buildGeneratedMetricEvent({
@@ -152,7 +227,7 @@ const buildGeneratedMetricEventForCommitReport = (
 })
 
 const buildAcceptedMetricEventForCommitReport = (
-	block: AiCodeGeneratedBlockState,
+	block: AiCodeGeneratedBlock,
 	commitOccurredAt: number,
 ): AiCodeStatsEvent => ({
 	...buildAcceptedMetricEvent({
@@ -218,10 +293,10 @@ export class AiCodeStatsStore {
 
 			await this.appendHistoryEventsInternal(
 				[
-					...normalizedReport.report.generatedBlocks.map((block) =>
+					...(normalizedReport.report.generatedBlocks ?? []).map((block) =>
 						buildGeneratedMetricEventForCommitReport(block, normalizedReport.report.commitOccurredAt),
 					),
-					...normalizedReport.report.acceptedBlocks.map((block) =>
+					...(normalizedReport.report.acceptedBlocks ?? []).map((block) =>
 						buildAcceptedMetricEventForCommitReport(block, normalizedReport.report.commitOccurredAt),
 					),
 					...normalizedReport.report.committedBlocks.map((block) => buildCommittedMetricEvent(block)),
@@ -1097,6 +1172,7 @@ export class AiCodeStatsStore {
 			matchStrategy:
 				event.matchStrategy === "exact" || event.matchStrategy === "partial" ? event.matchStrategy : undefined,
 			matchConfidence: typeof event.matchConfidence === "number" ? event.matchConfidence : undefined,
+			matchDetail: normalizeMatchDetail(event.matchDetail),
 			equivalentLineCount:
 				typeof event.equivalentLineCount === "number"
 					? event.equivalentLineCount
@@ -1441,6 +1517,7 @@ export class AiCodeStatsStore {
 							? block.matchStrategy
 							: undefined,
 					matchConfidence: typeof block.matchConfidence === "number" ? block.matchConfidence : undefined,
+					matchDetail: normalizeMatchDetail(block.matchDetail),
 					equivalentLineCount:
 						typeof block.equivalentLineCount === "number" ? block.equivalentLineCount : block.lineCount,
 				})),

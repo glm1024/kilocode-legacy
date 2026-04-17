@@ -9,6 +9,7 @@ import { AiCodeCommitAttributionService, type AiCodeCommitMatchedPayload } from 
 import { AiCodeDiffExtractor } from "../AiCodeDiffExtractor"
 import { extractLineFeatures } from "../AiCodeLineFeatures"
 import { hashLineFingerprint } from "../AiCodeLineFingerprint"
+import { createInlinePartialMatcherExecutor } from "../AiCodeCommitPartialMatcherWorkerClient"
 import { AiCodeStatsStore } from "../AiCodeStatsStore"
 import {
 	type AiCodeCommittedBlock,
@@ -149,6 +150,7 @@ class ScenarioHarness {
 			isAncestor: async () => true,
 			listCommitsBetween: async () => [],
 			listCommitsSinceTimestamp: async () => [],
+			partialMatcherExecutor: createInlinePartialMatcherExecutor(),
 			onCommitMatched: async (payload) => {
 				harness.matchedPayloads.push(payload)
 				if (payload.committedBlocks.length > 0) {

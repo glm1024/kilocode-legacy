@@ -328,6 +328,7 @@ export class AiCodeStatsUploader {
 				matchStrategy: block.matchStrategy,
 				matchConfidence: block.matchConfidence,
 				equivalentLineCount: block.equivalentLineCount,
+				matchDetail: block.matchDetail,
 			})),
 			changedFiles: (report.changedFiles || []).map((file) => ({
 				relativePath: normalizePath(file.relativePath),

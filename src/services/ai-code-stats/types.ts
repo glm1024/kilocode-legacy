@@ -6,6 +6,33 @@ export type AiCodeMetricType = "generated" | "accepted" | "committed"
 export type AiCodeCommitMatchStrategy = "exact" | "partial"
 export type AiCodeGeneratedBlockUploadStatus = "pending" | "queued" | "uploaded"
 export type AiCodeStatsSemanticsVersion = 1
+export type AiCodeCommitMatchDetailScoreSource = "attribution" | "inferred"
+export type AiCodeCommitMatchOverlapKind = "identifier" | "term"
+export type AiCodeCommitMatchAdjustment = "inline_comment_bonus"
+
+export interface AiCodeCommitLineMatchDetail {
+	committedLineNumber: number
+	generatedLineNumber: number
+	scoreSource: "attribution"
+	finalScore: number
+	baseScore: number
+	editSimilarity: number
+	tokenSimilarity: number
+	overlapSimilarity: number
+	overlapKind: AiCodeCommitMatchOverlapKind
+	adjustments: AiCodeCommitMatchAdjustment[]
+}
+
+export interface AiCodeCommitMatchDetail {
+	scoreSource: AiCodeCommitMatchDetailScoreSource
+	finalScore: number
+	baseScore?: number
+	editSimilarity?: number
+	tokenSimilarity?: number
+	overlapSimilarity?: number
+	adjustments?: AiCodeCommitMatchAdjustment[]
+	lineDetails: AiCodeCommitLineMatchDetail[]
+}
 
 export interface AiCodeStatsRange {
 	type: AiCodeStatsRangeType
@@ -47,6 +74,7 @@ export interface AiCodeStatsEvent {
 	matchConfidence?: number
 	equivalentLineCount?: number
 	generatedBlockId?: string
+	matchDetail?: AiCodeCommitMatchDetail
 }
 
 export interface AiCodeGeneratedBlock {
@@ -129,6 +157,7 @@ export interface AiCodeCommittedBlock {
 	matchStrategy?: AiCodeCommitMatchStrategy
 	matchConfidence?: number
 	equivalentLineCount?: number
+	matchDetail?: AiCodeCommitMatchDetail
 }
 
 export interface AiCodeCommitChangedBlock {
@@ -178,7 +207,7 @@ export interface AiCodeQueuedCommitReport {
 	matchedPendingLineIds: string[]
 }
 
-export interface AiCodePendingCommitMetricBlock extends AiCodeGeneratedBlock {}
+export type AiCodePendingCommitMetricBlock = AiCodeGeneratedBlock
 
 export interface AiCodeStatsDailyAggregate {
 	suggestedLines: number
@@ -335,10 +364,10 @@ export interface AiCodePendingLineAttribution {
 }
 
 export const DEFAULT_AI_CODE_COMMIT_ATTRIBUTION_CONFIG: AiCodeCommitAttributionConfig = {
-	candidateMinLineScore: 0.85,
-	contextualMinLineScore: 0.9,
-	isolatedMinLineScore: 0.95,
-	ambiguityGap: 0.03,
+	candidateMinLineScore: 0.6,
+	contextualMinLineScore: 0.65,
+	isolatedMinLineScore: 0.7,
+	ambiguityGap: 0.02,
 }
 
 export const AI_CODE_STATS_VERSION = 1 as const

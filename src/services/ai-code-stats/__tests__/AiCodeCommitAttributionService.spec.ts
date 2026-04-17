@@ -10,8 +10,15 @@ import {
 } from "../AiCodeCommitAttributionService"
 import { extractLineFeatures } from "../AiCodeLineFeatures"
 import { hashLineFingerprint } from "../AiCodeLineFingerprint"
+import { AiCodeCommitPartialMatcher } from "../AiCodeCommitPartialMatcher"
+import { createInlinePartialMatcherExecutor } from "../AiCodeCommitPartialMatcherWorkerClient"
 import { AiCodeStatsStore } from "../AiCodeStatsStore"
-import { type AiCodePendingLineAttribution } from "../types"
+import {
+	DEFAULT_AI_CODE_COMMIT_ATTRIBUTION_CONFIG,
+	type AiCodeCommitAttributionConfig,
+	type AiCodeCommittedBlock,
+	type AiCodePendingLineAttribution,
+} from "../types"
 
 class FakeWatcher {
 	private handlers: Array<(event: any) => void> = []
@@ -114,8 +121,294 @@ describe("AiCodeCommitAttributionService", () => {
 			isAncestor: async () => true,
 			listCommitsBetween: async () => [],
 			listCommitsSinceTimestamp: async () => [],
+			partialMatcherExecutor: createInlinePartialMatcherExecutor(),
 			...overrides,
 		})
+
+	type InternalCommitAddedLine = {
+		index: number
+		lineNumber: number
+		content: string
+	}
+
+	type InternalPartialDebugStats = {
+		totalPairCount: number
+		tokenLcsCount: number
+		levenshteinCount: number
+		positiveEdgeCount: number
+		processedBlockCount: number
+		denseFallbackBlockCount: number
+	}
+
+	type InternalService = {
+		buildPendingBlockCandidates: (
+			pendingLines: AiCodePendingLineAttribution[],
+			matchedLineIds: Set<string>,
+			currentFilePath: string,
+			previousFilePath: string | undefined,
+			commitOccurredAt: number,
+		) => any[]
+		buildAddedLineCandidates: (addedLines: InternalCommitAddedLine[], filePath?: string, language?: string) => any[]
+		alignPartialBlockCandidates: (
+			block: any,
+			addedLines: any[],
+			config: AiCodeCommitAttributionConfig,
+			debugStats?: InternalPartialDebugStats,
+		) => any[]
+		alignPartialBlockCandidatesDenseReference: (
+			block: any,
+			addedLines: any[],
+			config: AiCodeCommitAttributionConfig,
+			debugStats?: InternalPartialDebugStats,
+		) => any[]
+		comparePartialCandidates: (left: any, right: any) => number
+		buildCommittedBlocks: (
+			matches: any[],
+			branch: string,
+			commitHash: string,
+			commitOccurredAt: number,
+			fileSnapshotContent?: string,
+		) => AiCodeCommittedBlock[]
+	}
+
+	const createPartialDebugStats = (): InternalPartialDebugStats => ({
+		totalPairCount: 0,
+		tokenLcsCount: 0,
+		levenshteinCount: 0,
+		positiveEdgeCount: 0,
+		processedBlockCount: 0,
+		denseFallbackBlockCount: 0,
+	})
+
+	const summarizeCommittedBlocks = (blocks: AiCodeCommittedBlock[]) =>
+		blocks.map((block) => ({
+			generatedBlockId: block.generatedBlockId,
+			matchStrategy: block.matchStrategy,
+			lineStart: block.lineStart,
+			lineEnd: block.lineEnd,
+			lineCount: block.lineCount,
+			codeSnippet: block.codeSnippet,
+			matchConfidence: block.matchConfidence,
+			equivalentLineCount: block.equivalentLineCount,
+			matchDetail: block.matchDetail,
+		}))
+
+	const runPartialMatcherWithStrategy = ({
+		service,
+		pendingLines,
+		addedLines,
+		filePath = "src/a.ts",
+		previousFilePath,
+		matchedLineIds = new Set<string>(),
+		commitOccurredAt = 1_772_500_000_000,
+		config = DEFAULT_AI_CODE_COMMIT_ATTRIBUTION_CONFIG,
+		repoRoot = "/repo",
+		branch = "feature/stats",
+		commitHash = "partial-reference",
+		fileSnapshotContent = "// committed snapshot",
+		useDenseReference,
+	}: {
+		service: AiCodeCommitAttributionService
+		pendingLines: AiCodePendingLineAttribution[]
+		addedLines: readonly string[]
+		filePath?: string
+		previousFilePath?: string
+		matchedLineIds?: Set<string>
+		commitOccurredAt?: number
+		config?: AiCodeCommitAttributionConfig
+		repoRoot?: string
+		branch?: string
+		commitHash?: string
+		fileSnapshotContent?: string
+		useDenseReference: boolean
+	}) => {
+		const internal = service as unknown as InternalService
+		const indexedAddedLines = addedLines.map((content, index) => ({
+			index,
+			lineNumber: index + 1,
+			content,
+		}))
+		const blockCandidates = internal.buildPendingBlockCandidates(
+			pendingLines,
+			matchedLineIds,
+			filePath,
+			previousFilePath,
+			commitOccurredAt,
+		)
+		const addedLineCandidates = internal.buildAddedLineCandidates(indexedAddedLines, filePath)
+		const debugStats = createPartialDebugStats()
+		const lineCandidates = blockCandidates.flatMap((block) =>
+			useDenseReference
+				? internal.alignPartialBlockCandidatesDenseReference(block, addedLineCandidates, config, debugStats)
+				: internal.alignPartialBlockCandidates(block, addedLineCandidates, config, debugStats),
+		)
+
+		const candidatesByAddedLine = new Map<number, any[]>()
+		for (const candidate of lineCandidates) {
+			const existing = candidatesByAddedLine.get(candidate.addedLine.index) ?? []
+			existing.push(candidate)
+			candidatesByAddedLine.set(candidate.addedLine.index, existing)
+		}
+
+		const eligibleCandidates: any[] = []
+		for (const candidates of candidatesByAddedLine.values()) {
+			const rankedCandidates = candidates
+				.slice()
+				.sort((left, right) => internal.comparePartialCandidates(left, right))
+			const bestCandidate = rankedCandidates[0]
+			if (!bestCandidate) {
+				continue
+			}
+
+			const secondBestCandidate = rankedCandidates[1]
+			if (secondBestCandidate && bestCandidate.lineScore - secondBestCandidate.lineScore < config.ambiguityGap) {
+				continue
+			}
+
+			const passesThreshold = bestCandidate.isGenericLine
+				? bestCandidate.hasNeighborSupport && bestCandidate.lineScore >= config.contextualMinLineScore
+				: bestCandidate.lineScore >= config.isolatedMinLineScore ||
+					(bestCandidate.hasNeighborSupport && bestCandidate.lineScore >= config.contextualMinLineScore)
+			if (!passesThreshold) {
+				continue
+			}
+
+			eligibleCandidates.push(bestCandidate)
+		}
+
+		const usedAddedLineIndexes = new Set<number>()
+		const usedPendingLineIds = new Set<string>()
+		const acceptedMatches = eligibleCandidates
+			.slice()
+			.sort((left, right) => internal.comparePartialCandidates(left, right))
+			.filter((candidate) => {
+				if (
+					usedAddedLineIndexes.has(candidate.addedLine.index) ||
+					usedPendingLineIds.has(candidate.pendingLine.id)
+				) {
+					return false
+				}
+				usedAddedLineIndexes.add(candidate.addedLine.index)
+				usedPendingLineIds.add(candidate.pendingLine.id)
+				return true
+			})
+			.map((candidate) => ({
+				pendingLine: candidate.pendingLine,
+				lineNumber: candidate.addedLine.lineNumber,
+				content: candidate.addedLine.content,
+				filePath: path.join(repoRoot, filePath),
+				relativePath: filePath,
+				matchStrategy: "partial" as const,
+				lineScore: candidate.lineScore,
+				lineMatchDetail: candidate.lineMatchDetail,
+			}))
+			.sort((left, right) => left.lineNumber - right.lineNumber)
+
+		const matchedIds = [...new Set(acceptedMatches.map((match) => match.pendingLine.id))].sort()
+		const committedBlocks = internal.buildCommittedBlocks(
+			acceptedMatches,
+			branch,
+			commitHash,
+			commitOccurredAt,
+			fileSnapshotContent,
+		)
+
+		return {
+			matchedLineIds: matchedIds,
+			committedBlocks: summarizeCommittedBlocks(committedBlocks),
+			debugStats,
+		}
+	}
+
+	const createSeededRandom = (seed: number): (() => number) => {
+		let state = seed >>> 0
+		return () => {
+			state = (state * 1664525 + 1013904223) >>> 0
+			return state / 0x100000000
+		}
+	}
+
+	const pickOne = <T>(random: () => number, values: T[]): T => values[Math.floor(random() * values.length)]!
+
+	const capitalize = (value: string): string => value.slice(0, 1).toUpperCase() + value.slice(1)
+
+	const buildRandomPendingBlock = (seed: number, generatedEventId: string): AiCodePendingLineAttribution[] => {
+		const random = createSeededRandom(seed)
+		const identifiers = ["total", "subtotal", "amount", "receiptTotal", "taxRate", "localeSetting"]
+		const collections = ["items", "lineItems", "cartItems", "orderItems"]
+		const regions = ["regionCode", "countryCode", "localeCode"]
+		const templates = [
+			(primary: string, secondary: string, tertiary: string) =>
+				`const ${primary} = calculateTotal(${secondary}, ${tertiary})`,
+			(primary: string, secondary: string, tertiary: string) =>
+				`return formatCurrency(${primary}, ${secondary}, ${tertiary})`,
+			(primary: string, secondary: string, tertiary: string) =>
+				`const ${secondary} = normalize${capitalize(primary)}(${primary}, ${tertiary})`,
+			(primary: string, secondary: string, tertiary: string) =>
+				`logger.info("${primary}", { ${secondary}, ${tertiary} })`,
+		]
+
+		const lineCount = 1 + Math.floor(random() * 4)
+		const lines = Array.from({ length: lineCount }, () => {
+			const template = pickOne(random, templates)
+			return template(pickOne(random, identifiers), pickOne(random, collections), pickOne(random, regions))
+		})
+
+		return buildPendingBlock(lines, {
+			id: generatedEventId,
+			blockId: generatedEventId,
+			generatedEventId,
+		})
+	}
+
+	const mutateCodeLine = (random: () => number, line: string): string => {
+		let next = line
+		if (random() < 0.7) {
+			next = next.replace(/,\s*/g, random() < 0.5 ? "," : ", ")
+		}
+		if (random() < 0.6) {
+			next = next.replace(/\s*=\s*/g, random() < 0.5 ? "=" : " = ")
+		}
+		if (random() < 0.3) {
+			next = next.replace(/\(\s*/g, "(").replace(/\s*\)/g, ")")
+		}
+		if (random() < 0.25) {
+			next = next.replace(/\b(total|subtotal|amount)\b/, pickOne(random, ["total", "subtotal", "amount"]))
+		}
+		if (random() < 0.2) {
+			next = next.replace(
+				/\b(regionCode|countryCode|localeCode)\b/,
+				pickOne(random, ["regionCode", "countryCode", "localeCode"]),
+			)
+		}
+		return next
+	}
+
+	const buildRandomAddedLines = (seed: number, pendingLines: AiCodePendingLineAttribution[]): string[] => {
+		const random = createSeededRandom(seed ^ 0x9e3779b9)
+		const distractors = [
+			"const manualValue = 1",
+			'logger.debug("manual branch")',
+			"return summary",
+			"if (error) { return fallback }",
+		]
+		const addedLines: string[] = []
+		if (random() < 0.5) {
+			addedLines.push(pickOne(random, distractors))
+		}
+		for (const pendingLine of pendingLines) {
+			if (random() < 0.8) {
+				addedLines.push(mutateCodeLine(random, pendingLine.rawLine))
+			}
+			if (random() < 0.3) {
+				addedLines.push(pickOne(random, distractors))
+			}
+		}
+		if (addedLines.length === 0) {
+			addedLines.push(mutateCodeLine(random, pendingLines[0]?.rawLine ?? "const value = 1"))
+		}
+		return addedLines
+	}
 
 	it("creates committed events for exact commit matches", async () => {
 		const onCommitComparisonCompleted = vi.fn(async () => {})
@@ -133,20 +426,12 @@ describe("AiCodeCommitAttributionService", () => {
 		})
 
 		await service.start()
-		await service.registerPendingLineAttributions([
-			buildPendingLine({
-				id: "line-1",
+		await service.registerPendingLineAttributions(
+			buildPendingBlock(["const value = 1", "const other = 2"], {
+				id: "exact-block",
 				generatedEventId: "generated-1",
-				lineHash: hashLineFingerprint("const value = 1"),
-				occurrenceIndex: 1,
 			}),
-			buildPendingLine({
-				id: "line-2",
-				generatedEventId: "generated-1",
-				lineHash: hashLineFingerprint("const other = 2"),
-				occurrenceIndex: 1,
-			}),
-		])
+		)
 
 		watchers[0].emit({
 			type: "commit",
@@ -182,6 +467,58 @@ describe("AiCodeCommitAttributionService", () => {
 		expect(onCommitComparisonCompleted).toHaveBeenCalledTimes(1)
 		expect(await store.getPendingLineAttributions("/repo")).toHaveLength(0)
 		expect(await store.getRepoObservedCommit("/repo")).toBeUndefined()
+	})
+
+	it("splits exact committed blocks when generated lines are not consecutive", () => {
+		const service = createService()
+		const internal = service as unknown as InternalService
+		const pendingLines = buildPendingBlock(["const first = 1", "const middle = 2", "const last = 3"], {
+			id: "non-consecutive-exact",
+			generatedEventId: "generated-non-consecutive-exact",
+		})
+
+		const blocks = internal.buildCommittedBlocks(
+			[
+				{
+					pendingLine: pendingLines[0],
+					lineNumber: 10,
+					content: "const first = 1",
+					filePath: "/repo/src/a.ts",
+					relativePath: "src/a.ts",
+					matchStrategy: "exact",
+					lineScore: 1,
+				},
+				{
+					pendingLine: pendingLines[2],
+					lineNumber: 11,
+					content: "const last = 3",
+					filePath: "/repo/src/a.ts",
+					relativePath: "src/a.ts",
+					matchStrategy: "exact",
+					lineScore: 1,
+				},
+			],
+			"feature/stats",
+			"commit-non-consecutive-exact",
+			1_772_500_000_000,
+		)
+
+		expect(summarizeCommittedBlocks(blocks)).toEqual([
+			expect.objectContaining({
+				matchStrategy: "exact",
+				lineStart: 10,
+				lineEnd: 10,
+				lineCount: 1,
+				codeSnippet: "const first = 1",
+			}),
+			expect.objectContaining({
+				matchStrategy: "exact",
+				lineStart: 11,
+				lineEnd: 11,
+				lineCount: 1,
+				codeSnippet: "const last = 3",
+			}),
+		])
 	})
 
 	it("prefers the newest exact block when generic lines are shared with an older block", async () => {
@@ -361,7 +698,7 @@ describe("AiCodeCommitAttributionService", () => {
 		})
 
 		await vi.waitFor(async () => {
-			expect(await store.getRepoObservedCommit("/repo")).toBe("def456")
+			expect(onCommitComparisonCompleted).toHaveBeenCalledTimes(1)
 		})
 
 		expect(onCommitComparisonCompleted).toHaveBeenCalledTimes(1)
@@ -421,6 +758,12 @@ describe("AiCodeCommitAttributionService", () => {
 			expect(events[0].matchConfidence).toBeLessThan(1)
 			expect(events[0].equivalentLineCount).toBeGreaterThan(1.7)
 			expect(events[0].equivalentLineCount).toBeLessThan(2)
+			expect(events[0].matchDetail).toMatchObject({
+				scoreSource: "attribution",
+				overlapSimilarity: expect.any(Number),
+			})
+			expect(events[0].matchDetail?.lineDetails).toHaveLength(2)
+			expect(events[0].matchDetail?.lineDetails.every((detail) => detail.overlapKind === "identifier")).toBe(true)
 		})
 
 		expect(await store.getPendingLineAttributions("/repo")).toHaveLength(0)
@@ -615,6 +958,273 @@ describe("AiCodeCommitAttributionService", () => {
 		})
 	})
 
+	it("matches sparse partial candidates when blank lines create added-order gaps", () => {
+		const matcher = new AiCodeCommitPartialMatcher()
+		const pendingLines = buildPendingBlock(
+			["const total=calculateTotal(items,taxRate)", "return formatCurrency(total,currencyCode)"],
+			{
+				id: "sparse-gap",
+				generatedEventId: "generated-sparse-gap",
+				filePath: "/repo/src/a.ts",
+				relativePath: "src/a.ts",
+				repoRelativePath: "src/a.ts",
+			},
+		)
+
+		const partialMatches = matcher.matchPartialPendingBlocks({
+			repoRoot: "/repo",
+			filePath: "src/a.ts",
+			addedLines: [
+				{ index: 0, lineNumber: 1, content: "" },
+				{ index: 1, lineNumber: 2, content: "const total = calculateTotal(items, taxRate)" },
+				{ index: 2, lineNumber: 3, content: "" },
+				{ index: 3, lineNumber: 4, content: "return formatCurrency(total, currencyCode)" },
+			],
+			pendingLines,
+			matchedLineIds: new Set<string>(),
+			commitOccurredAt: 1_772_500_000_000,
+			config: DEFAULT_AI_CODE_COMMIT_ATTRIBUTION_CONFIG,
+		})
+
+		const matchedAddedIndexes = new Set(partialMatches.flatMap((match) => [...match.matchedAddedLineIndexes]))
+		expect(matchedAddedIndexes).toEqual(new Set([1, 3]))
+	})
+
+	it("rechecks suspicious exact jumps with local partial matching", async () => {
+		const committedCode = ["def add(a, b):", "    return a - b", "def subtractx(a, b):", "    return a - b"].join(
+			"\n",
+		)
+		const service = createService({
+			loadCommitPatch: async () =>
+				[
+					"diff --git a/src/test.py b/src/test.py",
+					"--- a/src/test.py",
+					"+++ b/src/test.py",
+					"@@ -0,0 +1,4 @@",
+					"+def add(a, b):",
+					"+    return a - b",
+					"+def subtractx(a, b):",
+					"+    return a - b",
+				].join("\n"),
+			loadCommitFileContent: async () => `${committedCode}\n`,
+		})
+
+		await service.start()
+		await service.registerPendingLineAttributions(
+			buildPendingBlock(["def add(a, b):", "    return a + b", "def subtract(a, b):", "    return a - b"], {
+				id: "suspicious-exact-jump",
+				generatedEventId: "generated-suspicious-exact-jump",
+				filePath: "/repo/src/test.py",
+				relativePath: "src/test.py",
+				repoRelativePath: "src/test.py",
+				language: "python",
+			}),
+		)
+
+		watchers[0].emit({
+			type: "commit",
+			previousCommit: "abc123",
+			newCommit: "def456",
+			branch: "feature/stats",
+			isBaseBranch: false,
+			watcher: watchers[0],
+			files: [],
+		})
+
+		await vi.waitFor(async () => {
+			const events = await store.getRecentEvents(10, undefined, 1_772_500_000_000)
+			expect(events.some((event) => event.matchStrategy === "partial" && event.lineStart === 2)).toBe(true)
+		})
+
+		const events = await store.getRecentEvents(10, undefined, 1_772_500_000_000)
+		const rewrittenReturn = events.find((event) => event.matchStrategy === "partial" && event.lineStart === 2)
+		expect(rewrittenReturn).toMatchObject({
+			filePath: "/repo/src/test.py",
+			relativePath: "src/test.py",
+			matchStrategy: "partial",
+			lineStart: 2,
+		})
+		expect(rewrittenReturn?.codeSnippet).toContain("return a - b")
+		expect(rewrittenReturn?.matchDetail).toMatchObject({
+			scoreSource: "attribution",
+			lineDetails: [
+				expect.objectContaining({
+					committedLineNumber: 2,
+					generatedLineNumber: 2,
+				}),
+			],
+		})
+		expect(events.some((event) => event.matchStrategy === "exact" && event.lineStart === 2)).toBe(false)
+	})
+
+	it("does not merge out-of-order exact lines into a broad exact attribution block", async () => {
+		const committedCode = [
+			"def add(a, b):",
+			"    return a - b",
+			"",
+			"",
+			"def subtract(a, b):",
+			'    """两数相减"""',
+			"    # 哈哈哈",
+			"    return a + b",
+		].join("\n")
+		const onCommitMatched = vi.fn(async (_payload: any) => {})
+		const service = createService({
+			onCommitMatched,
+			loadCommitPatch: async () =>
+				[
+					"diff --git a/test.py b/test.py",
+					"--- a/test.py",
+					"+++ b/test.py",
+					"@@ -0,0 +1,8 @@",
+					"+def add(a, b):",
+					"+    return a - b",
+					"+",
+					"+",
+					"+def subtract(a, b):",
+					'+    """两数相减"""',
+					"+    # 哈哈哈",
+					"+    return a + b",
+				].join("\n"),
+			loadCommitFileContent: async () => `${committedCode}\n`,
+		})
+
+		await service.start()
+		await service.registerPendingLineAttributions(
+			buildPendingBlock(
+				[
+					"def add(a, b):",
+					'    """两数相加"""',
+					"    return a + b",
+					"",
+					"",
+					"def subtract(a, b):",
+					'    """两数相减"""',
+					"    return a - b",
+				],
+				{
+					id: "regression-84f3a6b8",
+					generatedEventId: "generated-regression-84f3a6b8",
+					filePath: "/repo/test.py",
+					relativePath: "test.py",
+					repoRelativePath: "test.py",
+					language: "python",
+				},
+			),
+		)
+
+		watchers[0].emit({
+			type: "commit",
+			previousCommit: "abc123",
+			newCommit: "84f3a6b8",
+			branch: "feature/stats",
+			isBaseBranch: false,
+			watcher: watchers[0],
+			files: [],
+		})
+
+		await vi.waitFor(() => {
+			expect(onCommitMatched).toHaveBeenCalledTimes(1)
+		})
+
+		const payload = onCommitMatched.mock.calls[0][0] as any
+		const committedBlocks = payload.committedBlocks as AiCodeCommittedBlock[]
+		expect(
+			committedBlocks.some(
+				(block) =>
+					block.matchStrategy === "exact" &&
+					block.relativePath === "test.py" &&
+					block.lineStart === 1 &&
+					block.lineEnd >= 6,
+			),
+		).toBe(false)
+		expect(committedBlocks.some((block) => block.codeSnippet.includes("# 哈哈哈"))).toBe(false)
+		expect(payload.changedFiles[0].changedBlocks[0].codeSnippet).toContain("# 哈哈哈")
+
+		const partialBlocks = committedBlocks.filter((block) => block.matchStrategy === "partial")
+		expect(partialBlocks.length).toBeGreaterThan(0)
+		expect(
+			partialBlocks.some(
+				(block) =>
+					typeof block.matchConfidence === "number" &&
+					typeof block.equivalentLineCount === "number" &&
+					block.matchDetail?.scoreSource === "attribution" &&
+					(block.matchDetail.lineDetails?.length ?? 0) > 0,
+			),
+		).toBe(true)
+	})
+
+	it("handles suspicious exact fallback windows containing filtered blank lines", async () => {
+		const committedCode = [
+			"def add(a, b):",
+			"    return a - b",
+			"",
+			"",
+			"def subtract(a, b):",
+			'    """hello"""',
+			"    return a + b",
+		].join("\n")
+		const service = createService({
+			loadCommitPatch: async () =>
+				[
+					"diff --git a/src/test.py b/src/test.py",
+					"--- a/src/test.py",
+					"+++ b/src/test.py",
+					"@@ -0,0 +1,7 @@",
+					"+def add(a, b):",
+					"+    return a - b",
+					"+",
+					"+",
+					"+def subtract(a, b):",
+					'+    """hello"""',
+					"+    return a + b",
+				].join("\n"),
+			loadCommitFileContent: async () => `${committedCode}\n`,
+		})
+
+		await service.start()
+		await service.registerPendingLineAttributions(
+			buildPendingBlock(
+				[
+					"def add(a, b):",
+					'    """两数相加"""',
+					"    return a + b",
+					"",
+					"",
+					"def subtract(a, b):",
+					'    """两数相减"""',
+					"    return a - b",
+				],
+				{
+					id: "suspicious-exact-with-blanks",
+					generatedEventId: "generated-suspicious-exact-with-blanks",
+					filePath: "/repo/src/test.py",
+					relativePath: "src/test.py",
+					repoRelativePath: "src/test.py",
+					language: "python",
+				},
+			),
+		)
+
+		watchers[0].emit({
+			type: "commit",
+			previousCommit: "abc123",
+			newCommit: "def456",
+			branch: "feature/stats",
+			isBaseBranch: false,
+			watcher: watchers[0],
+			files: [],
+		})
+
+		await vi.waitFor(async () => {
+			expect(await store.getRepoObservedCommit("/repo")).toBe("def456")
+		})
+
+		const events = await store.getRecentEvents(10, undefined, 1_772_500_000_000)
+		expect(events.length).toBeGreaterThan(0)
+		expect(await store.getRepoObservedCommit("/repo")).toBe("def456")
+	})
+
 	it("does not attribute partial lines when competing candidates are ambiguous", async () => {
 		const service = createService({
 			loadCommitPatch: async () =>
@@ -696,6 +1306,411 @@ describe("AiCodeCommitAttributionService", () => {
 
 		expect(await store.getRecentEvents(1, undefined, 1_772_500_000_000)).toHaveLength(0)
 		expect(await store.getPendingLineAttributions("/repo")).toHaveLength(1)
+	})
+
+	it("keeps isolated short text lines manual when they lack neighboring support", async () => {
+		const service = createService({
+			loadCommitPatch: async () =>
+				[
+					"diff --git a/src/test.py b/src/test.py",
+					"--- a/src/test.py",
+					"+++ b/src/test.py",
+					"@@ -0,0 +1 @@",
+					"+# 新说明",
+				].join("\n"),
+		})
+
+		await service.start()
+		await service.registerPendingLineAttributions([
+			buildPendingLine({
+				id: "generic-text-line",
+				generatedEventId: "generated-generic-text-line",
+				rawLine: "# 说明",
+				filePath: "/repo/src/test.py",
+				relativePath: "src/test.py",
+				repoRelativePath: "src/test.py",
+				language: "python",
+			}),
+		])
+
+		watchers[0].emit({
+			type: "commit",
+			previousCommit: "abc123",
+			newCommit: "def456",
+			branch: "feature/stats",
+			isBaseBranch: false,
+			watcher: watchers[0],
+			files: [],
+		})
+
+		await vi.waitFor(async () => {
+			expect(await store.getRepoObservedCommit("/repo")).toBe("def456")
+		})
+
+		expect(await store.getRecentEvents(1, undefined, 1_772_500_000_000)).toHaveLength(0)
+		expect(await store.getPendingLineAttributions("/repo")).toHaveLength(1)
+	})
+
+	it("keeps low-information manual comments out of partial attribution between exact neighbors", async () => {
+		const service = createService({
+			loadCommitPatch: async () =>
+				[
+					"diff --git a/src/test.py b/src/test.py",
+					"--- a/src/test.py",
+					"+++ b/src/test.py",
+					"@@ -0,0 +1,3 @@",
+					"+def subtract(a, b):",
+					"+    # 哈哈哈",
+					"+    return a - b",
+				].join("\n"),
+			loadCommitFileContent: async () =>
+				["def subtract(a, b):", "    # 哈哈哈", "    return a - b", ""].join("\n"),
+		})
+
+		await service.start()
+		await service.registerPendingLineAttributions(
+			buildPendingBlock(["def subtract(a, b):", '    """两数相减"""', "    return a - b"], {
+				id: "manual-comment-between-exacts",
+				generatedEventId: "generated-manual-comment-between-exacts",
+				filePath: "/repo/src/test.py",
+				relativePath: "src/test.py",
+				repoRelativePath: "src/test.py",
+				language: "python",
+			}),
+		)
+
+		watchers[0].emit({
+			type: "commit",
+			previousCommit: "abc123",
+			newCommit: "def456",
+			branch: "feature/stats",
+			isBaseBranch: false,
+			watcher: watchers[0],
+			files: [],
+		})
+
+		await vi.waitFor(async () => {
+			expect(await store.getRepoObservedCommit("/repo")).toBe("def456")
+		})
+
+		const events = await store.getRecentEvents(10, undefined, 1_772_500_000_000)
+		expect(events.some((event) => event.codeSnippet.includes("# 哈哈哈"))).toBe(false)
+		expect(events.every((event) => event.matchStrategy === "exact")).toBe(true)
+	})
+
+	it("matches Chinese comment lines through the text scorer", async () => {
+		const service = createService({
+			loadCommitPatch: async () =>
+				[
+					"diff --git a/src/test.py b/src/test.py",
+					"--- a/src/test.py",
+					"+++ b/src/test.py",
+					"@@ -0,0 +1 @@",
+					"+# a两数相加函数",
+				].join("\n"),
+			loadCommitFileContent: async () => ["# a两数相加函数", ""].join("\n"),
+		})
+
+		await service.start()
+		await service.registerPendingLineAttributions([
+			buildPendingLine({
+				id: "comment-line",
+				generatedEventId: "generated-comment-line",
+				rawLine: "# 两数相加函数",
+				filePath: "/repo/src/test.py",
+				relativePath: "src/test.py",
+				repoRelativePath: "src/test.py",
+				language: "python",
+			}),
+		])
+
+		watchers[0].emit({
+			type: "commit",
+			previousCommit: "abc123",
+			newCommit: "def456",
+			branch: "feature/stats",
+			isBaseBranch: false,
+			watcher: watchers[0],
+			files: [],
+		})
+
+		await vi.waitFor(async () => {
+			const events = await store.getRecentEvents(1, undefined, 1_772_500_000_000)
+			expect(events).toHaveLength(1)
+			expect(events[0]).toMatchObject({
+				matchStrategy: "partial",
+				filePath: "/repo/src/test.py",
+				relativePath: "src/test.py",
+				lineStart: 1,
+				lineEnd: 1,
+				lineCount: 1,
+				codeSnippet: "# a两数相加函数",
+			})
+		})
+
+		const [event] = await store.getRecentEvents(1, undefined, 1_772_500_000_000)
+		expect(event?.matchConfidence).toBeGreaterThanOrEqual(0.8)
+		expect(await store.getPendingLineAttributions("/repo")).toHaveLength(0)
+	})
+
+	it("matches Java doc comment blocks through the docstring scorer", async () => {
+		const service = createService({
+			loadCommitPatch: async () =>
+				[
+					"diff --git a/src/Add.java b/src/Add.java",
+					"--- a/src/Add.java",
+					"+++ b/src/Add.java",
+					"@@ -0,0 +1,7 @@",
+					"+/**",
+					"+ * a两数相加函数",
+					"+ * 返回计算结果",
+					"+ */",
+					"+int add(int a, int b) {",
+					"+    return a + b;",
+					"+}",
+				].join("\n"),
+			loadCommitFileContent: async () =>
+				[
+					"/**",
+					" * a两数相加函数",
+					" * 返回计算结果",
+					" */",
+					"int add(int a, int b) {",
+					"    return a + b;",
+					"}",
+					"",
+				].join("\n"),
+		})
+
+		await service.start()
+		await service.registerPendingLineAttributions(
+			buildPendingBlock(
+				[
+					"/**",
+					" * 两数相加函数",
+					" * 返回计算结果",
+					" */",
+					"int add(int a, int b) {",
+					"    return a + b;",
+					"}",
+				],
+				{
+					id: "java-doc-comment-block",
+					generatedEventId: "generated-java-doc-comment-block",
+					filePath: "/repo/src/Add.java",
+					relativePath: "src/Add.java",
+					repoRelativePath: "src/Add.java",
+					language: "java",
+				},
+			),
+		)
+
+		watchers[0].emit({
+			type: "commit",
+			previousCommit: "abc123",
+			newCommit: "def456",
+			branch: "feature/stats",
+			isBaseBranch: false,
+			watcher: watchers[0],
+			files: [],
+		})
+
+		await vi.waitFor(async () => {
+			const events = await store.getRecentEvents(7, undefined, 1_772_500_000_000)
+			expect(
+				events.some(
+					(event) => event.matchStrategy === "partial" && event.codeSnippet.includes("a两数相加函数"),
+				),
+			).toBe(true)
+		})
+
+		const events = await store.getRecentEvents(7, undefined, 1_772_500_000_000)
+		expect(
+			events.some((event) => event.matchStrategy === "exact" && event.codeSnippet.includes("return a + b;")),
+		).toBe(true)
+		expect(await store.getPendingLineAttributions("/repo")).toHaveLength(0)
+	})
+
+	it("matches slash doc comments in C++ through the docstring scorer", async () => {
+		const service = createService({
+			loadCommitPatch: async () =>
+				[
+					"diff --git a/src/add.cpp b/src/add.cpp",
+					"--- a/src/add.cpp",
+					"+++ b/src/add.cpp",
+					"@@ -0,0 +1 @@",
+					"+/// a两数相加函数",
+				].join("\n"),
+			loadCommitFileContent: async () => ["/// a两数相加函数", ""].join("\n"),
+		})
+
+		await service.start()
+		await service.registerPendingLineAttributions([
+			buildPendingLine({
+				id: "cpp-doc-line",
+				generatedEventId: "generated-cpp-doc-line",
+				rawLine: "/// 两数相加函数",
+				filePath: "/repo/src/add.cpp",
+				relativePath: "src/add.cpp",
+				repoRelativePath: "src/add.cpp",
+				language: "cpp",
+			}),
+		])
+
+		watchers[0].emit({
+			type: "commit",
+			previousCommit: "abc123",
+			newCommit: "def456",
+			branch: "feature/stats",
+			isBaseBranch: false,
+			watcher: watchers[0],
+			files: [],
+		})
+
+		await vi.waitFor(async () => {
+			const events = await store.getRecentEvents(1, undefined, 1_772_500_000_000)
+			expect(events).toHaveLength(1)
+			expect(events[0]?.matchStrategy).toBe("partial")
+			expect(events[0]?.codeSnippet).toContain("a两数相加函数")
+		})
+
+		expect(await store.getPendingLineAttributions("/repo")).toHaveLength(0)
+	})
+
+	it("accepts a generic partial line when adjacent exact matches provide support", async () => {
+		const service = createService({
+			loadCommitPatch: async () =>
+				[
+					"diff --git a/src/test.py b/src/test.py",
+					"--- a/src/test.py",
+					"+++ b/src/test.py",
+					"@@ -0,0 +1,4 @@",
+					"+def add(a, b):",
+					'+    """a两数相加函数"""',
+					"+    result = a + b",
+					"+    return result",
+				].join("\n"),
+			loadCommitFileContent: async () =>
+				["def add(a, b):", '    """a两数相加函数"""', "    result = a + b", "    return result", ""].join("\n"),
+		})
+
+		await service.start()
+		await service.registerPendingLineAttributions(
+			buildPendingBlock(["def add(a, b):", '    """两数相加函数"""', "    result = a + b", "    return result"], {
+				id: "python-docstring-block",
+				generatedEventId: "generated-python-docstring-block",
+				filePath: "/repo/src/test.py",
+				relativePath: "src/test.py",
+				repoRelativePath: "src/test.py",
+				language: "python",
+			}),
+		)
+
+		watchers[0].emit({
+			type: "commit",
+			previousCommit: "abc123",
+			newCommit: "def456",
+			branch: "feature/stats",
+			isBaseBranch: false,
+			watcher: watchers[0],
+			files: [],
+		})
+
+		await vi.waitFor(async () => {
+			const events = await store.getRecentEvents(3, undefined, 1_772_500_000_000)
+			expect(events).toHaveLength(3)
+			expect(
+				events.some(
+					(event) => event.matchStrategy === "partial" && event.codeSnippet.includes("a两数相加函数"),
+				),
+			).toBe(true)
+		})
+
+		const events = await store.getRecentEvents(3, undefined, 1_772_500_000_000)
+		const partialEvent = events.find((event) => event.matchStrategy === "partial")
+		expect(partialEvent).toMatchObject({
+			filePath: "/repo/src/test.py",
+			relativePath: "src/test.py",
+			lineStart: 2,
+			lineEnd: 2,
+			lineCount: 1,
+			codeSnippet: '    """a两数相加函数"""',
+		})
+		expect(partialEvent?.matchConfidence).toBeGreaterThanOrEqual(0.75)
+		expect(partialEvent?.equivalentLineCount).toBeGreaterThanOrEqual(0.75)
+		expect(partialEvent?.matchDetail).toMatchObject({
+			scoreSource: "attribution",
+			lineDetails: [
+				expect.objectContaining({
+					committedLineNumber: 2,
+					generatedLineNumber: 2,
+					overlapKind: "term",
+				}),
+			],
+		})
+		expect(await store.getPendingLineAttributions("/repo")).toHaveLength(0)
+	})
+
+	it("matches markdown text outside fenced code blocks while keeping fenced code on the code path", async () => {
+		const service = createService({
+			loadCommitPatch: async () =>
+				[
+					"diff --git a/docs/guide.md b/docs/guide.md",
+					"--- a/docs/guide.md",
+					"+++ b/docs/guide.md",
+					"@@ -0,0 +1,5 @@",
+					"+# a两数相加",
+					"+- a计算两个整数之和",
+					"+```python",
+					"+def add(a, b):",
+					"+```",
+				].join("\n"),
+			loadCommitFileContent: async () =>
+				["# a两数相加", "- a计算两个整数之和", "```python", "def add(a, b):", "```", ""].join("\n"),
+		})
+
+		await service.start()
+		await service.registerPendingLineAttributions(
+			buildPendingBlock(["# 两数相加", "- 计算两个整数之和", "```python", "def add(a, b):", "```"], {
+				id: "markdown-block",
+				generatedEventId: "generated-markdown-block",
+				filePath: "/repo/docs/guide.md",
+				relativePath: "docs/guide.md",
+				repoRelativePath: "docs/guide.md",
+				language: "markdown",
+			}),
+		)
+
+		watchers[0].emit({
+			type: "commit",
+			previousCommit: "abc123",
+			newCommit: "def456",
+			branch: "feature/stats",
+			isBaseBranch: false,
+			watcher: watchers[0],
+			files: [],
+		})
+
+		await vi.waitFor(async () => {
+			const events = await store.getRecentEvents(5, undefined, 1_772_500_000_000)
+			expect(
+				events.some((event) => event.matchStrategy === "partial" && event.codeSnippet.includes("# a两数相加")),
+			).toBe(true)
+			expect(
+				events.some(
+					(event) => event.matchStrategy === "partial" && event.codeSnippet.includes("a计算两个整数之和"),
+				),
+			).toBe(true)
+		})
+
+		const events = await store.getRecentEvents(5, undefined, 1_772_500_000_000)
+		expect(
+			events.some((event) => event.matchStrategy === "partial" && event.codeSnippet.includes("def add(a, b):")),
+		).toBe(false)
+		expect(
+			events.some((event) => event.matchStrategy === "exact" && event.codeSnippet.includes("def add(a, b):")),
+		).toBe(true)
+		expect(await store.getPendingLineAttributions("/repo")).toHaveLength(0)
 	})
 
 	it("accepts partial blocks when three of five lines are adopted with high confidence", async () => {
@@ -1135,5 +2150,222 @@ describe("AiCodeCommitAttributionService", () => {
 
 		expect(await store.getRecentEvents(1, undefined, 1_772_500_000_000)).toHaveLength(0)
 		expect(await store.getPendingLineAttributions("/repo")).toHaveLength(1)
+	})
+
+	it("matches the dense partial reference on deterministic random corpora", () => {
+		const service = createService()
+
+		for (let caseIndex = 0; caseIndex < 40; caseIndex += 1) {
+			const pendingLines = buildRandomPendingBlock(caseIndex + 1, `generated-random-${caseIndex}`)
+			const addedLines = buildRandomAddedLines(caseIndex + 1, pendingLines)
+
+			const sparseResult = runPartialMatcherWithStrategy({
+				service,
+				pendingLines,
+				addedLines,
+				commitHash: `sparse-${caseIndex}`,
+				useDenseReference: false,
+			})
+			const denseResult = runPartialMatcherWithStrategy({
+				service,
+				pendingLines,
+				addedLines,
+				commitHash: `dense-${caseIndex}`,
+				useDenseReference: true,
+			})
+
+			expect(
+				{
+					matchedLineIds: sparseResult.matchedLineIds,
+					committedBlocks: sparseResult.committedBlocks,
+				},
+				`random corpus case ${caseIndex}`,
+			).toEqual({
+				matchedLineIds: denseResult.matchedLineIds,
+				committedBlocks: denseResult.committedBlocks,
+			})
+		}
+	})
+
+	it("matches the dense partial reference on text-focused corpora", () => {
+		const service = createService()
+		const textCases = [
+			{
+				name: "python-comments",
+				filePath: "src/test.py",
+				pendingLines: buildPendingBlock(["# 两数相加函数", "# 返回计算结果"], {
+					id: "text-comment",
+					blockId: "text-comment",
+					generatedEventId: "generated-text-comment",
+					filePath: "/repo/src/test.py",
+					relativePath: "src/test.py",
+					repoRelativePath: "src/test.py",
+					language: "python",
+				}),
+				addedLines: ["# a两数相加函数", "# 返回计算结果并记录日志"],
+			},
+			{
+				name: "python-docstring",
+				filePath: "src/doc.py",
+				pendingLines: buildPendingBlock(['"""两数相加函数"""', '"""返回计算结果"""'], {
+					id: "text-docstring",
+					blockId: "text-docstring",
+					generatedEventId: "generated-text-docstring",
+					filePath: "/repo/src/doc.py",
+					relativePath: "src/doc.py",
+					repoRelativePath: "src/doc.py",
+					language: "python",
+				}),
+				addedLines: ['"""a两数相加函数"""', '"""返回计算结果并记录日志"""'],
+			},
+			{
+				name: "markdown-text",
+				filePath: "docs/guide.md",
+				pendingLines: buildPendingBlock(["# 两数相加", "- 计算两个整数之和", "普通段落说明"], {
+					id: "text-markdown",
+					blockId: "text-markdown",
+					generatedEventId: "generated-text-markdown",
+					filePath: "/repo/docs/guide.md",
+					relativePath: "docs/guide.md",
+					repoRelativePath: "docs/guide.md",
+					language: "markdown",
+				}),
+				addedLines: ["# a两数相加", "- a计算两个整数之和", "普通段落a说明"],
+			},
+		] as const
+
+		for (const textCase of textCases) {
+			const sparseResult = runPartialMatcherWithStrategy({
+				service,
+				pendingLines: textCase.pendingLines,
+				addedLines: textCase.addedLines,
+				filePath: textCase.filePath,
+				commitHash: `sparse-${textCase.name}`,
+				useDenseReference: false,
+			})
+			const denseResult = runPartialMatcherWithStrategy({
+				service,
+				pendingLines: textCase.pendingLines,
+				addedLines: textCase.addedLines,
+				filePath: textCase.filePath,
+				commitHash: `dense-${textCase.name}`,
+				useDenseReference: true,
+			})
+
+			expect(
+				{
+					matchedLineIds: sparseResult.matchedLineIds,
+					committedBlocks: sparseResult.committedBlocks,
+				},
+				textCase.name,
+			).toEqual({
+				matchedLineIds: denseResult.matchedLineIds,
+				committedBlocks: denseResult.committedBlocks,
+			})
+		}
+	})
+
+	it("matches inline-commented code lines when nested calls collapse into the final value", () => {
+		const service = createService()
+		const result = runPartialMatcherWithStrategy({
+			service,
+			filePath: "src/test.py",
+			pendingLines: buildPendingBlock(["print(add(1, 2))  # 输出: 3", "print(add(5, 10))  # 输出: 15"], {
+				id: "inline-print",
+				blockId: "inline-print",
+				generatedEventId: "generated-inline-print",
+				filePath: "/repo/src/test.py",
+				relativePath: "src/test.py",
+				repoRelativePath: "src/test.py",
+				language: "python",
+			}),
+			addedLines: ["print(add(3, 2))  # 输出: 5", "print(15)  # 输出: 15"],
+			commitHash: "inline-comment-print-collapse",
+			useDenseReference: false,
+		})
+
+		expect(result.matchedLineIds).toEqual(["inline-print-1", "inline-print-2"])
+		expect(result.committedBlocks).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					lineStart: 2,
+					lineEnd: 2,
+					matchStrategy: "partial",
+					codeSnippet: "print(15)  # 输出: 15",
+				}),
+			]),
+		)
+		expect(
+			result.committedBlocks.find((block) => block.lineStart === 2 && block.lineEnd === 2)?.matchConfidence,
+		).toBeGreaterThanOrEqual(0.65)
+		const collapsedPrintBlock = result.committedBlocks.find((block) => block.lineStart === 2 && block.lineEnd === 2)
+		expect(collapsedPrintBlock?.matchDetail).toMatchObject({
+			scoreSource: "attribution",
+			lineDetails: [
+				expect.objectContaining({
+					committedLineNumber: 2,
+					generatedLineNumber: 2,
+					adjustments: ["inline_comment_bonus"],
+				}),
+			],
+		})
+		expect(collapsedPrintBlock?.matchDetail?.baseScore).toBeLessThan(
+			collapsedPrintBlock?.matchDetail?.finalScore ?? 0,
+		)
+	})
+
+	it("falls back to the dense reference when sparse paths tie exactly", () => {
+		const service = createService()
+		const internal = service as unknown as InternalService
+		const pendingLines = buildPendingBlock(
+			["return formatCurrency(total, currencyCode)", "return formatCurrency(total, currencyCode)"],
+			{
+				id: "ambiguous-tie",
+				blockId: "ambiguous-tie",
+				generatedEventId: "generated-ambiguous-tie",
+			},
+		)
+		const block = internal.buildPendingBlockCandidates(
+			pendingLines,
+			new Set<string>(),
+			"src/a.ts",
+			undefined,
+			1_772_500_000_000,
+		)[0]
+		const addedLines = internal.buildAddedLineCandidates([
+			{ index: 0, lineNumber: 1, content: "return formatCurrency(total, currencyCode)" },
+			{ index: 1, lineNumber: 2, content: "const total = calculateTotal(items, taxRate)" },
+			{ index: 2, lineNumber: 3, content: "const total = calculateTotal(items, taxRate)" },
+		])
+		const debugStats = createPartialDebugStats()
+
+		const sparseResult = internal.alignPartialBlockCandidates(
+			block,
+			addedLines,
+			DEFAULT_AI_CODE_COMMIT_ATTRIBUTION_CONFIG,
+			debugStats,
+		)
+		const denseResult = internal.alignPartialBlockCandidatesDenseReference(
+			block,
+			addedLines,
+			DEFAULT_AI_CODE_COMMIT_ATTRIBUTION_CONFIG,
+			createPartialDebugStats(),
+		)
+
+		expect(debugStats.processedBlockCount).toBe(1)
+		expect(debugStats.denseFallbackBlockCount).toBe(1)
+		expect(
+			sparseResult.map((candidate) => ({
+				pendingLineId: candidate.pendingLine.id,
+				addedIndex: candidate.addedLine.index,
+				lineScore: candidate.lineScore,
+			})),
+		).toEqual(
+			denseResult.map((candidate) => ({
+				pendingLineId: candidate.pendingLine.id,
+				addedIndex: candidate.addedLine.index,
+				lineScore: candidate.lineScore,
+			})),
+		)
 	})
 })
