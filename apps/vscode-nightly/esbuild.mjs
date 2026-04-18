@@ -63,7 +63,7 @@ async function main() {
 				build.onEnd(() => {
 					copyPaths(
 						[
-							["../README.md", "README.md"],
+							["../marketplace-README.md", "README.md"], // kilocode_change: use marketplace README without deprecation notice
 							["../CHANGELOG.md", "CHANGELOG.md"],
 							["../LICENSE", "LICENSE"],
 							["../.env", ".env", { optional: true }],

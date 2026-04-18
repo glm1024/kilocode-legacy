@@ -185,6 +185,7 @@ export interface ExtensionMessage {
 		| "mcpDownloadDetails" // kilocode_change
 		| "showSystemNotification" // kilocode_change
 		| "openInBrowser" // kilocode_change
+		| "switchToPreRelease" // kilocode_change
 		| "acceptInput"
 		| "focusChatInput" // kilocode_change
 		| "stt:started" // kilocode_change: STT session started
@@ -898,6 +899,7 @@ export interface WebviewMessage {
 		| "setReasoningBlockCollapsed" // kilocode_change
 		| "openExternal"
 		| "openInBrowser" // kilocode_change
+		| "switchToPreRelease" // kilocode_change
 		| "filterMarketplaceItems"
 		| "marketplaceButtonClicked"
 		| "installMarketplaceItem"

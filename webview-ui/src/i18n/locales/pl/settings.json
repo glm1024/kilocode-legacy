@@ -642,6 +642,7 @@
 		"verbosity": {
 			"label": "Szczegółowość danych wyjściowych",
 			"max": "Max",
+			"xhigh": "Bardzo wysoki",
 			"high": "Wysoka",
 			"medium": "Średnia",
 			"low": "Niska",

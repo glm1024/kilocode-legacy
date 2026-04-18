@@ -679,6 +679,7 @@
 		"verbosity": {
 			"label": "Podrobnost výstupu",
 			"max": "Max",
+			"xhigh": "Extra vysoké",
 			"high": "Vysoká",
 			"medium": "Střední",
 			"low": "Nízká",

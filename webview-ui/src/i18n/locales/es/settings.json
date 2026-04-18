@@ -625,6 +625,7 @@
 		"verbosity": {
 			"label": "Verbosidad de la salida",
 			"max": "Max",
+			"xhigh": "Extra Alto",
 			"high": "Alta",
 			"medium": "Media",
 			"low": "Baja",

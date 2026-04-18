@@ -642,6 +642,7 @@
 		"verbosity": {
 			"label": "Verbositat de la sortida",
 			"max": "Max",
+			"xhigh": "Molt Alt",
 			"high": "Alta",
 			"medium": "Mitjana",
 			"low": "Baixa",

@@ -477,7 +477,8 @@ export class ZenMuxHandler extends BaseProvider implements SingleCompletionHandl
 		// ZenMux `verbosity` supports "low" | "medium" | "high" (and sometimes null),
 		// while our shared model params may include "max". Map "max" to the closest
 		// supported value to satisfy the API/SDK typing.
-		const zenMuxVerbosity: "low" | "medium" | "high" | null | undefined = verbosity === "max" ? "high" : verbosity
+		const zenMuxVerbosity: "low" | "medium" | "high" | null | undefined =
+			verbosity === "max" || verbosity === "xhigh" ? "high" : verbosity
 
 		const completionParams: ZenMuxChatCompletionParams = {
 			model: modelId,

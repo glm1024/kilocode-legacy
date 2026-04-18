@@ -73,7 +73,8 @@ export class AnthropicHandler extends BaseProvider implements SingleCompletionHa
 			(modelId === "claude-sonnet-4-20250514" ||
 				modelId === "claude-sonnet-4-5" ||
 				modelId === "claude-sonnet-4-6" ||
-				modelId === "claude-opus-4-6") &&
+				modelId === "claude-opus-4-6" ||
+				modelId === "claude-opus-4-7") &&
 			this.options.anthropicBeta1MContext
 		) {
 			betas.push("context-1m-2025-08-07")
@@ -120,6 +121,7 @@ export class AnthropicHandler extends BaseProvider implements SingleCompletionHa
 			: {}
 
 		switch (modelId) {
+			case "claude-opus-4-7": // kilocode_change
 			case "claude-opus-4-6": // kilocode_change
 			case "claude-sonnet-4-6":
 			case "claude-sonnet-4-5":
@@ -195,6 +197,7 @@ export class AnthropicHandler extends BaseProvider implements SingleCompletionHa
 
 							// Then check for models that support prompt caching
 							switch (modelId) {
+								case "claude-opus-4-7": // kilocode_change
 								case "claude-opus-4-6": // kilocode_change
 								case "claude-sonnet-4-6":
 								case "claude-sonnet-4-5":
@@ -439,7 +442,8 @@ export class AnthropicHandler extends BaseProvider implements SingleCompletionHa
 			(id === "claude-sonnet-4-20250514" ||
 				id === "claude-sonnet-4-5" ||
 				id === "claude-sonnet-4-6" ||
-				id === "claude-opus-4-6") &&
+				id === "claude-opus-4-6" ||
+				id === "claude-opus-4-7") &&
 			this.options.anthropicBeta1MContext
 		) {
 			// Use the tier pricing for 1M context

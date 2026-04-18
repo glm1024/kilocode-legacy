@@ -7,7 +7,7 @@
 		},
 		"premiumModels": {
 			"title": "Prémiové modely",
-			"description": "Zaregistruj sa. Noví používatelia získajú kredit 5 $"
+			"description": "Zaregistruj sa. Noví používatelia získajú kredit 2,50 $"
 		},
 		"byok": {
 			"title": "Použi vlastný kľúč",
@@ -18,7 +18,7 @@
 		"greeting": "Vitaj v Kilo Code!",
 		"introText1": "Kilo Code je bezplatný open source AI coding agent.",
 		"introText2": "Funguje s najnovšími AI modelmi ako Claude Opus 4.5, Gemini 3 Pro, GPT-5.2 a viac ako 450 ďalšími.",
-		"introText3": "Vytvor si bezplatný účet a získaj $20 bonusových kreditov pri prvom dobití.",
+		"introText3": "Vytvor si bezplatný účet a začni.",
 		"ctaButton": "Začať",
 		"manualModeButton": "Použi vlastný API key",
 		"alreadySignedUp": "Už si registrovaný?",

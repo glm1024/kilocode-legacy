@@ -1,5 +1,59 @@
 # kilo-code
 
+## 5.13.0
+
+### Minor Changes
+
+- [#108](https://github.com/Kilo-Org/kilocode-legacy/pull/108) [`3c215d2`](https://github.com/Kilo-Org/kilocode-legacy/commit/3c215d2c9ef52cd6ad5bac6c09a405eae7f0a7c7) Thanks [@kilo-code-bot](https://github.com/apps/kilo-code-bot)! - Add Claude Opus 4.7 support and new Extra High output verbosity level
+
+## 5.12.0
+
+### Minor Changes
+
+- [#80](https://github.com/Kilo-Org/kilocode-legacy/pull/80) [`cf557ce`](https://github.com/Kilo-Org/kilocode-legacy/commit/cf557ce90f51e820daa2f079b21e4b5a1a9eb490) Thanks [@kilo-code-bot](https://github.com/apps/kilo-code-bot)! - Add GLM-5-Turbo and GLM-5.1 models to the Z.AI provider
+
+## 5.11.0
+
+### Minor Changes
+
+- [#74](https://github.com/Kilo-Org/kilocode-legacy/pull/74) [`985f714`](https://github.com/Kilo-Org/kilocode-legacy/commit/985f714c6ed4663610a8a2fe7936fb86dbe4462a) Thanks [@chrarnoldus](https://github.com/chrarnoldus)! - Added notification about the completely rebuilt Kilo Code extension for VS Code.
+
+## 5.10.5
+
+### Patch Changes
+
+- [#69](https://github.com/Kilo-Org/kilocode-legacy/pull/69) [`ac89448`](https://github.com/Kilo-Org/kilocode-legacy/commit/ac89448a886d2bc59e0585174db85b77ea54a643) Thanks [@kilo-code-bot](https://github.com/apps/kilo-code-bot)! - Add MiniMax-M2.7 and MiniMax-M2.7-highspeed models to the MiniMax provider
+
+- [#65](https://github.com/Kilo-Org/kilocode-legacy/pull/65) [`08029f2`](https://github.com/Kilo-Org/kilocode-legacy/commit/08029f26c4f038e0101484b9bf4430b8b7054168) Thanks [@kilo-code-bot](https://github.com/apps/kilo-code-bot)! - Update new user welcome credits from $5 to $2.50
+
+## 5.10.4
+
+### Patch Changes
+
+- [#54](https://github.com/Kilo-Org/kilocode-legacy/pull/54) [`7de6525`](https://github.com/Kilo-Org/kilocode-legacy/commit/7de652520851d8debad92b72d6cb9dfa10edb399) Thanks [@kilo-code-bot](https://github.com/apps/kilo-code-bot)! - Update onboarding premium models text to reflect new first top-up bonus credits offer
+
+## 5.10.3
+
+### Patch Changes
+
+- [#47](https://github.com/Kilo-Org/kilocode-legacy/pull/47) [`65552ff`](https://github.com/Kilo-Org/kilocode-legacy/commit/65552ff1f501aaecc235882a299c4ae59f31a5a1) Thanks [@kevinvandijk](https://github.com/kevinvandijk)! - Add OpenAI's GPT-5.3-Chat-Latest model support (thanks Roo! / @PeterDaveHello)
+
+- [#47](https://github.com/Kilo-Org/kilocode-legacy/pull/47) [`65552ff`](https://github.com/Kilo-Org/kilocode-legacy/commit/65552ff1f501aaecc235882a299c4ae59f31a5a1) Thanks [@kevinvandijk](https://github.com/kevinvandijk)! - Add OpenAI's GPT-5.4 model support (thanks Roo! / @PeterDaveHello)
+
+## 5.10.2
+
+### Patch Changes
+
+- [#44](https://github.com/Kilo-Org/kilocode-legacy/pull/44) [`b3f72a6`](https://github.com/Kilo-Org/kilocode-legacy/commit/b3f72a6a4a07b20450f6bf4024b29b1b8b79db1b) Thanks [@catgirl3d](https://github.com/catgirl3d)! - feat(providers): add Claude Code Sonnet/Opus 4.6 models to Claude Code and fix OpenAI Codex GPT-5.4 id
+
+## 5.10.1
+
+### Patch Changes
+
+- [#32](https://github.com/Kilo-Org/kilocode-legacy/pull/32) [`b8fda59`](https://github.com/Kilo-Org/kilocode-legacy/commit/b8fda597055785efd17ddba7185f1e2b2a3404f2) Thanks [@dmkononenko](https://github.com/dmkononenko)! - Add gpt-5.4-codex configuration
+
+- [#33](https://github.com/Kilo-Org/kilocode-legacy/pull/33) [`2c17b43`](https://github.com/Kilo-Org/kilocode-legacy/commit/2c17b43787b17c09a8b0955b350ef9c807b50491) Thanks [@kilo-code-bot](https://github.com/apps/kilo-code-bot)! - Use separate marketplace README without deprecation notice for VS Code marketplace listing
+
 ## 5.10.0
 
 ### Minor Changes

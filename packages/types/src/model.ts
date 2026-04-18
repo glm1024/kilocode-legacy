@@ -39,7 +39,7 @@ export const reasoningEffortSettingSchema = z.enum(reasoningEffortSettingValues)
  * Verbosity
  */
 
-export const verbosityLevels = ["low", "medium", "high", "max"] as const // kilocode_change
+export const verbosityLevels = ["low", "medium", "high", "xhigh", "max"] as const // kilocode_change
 
 export const verbosityLevelsSchema = z.enum(verbosityLevels)
 
@@ -100,6 +100,16 @@ export const modelInfoSchema = z.object({
 	outputPrice: z.number().optional(),
 	cacheWritesPrice: z.number().optional(),
 	cacheReadsPrice: z.number().optional(),
+	longContextPricing: z
+		.object({
+			thresholdTokens: z.number(),
+			inputPriceMultiplier: z.number().optional(),
+			outputPriceMultiplier: z.number().optional(),
+			cacheWritesPriceMultiplier: z.number().optional(),
+			cacheReadsPriceMultiplier: z.number().optional(),
+			appliesToServiceTiers: z.array(serviceTierSchema).optional(),
+		})
+		.optional(),
 	description: z.string().optional(),
 	banner: z.string().optional(), // kilocode_change
 	// Default effort value for models that support reasoning effort

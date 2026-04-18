@@ -7,7 +7,7 @@
 		},
 		"premiumModels": {
 			"title": "Model premium",
-			"description": "Daftar. Pengguna baru mendapatkan kredit $5"
+			"description": "Daftar. Pengguna baru mendapatkan kredit $2.50"
 		},
 		"byok": {
 			"title": "Gunakan kunci sendiri",
@@ -18,7 +18,7 @@
 		"greeting": "Selamat datang di Kilo Code!",
 		"introText1": "Kilo Code adalah agen coding AI gratis dan open source.",
 		"introText2": "Bekerja dengan model AI terbaru seperti Claude Opus 4.5, Gemini 3 Pro, GPT-5.2, dan lebih dari 450 model lainnya.",
-		"introText3": "Buat akun gratis dan dapatkan $20 kredit bonus saat top-up pertama kali.",
+		"introText3": "Buat akun gratis untuk memulai.",
 		"ctaButton": "Mulai",
 		"manualModeButton": "Gunakan API key sendiri",
 		"alreadySignedUp": "Sudah mendaftar?",

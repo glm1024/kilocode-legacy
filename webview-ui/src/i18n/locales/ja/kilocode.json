@@ -7,7 +7,7 @@
 		},
 		"premiumModels": {
 			"title": "プレミアムモデル",
-			"description": "登録。新規ユーザーは5ドルのクレジットを獲得"
+			"description": "登録。新規ユーザーは2.50ドルのクレジットを獲得"
 		},
 		"byok": {
 			"title": "自分のキーを使用",
@@ -18,7 +18,7 @@
 		"greeting": "Kilo Codeへようこそ！",
 		"introText1": "Kilo Codeは無料のオープンソースAIコーディングエージェントです。",
 		"introText2": "Claude Opus 4.5、Gemini 3 Pro、GPT-5.2、その他450以上の最新のAIモデルと連携します。",
-		"introText3": "無料アカウントを作成して、初回チャージ時に$20のボーナスクレジットを獲得しましょう。",
+		"introText3": "無料アカウントを作成して始めましょう。",
 		"ctaButton": "始める",
 		"manualModeButton": "自分のAPIキーを使う",
 		"alreadySignedUp": "すでに登録済みですか？",

@@ -642,6 +642,7 @@
 		"verbosity": {
 			"label": "Uitvoerbaarheid",
 			"max": "Max",
+			"xhigh": "Extra Hoog",
 			"high": "Hoog",
 			"medium": "Gemiddeld",
 			"low": "Laag",

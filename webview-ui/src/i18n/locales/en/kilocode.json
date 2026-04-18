@@ -7,7 +7,7 @@
 		},
 		"premiumModels": {
 			"title": "Premium models",
-			"description": "Sign up. New users get $5 in credits"
+			"description": "Sign up. New users get $2.50 in credits"
 		},
 		"byok": {
 			"title": "Bring my own Key",
@@ -18,7 +18,7 @@
 		"greeting": "Welcome to Kilo Code!",
 		"introText1": "Kilo Code is a free, open source AI coding agent.",
 		"introText2": "It works with the latest AI models like Claude Opus 4.5, Gemini 3 Pro, GPT-5.2, and 450+ more.",
-		"introText3": "Create a free account and get $20 in bonus credits when you top-up for the first time.",
+		"introText3": "Create a free account to get started.",
 		"ctaButton": "Get Started",
 		"manualModeButton": "Use your own API key",
 		"alreadySignedUp": "Already signed up?",

@@ -7,6 +7,7 @@ import { ZaiApiLine } from "../provider-settings.js"
 // https://docs.z.ai/guides/llm/glm-4.6
 // https://docs.z.ai/guides/llm/glm-4.7
 // https://docs.z.ai/guides/llm/glm-5 // kilocode_change
+// https://docs.z.ai/guides/llm/glm-5-turbo // kilocode_change
 // https://docs.z.ai/guides/overview/pricing
 // https://bigmodel.cn/pricing
 
@@ -176,6 +177,40 @@ export const internationalZAiModels = {
 			"GLM-5 is Z.AI's flagship text model with 200K context, 128K max output, thinking mode, function calling, and context caching.",
 		preferredIndex: 0,
 	},
+	"glm-5-turbo": {
+		maxTokens: 131_072,
+		contextWindow: 200_000,
+		supportsImages: false,
+		supportsPromptCache: true,
+		supportsNativeTools: true,
+		defaultToolProtocol: "native",
+		supportsReasoningEffort: ["disable", "medium"],
+		reasoningEffort: "medium",
+		preserveReasoning: true,
+		inputPrice: 1.2,
+		outputPrice: 4,
+		cacheWritesPrice: 0,
+		cacheReadsPrice: 0.24,
+		description:
+			"GLM-5-Turbo is a model deeply optimized for the OpenClaw agentic scenario, with enhanced capabilities in tool invocation, instruction following, scheduled tasks, and long-chain execution.",
+	},
+	"glm-5.1": {
+		maxTokens: 131_072,
+		contextWindow: 200_000,
+		supportsImages: false,
+		supportsPromptCache: true,
+		supportsNativeTools: true,
+		defaultToolProtocol: "native",
+		supportsReasoningEffort: ["disable", "medium"],
+		reasoningEffort: "medium",
+		preserveReasoning: true,
+		inputPrice: 0,
+		outputPrice: 0,
+		cacheWritesPrice: 0,
+		cacheReadsPrice: 0,
+		description:
+			"GLM-5.1 is the latest iteration of the GLM-5 series, available via the GLM Coding Plan with enhanced capabilities for coding and agentic tasks.",
+	},
 	"glm-4.7-flash": {
 		maxTokens: 16_384,
 		contextWindow: 200_000,
@@ -342,6 +377,40 @@ export const mainlandZAiModels = {
 		description:
 			"GLM-5 is Z.AI's flagship text model with 200K context, 128K max output, thinking mode, function calling, and context caching.",
 		preferredIndex: 0,
+	},
+	"glm-5-turbo": {
+		maxTokens: 131_072,
+		contextWindow: 200_000,
+		supportsImages: false,
+		supportsPromptCache: true,
+		supportsNativeTools: true,
+		defaultToolProtocol: "native",
+		supportsReasoningEffort: ["disable", "medium"],
+		reasoningEffort: "medium",
+		preserveReasoning: true,
+		inputPrice: 0.69,
+		outputPrice: 3.09,
+		cacheWritesPrice: 0,
+		cacheReadsPrice: 0.17,
+		description:
+			"GLM-5-Turbo is a model deeply optimized for the OpenClaw agentic scenario, with enhanced capabilities in tool invocation, instruction following, scheduled tasks, and long-chain execution.",
+	},
+	"glm-5.1": {
+		maxTokens: 131_072,
+		contextWindow: 200_000,
+		supportsImages: false,
+		supportsPromptCache: true,
+		supportsNativeTools: true,
+		defaultToolProtocol: "native",
+		supportsReasoningEffort: ["disable", "medium"],
+		reasoningEffort: "medium",
+		preserveReasoning: true,
+		inputPrice: 0,
+		outputPrice: 0,
+		cacheWritesPrice: 0,
+		cacheReadsPrice: 0,
+		description:
+			"GLM-5.1 is the latest iteration of the GLM-5 series, available via the GLM Coding Plan with enhanced capabilities for coding and agentic tasks.",
 	},
 	"glm-4.7-flash": {
 		maxTokens: 16_384,

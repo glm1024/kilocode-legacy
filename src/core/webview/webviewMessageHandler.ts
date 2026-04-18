@@ -124,6 +124,15 @@ import { ManagedIndexer } from "../../services/code-index/managed/ManagedIndexer
 import { SessionManager } from "../../shared/kilocode/cli-sessions/core/SessionManager" // kilocode_change
 import { getEffectiveTelemetrySetting } from "../kilocode/wrapper"
 
+async function switchToPreRelease() {
+	await vscode.commands.executeCommand("workbench.extensions.installExtension", "kilocode.kilo-code", {
+		installPreReleaseVersion: true,
+	})
+	vscode.window.showInformationMessage(
+		"Switching to the pre-release channel. VS Code will prompt you to reload once the update is installed.",
+	)
+}
+
 export const webviewMessageHandler = async (
 	provider: ClineProvider,
 	message: MaybeTypedWebviewMessage, // kilocode_change switch to MaybeTypedWebviewMessage for better type-safety
@@ -1791,6 +1800,9 @@ export const webviewMessageHandler = async (
 			const systemNotificationsEnabled = message.bool ?? true
 			await updateGlobalState("systemNotificationsEnabled", systemNotificationsEnabled)
 			await provider.postStateToWebview()
+			break
+		case "switchToPreRelease":
+			await switchToPreRelease()
 			break
 		case "openInBrowser":
 			if (message.url) {

@@ -7,7 +7,7 @@
 		},
 		"premiumModels": {
 			"title": "Modele premium",
-			"description": "Zarejestruj się. Nowi użytkownicy otrzymują 5 $ kredytu"
+			"description": "Zarejestruj się. Nowi użytkownicy otrzymują 2,50 $ kredytu"
 		},
 		"byok": {
 			"title": "Użyj własnego klucza",
@@ -18,7 +18,7 @@
 		"greeting": "Witaj w Kilo Code!",
 		"introText1": "Kilo Code to darmowy, otwartoźródłowy agent kodowania AI.",
 		"introText2": "Współpracuje z najnowszymi modelami AI, takimi jak Claude Opus 4.5, Gemini 3 Pro, GPT-5.2 i ponad 450 innymi.",
-		"introText3": "Stwórz darmowe konto i otrzymaj $20 bonusowych kredytów przy pierwszym doładowaniu.",
+		"introText3": "Stwórz darmowe konto, aby zacząć.",
 		"ctaButton": "Rozpocznij",
 		"manualModeButton": "Użyj własnego klucza API",
 		"alreadySignedUp": "Już zarejestrowany?",

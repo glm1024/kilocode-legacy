@@ -642,6 +642,7 @@
 		"verbosity": {
 			"label": "출력 상세도",
 			"max": "Max",
+			"xhigh": "매우 높음",
 			"high": "높음",
 			"medium": "중간",
 			"low": "낮음",

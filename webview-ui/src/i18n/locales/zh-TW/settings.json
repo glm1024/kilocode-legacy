@@ -626,6 +626,7 @@
 		"verbosity": {
 			"label": "輸出詳細程度",
 			"max": "Max",
+			"xhigh": "超高",
 			"high": "高",
 			"medium": "中",
 			"low": "低",
