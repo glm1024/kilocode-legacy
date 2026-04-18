@@ -3,9 +3,9 @@ import { describe, it, expect, vi, beforeEach } from "vitest"
 import { ContributionTrackingService } from "../ContributionTrackingService"
 import type { TrackContributionParams } from "../contribution-tracking-types"
 
-const { mockGetAiCodeStatsInstance, mockRecordAgentSuggestion } = vi.hoisted(() => ({
+const { mockGetAiCodeStatsInstance, mockRecordRejectedAgentSuggestion } = vi.hoisted(() => ({
 	mockGetAiCodeStatsInstance: vi.fn(),
-	mockRecordAgentSuggestion: vi.fn(),
+	mockRecordRejectedAgentSuggestion: vi.fn(),
 }))
 
 // Mock dependencies
@@ -37,7 +37,7 @@ describe("ContributionTrackingService", () => {
 		// Clear all mocks
 		vi.clearAllMocks()
 		mockGetAiCodeStatsInstance.mockReturnValue({
-			recordAgentSuggestion: mockRecordAgentSuggestion,
+			recordRejectedAgentSuggestion: mockRecordRejectedAgentSuggestion,
 		})
 	})
 
@@ -234,22 +234,30 @@ describe("ContributionTrackingService", () => {
 	})
 
 	describe("trackContribution", () => {
-		it("should record suggested lines locally even when remote tracking is skipped", async () => {
+		it("should record rejected suggestions locally even when remote tracking is skipped", async () => {
+			const { fetchWithRetries } = await import("../../../shared/http")
+			const mockFetchWithRetries = vi.mocked(fetchWithRetries)
+
 			const params: TrackContributionParams = {
 				cwd: "/test/repo",
 				filePath: "test.ts",
 				originalContent: "const x = 1",
 				newContent: "const x = 1\nconst y = 2",
 				status: "rejected",
+				taskId: "task-rejected",
 				kilocodeToken: "token",
 			}
 
 			await service.trackContribution(params)
 
-			expect(mockRecordAgentSuggestion).toHaveBeenCalledWith({
+			expect(mockRecordRejectedAgentSuggestion).toHaveBeenCalledWith({
+				cwd: "/test/repo",
+				filePath: "test.ts",
 				originalContent: "const x = 1",
 				newContent: "const x = 1\nconst y = 2",
+				taskId: "task-rejected",
 			})
+			expect(mockFetchWithRetries).not.toHaveBeenCalled()
 		})
 
 		it("should skip tracking when no organization ID", async () => {

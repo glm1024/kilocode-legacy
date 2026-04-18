@@ -1,44 +1,9 @@
-export type AiCodeSourceType = "autocomplete" | "agent_insert"
+export type AiCodeSourceType = "agent_insert"
 export type AiCodeIde = "vscode" | "jetbrains"
-export type AiCodeUploadMode = "incremental" | "backfill"
-export type AiCodeStatsRangeType = "current" | "last7days" | "last30days" | "custom" | "all"
-export type AiCodeMetricType = "generated" | "accepted" | "committed"
-export type AiCodeCommitMatchStrategy = "exact" | "partial"
+export type AiCodeMetricType = "generated" | "accepted"
+export type AiCodeUploadMode = "incremental"
 export type AiCodeGeneratedBlockUploadStatus = "pending" | "queued" | "uploaded"
 export type AiCodeStatsSemanticsVersion = 1
-export type AiCodeCommitMatchDetailScoreSource = "attribution" | "inferred"
-export type AiCodeCommitMatchOverlapKind = "identifier" | "term"
-export type AiCodeCommitMatchAdjustment = "inline_comment_bonus"
-
-export interface AiCodeCommitLineMatchDetail {
-	committedLineNumber: number
-	generatedLineNumber: number
-	scoreSource: "attribution"
-	finalScore: number
-	baseScore: number
-	editSimilarity: number
-	tokenSimilarity: number
-	overlapSimilarity: number
-	overlapKind: AiCodeCommitMatchOverlapKind
-	adjustments: AiCodeCommitMatchAdjustment[]
-}
-
-export interface AiCodeCommitMatchDetail {
-	scoreSource: AiCodeCommitMatchDetailScoreSource
-	finalScore: number
-	baseScore?: number
-	editSimilarity?: number
-	tokenSimilarity?: number
-	overlapSimilarity?: number
-	adjustments?: AiCodeCommitMatchAdjustment[]
-	lineDetails: AiCodeCommitLineMatchDetail[]
-}
-
-export interface AiCodeStatsRange {
-	type: AiCodeStatsRangeType
-	startDate?: string
-	endDate?: string
-}
 
 export interface AiCodeStatsEvent {
 	eventId: string
@@ -47,7 +12,6 @@ export interface AiCodeStatsEvent {
 	sourceType: AiCodeSourceType
 	ide: AiCodeIde
 	metricType: AiCodeMetricType
-	// kilocode_change start
 	userName?: string
 	userEmail?: string
 	organizationId?: string
@@ -61,7 +25,6 @@ export interface AiCodeStatsEvent {
 	language?: string
 	gitRemoteUrl?: string
 	gitBranch?: string
-	// kilocode_change end
 	lineStart: number
 	lineEnd: number
 	lineCount: number
@@ -70,11 +33,7 @@ export interface AiCodeStatsEvent {
 	taskId?: string
 	commitHash?: string
 	commitOccurredAt?: number
-	matchStrategy?: AiCodeCommitMatchStrategy
-	matchConfidence?: number
-	equivalentLineCount?: number
 	generatedBlockId?: string
-	matchDetail?: AiCodeCommitMatchDetail
 }
 
 export interface AiCodeGeneratedBlock {
@@ -126,11 +85,12 @@ export interface AiCodeGeneratedBlockState extends AiCodeGeneratedBlock {
 	queuedReportId?: string
 }
 
-export interface AiCodeCommittedBlock {
-	eventId: string
+export interface AiCodeCommitCandidateLine {
+	clientLineId: string
 	generatedBlockId: string
-	timestamp: number
-	semanticsVersion?: AiCodeStatsSemanticsVersion
+	baselineEventId: string
+	baselineMetricType: "generated" | "accepted"
+	sourceTimestamp: number
 	sourceType: AiCodeSourceType
 	ide: AiCodeIde
 	userName?: string
@@ -143,21 +103,25 @@ export interface AiCodeCommittedBlock {
 	projectKey?: string
 	filePath: string
 	relativePath: string
+	repoRoot: string
+	repoRelativePath: string
 	language?: string
 	gitRemoteUrl?: string
 	gitBranch?: string
-	lineStart: number
-	lineEnd: number
-	lineCount: number
-	codeSnippet: string
-	fileSnapshotContent?: string
 	taskId?: string
-	commitHash: string
-	commitOccurredAt: number
-	matchStrategy?: AiCodeCommitMatchStrategy
-	matchConfidence?: number
-	equivalentLineCount?: number
-	matchDetail?: AiCodeCommitMatchDetail
+	lineNumber: number
+	rawLine: string
+	blockLineIndex: number
+	blockLineCount: number
+	lineHash: string
+	occurrenceIndex: number
+}
+
+export interface AiCodeCommitAddedLine {
+	addedIndex: number
+	lineNumber: number
+	content: string
+	lineHash: string
 }
 
 export interface AiCodeCommitChangedBlock {
@@ -175,6 +139,7 @@ export interface AiCodeCommitChangedFile {
 	language?: string
 	committedSnapshotContent?: string
 	changedBlocks: AiCodeCommitChangedBlock[]
+	addedLines?: AiCodeCommitAddedLine[]
 }
 
 export interface AiCodeCommitReport {
@@ -182,6 +147,7 @@ export interface AiCodeCommitReport {
 	source: "kilocode-ai-code-stats"
 	mode: "commit_report"
 	semanticsVersion?: AiCodeStatsSemanticsVersion
+	attributionInputVersion?: 1
 	reportId: string
 	reportGeneratedAt: number
 	client: AiCodeStatsUploadClient
@@ -196,48 +162,17 @@ export interface AiCodeCommitReport {
 	commitOccurredAt: number
 	acceptedBlocks?: AiCodeGeneratedBlock[]
 	generatedBlocks?: AiCodeGeneratedBlock[]
-	committedBlocks: AiCodeCommittedBlock[]
 	changedFiles: AiCodeCommitChangedFile[]
+	candidateLines?: AiCodeCommitCandidateLine[]
 }
 
 export interface AiCodeQueuedCommitReport {
 	report: AiCodeCommitReport
 	createdAt: number
 	generatedBlockIds: string[]
-	matchedPendingLineIds: string[]
 }
 
 export type AiCodePendingCommitMetricBlock = AiCodeGeneratedBlock
-
-export interface AiCodeStatsDailyAggregate {
-	suggestedLines: number
-	generatedLines: number
-	acceptedLines: number
-	committedLines: number
-	equivalentCommittedLines: number
-	eventCount: number
-}
-
-export interface AiCodeStatsSummaryPeriod {
-	suggestedLines: number
-	generatedLines: number
-	acceptedLines: number
-	committedLines: number
-	adoptionRate: number
-	retentionRate: number
-	strictCommittedLines: number
-	equivalentCommittedLines: number
-	strictAdoptionRate: number
-	equivalentAdoptionRate: number
-}
-
-export interface AiCodeStatsRangeSummary {
-	generatedLines: number
-	acceptedLines: number
-	committedLines: number
-	adoptionRate: number
-	retentionRate: number
-}
 
 export interface AiCodeStatsLastUpload {
 	status: "idle" | "success" | "failed"
@@ -245,19 +180,11 @@ export interface AiCodeStatsLastUpload {
 	message?: string
 	uploadedEvents?: number
 	mode?: AiCodeUploadMode
-	trigger?: "daily" | "threshold" | "commit" | "manual"
-}
-
-export interface AiCodeStatsSummary {
-	today: AiCodeStatsSummaryPeriod
-	total: AiCodeStatsSummaryPeriod
-	pendingEvents: number
-	lastUpload: AiCodeStatsLastUpload
+	trigger?: "commit"
 }
 
 export interface AiCodeStatsPersistedState {
 	version: 1
-	dailyAggregates: Record<string, AiCodeStatsDailyAggregate>
 	pendingEventIds: string[]
 	supersededEventIds: string[]
 	repoObservedCommits: Record<string, string>
@@ -270,13 +197,6 @@ export interface AiCodeStatsUploadSettings {
 	// kilocode_change start
 	userName?: string
 	// kilocode_change end
-}
-
-export interface AiCodeCommitAttributionConfig {
-	candidateMinLineScore: number
-	contextualMinLineScore: number
-	isolatedMinLineScore: number
-	ambiguityGap: number
 }
 
 export interface AiCodeStatsUploadClient {
@@ -358,16 +278,6 @@ export interface AiCodePendingLineAttribution {
 	blockLineCount: number
 	lineHash: string
 	occurrenceIndex: number
-	normalizedLine: string
-	normalizedTokenLine: string
-	rareIdentifiers: string[]
-}
-
-export const DEFAULT_AI_CODE_COMMIT_ATTRIBUTION_CONFIG: AiCodeCommitAttributionConfig = {
-	candidateMinLineScore: 0.6,
-	contextualMinLineScore: 0.65,
-	isolatedMinLineScore: 0.7,
-	ambiguityGap: 0.02,
 }
 
 export const AI_CODE_STATS_VERSION = 1 as const
@@ -381,36 +291,5 @@ export const toLocalDateKey = (timestamp: number): string => {
 	const day = String(d.getDate()).padStart(2, "0")
 	return `${y}-${m}-${day}`
 }
-
-export const emptyAggregate = (): AiCodeStatsDailyAggregate => ({
-	suggestedLines: 0,
-	generatedLines: 0,
-	acceptedLines: 0,
-	committedLines: 0,
-	equivalentCommittedLines: 0,
-	eventCount: 0,
-})
-
-export const emptySummary = (): AiCodeStatsSummary => ({
-	today: emptySummaryPeriod(),
-	total: emptySummaryPeriod(),
-	pendingEvents: 0,
-	lastUpload: {
-		status: "idle",
-	},
-})
-
-export const emptySummaryPeriod = (): AiCodeStatsSummaryPeriod => ({
-	suggestedLines: 0,
-	generatedLines: 0,
-	acceptedLines: 0,
-	committedLines: 0,
-	adoptionRate: 0,
-	retentionRate: 0,
-	strictCommittedLines: 0,
-	equivalentCommittedLines: 0,
-	strictAdoptionRate: 0,
-	equivalentAdoptionRate: 0,
-})
 
 export const normalizePath = (value: string): string => value.replace(/\\/g, "/")

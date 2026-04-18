@@ -1,8 +1,14 @@
 import { normalizePath as normalizeFsPath } from "../ai-code-stats/types"
-import type { AiCodeStatsRange } from "../ai-code-stats/types"
 
 export type AiTokenUsageIde = "vscode" | "jetbrains"
 export type AiTokenUsageUploadMode = "incremental"
+
+export type AiTokenUsageRange =
+	| { type: "current" }
+	| { type: "last7days" }
+	| { type: "last30days" }
+	| { type: "all" }
+	| { type: "custom"; startDate?: string; endDate?: string }
 
 export interface AiTokenUsageUploadSettings {
 	webhookUrl?: string
@@ -123,5 +129,3 @@ export const buildAggregateKey = (
 	provider: string,
 	model: string,
 ): string => [dateKey, userKey, projectKey, ide, provider, model].join("::")
-
-export type { AiCodeStatsRange }

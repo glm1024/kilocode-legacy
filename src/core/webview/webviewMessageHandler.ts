@@ -110,12 +110,10 @@ import { getSapAiCoreDeployments } from "../../api/providers/fetchers/sap-ai-cor
 import { AutoPurgeScheduler } from "../../services/auto-purge" // kilocode_change
 import { fetchWithRetries, RequestTimedOutError } from "../../shared/http" // kilocode_change
 // kilocode_change start
-import { AiCodeStatsService, type AiCodeStatsRange, type AiCodeStatsRangeType } from "../../services/ai-code-stats"
 import {
 	InvalidAiCodeStatsWebhookUrlError,
 	resolveAiCodeStatsWebhookUrl,
 } from "../../services/ai-code-stats/AiCodeStatsWebhookUrl"
-import { AiTokenUsageService } from "../../services/ai-token-usage"
 import {
 	InvalidAiTokenUsageWebhookUrlError,
 	resolveAiTokenUsageWebhookUrl,
@@ -139,27 +137,6 @@ export const webviewMessageHandler = async (
 	const getCurrentCwd = () => {
 		return provider.getCurrentTask()?.cwd || provider.cwd
 	}
-
-	// kilocode_change start
-	const parseAiCodeStatsRange = (input: unknown): AiCodeStatsRange => {
-		const validTypes: AiCodeStatsRangeType[] = ["current", "last7days", "last30days", "custom", "all"]
-		const fallback: AiCodeStatsRange = { type: "current" }
-		if (!input || typeof input !== "object") {
-			return fallback
-		}
-
-		const raw = input as Record<string, unknown>
-		const type =
-			typeof raw.type === "string" && validTypes.includes(raw.type as AiCodeStatsRangeType)
-				? (raw.type as AiCodeStatsRangeType)
-				: "current"
-
-		const startDate = typeof raw.startDate === "string" ? raw.startDate : undefined
-		const endDate = typeof raw.endDate === "string" ? raw.endDate : undefined
-
-		return { type, startDate, endDate }
-	}
-	// kilocode_change end
 
 	/**
 	 * Resolves image file mentions in incoming messages.
@@ -3990,123 +3967,6 @@ export const webviewMessageHandler = async (
 			}
 			break
 		}
-		// kilocode_change start
-		case "getAiCodeStatsSummary": {
-			try {
-				const aiCodeStatsService = AiCodeStatsService.getInstance()
-				const aiTokenUsageService = AiTokenUsageService.getInstance()
-				const range = parseAiCodeStatsRange((message.values as Record<string, unknown> | undefined)?.range)
-				const summary = aiCodeStatsService
-					? await aiCodeStatsService.getSummary()
-					: {
-							today: {
-								suggestedLines: 0,
-								generatedLines: 0,
-								acceptedLines: 0,
-								committedLines: 0,
-								adoptionRate: 0,
-								retentionRate: 0,
-								strictCommittedLines: 0,
-								equivalentCommittedLines: 0,
-								strictAdoptionRate: 0,
-								equivalentAdoptionRate: 0,
-							},
-							total: {
-								suggestedLines: 0,
-								generatedLines: 0,
-								acceptedLines: 0,
-								committedLines: 0,
-								adoptionRate: 0,
-								retentionRate: 0,
-								strictCommittedLines: 0,
-								equivalentCommittedLines: 0,
-								strictAdoptionRate: 0,
-								equivalentAdoptionRate: 0,
-							},
-							pendingEvents: 0,
-							lastUpload: { status: "idle" as const },
-						}
-				const suggestedLines = aiCodeStatsService ? await aiCodeStatsService.getSuggestedLines(range) : 0
-				const rangeSummary = aiCodeStatsService
-					? await aiCodeStatsService.getRangeSummary(range)
-					: {
-							generatedLines: 0,
-							acceptedLines: 0,
-							committedLines: 0,
-							adoptionRate: 0,
-							retentionRate: 0,
-						}
-				const tokenSummary = aiTokenUsageService
-					? await aiTokenUsageService.getSummary(range)
-					: {
-							inputTokens: 0,
-							outputTokens: 0,
-							totalTokens: 0,
-						}
-
-				await provider.postMessageToWebview({
-					type: "aiCodeStatsSummaryResponse",
-					values: {
-						...summary,
-						range,
-						suggestedLines,
-						...rangeSummary,
-						inputTokens: tokenSummary.inputTokens,
-						outputTokens: tokenSummary.outputTokens,
-						totalTokens: tokenSummary.totalTokens,
-					},
-				})
-			} catch (error) {
-				const errorMessage = error instanceof Error ? error.message : String(error)
-				provider.log(`Error getting AI code stats summary: ${errorMessage}`)
-				await provider.postMessageToWebview({
-					type: "aiCodeStatsSummaryResponse",
-					values: {
-						today: {
-							suggestedLines: 0,
-							generatedLines: 0,
-							acceptedLines: 0,
-							committedLines: 0,
-							adoptionRate: 0,
-							retentionRate: 0,
-							strictCommittedLines: 0,
-							equivalentCommittedLines: 0,
-							strictAdoptionRate: 0,
-							equivalentAdoptionRate: 0,
-						},
-						total: {
-							suggestedLines: 0,
-							generatedLines: 0,
-							acceptedLines: 0,
-							committedLines: 0,
-							adoptionRate: 0,
-							retentionRate: 0,
-							strictCommittedLines: 0,
-							equivalentCommittedLines: 0,
-							strictAdoptionRate: 0,
-							equivalentAdoptionRate: 0,
-						},
-						pendingEvents: 0,
-						suggestedLines: 0,
-						generatedLines: 0,
-						acceptedLines: 0,
-						committedLines: 0,
-						adoptionRate: 0,
-						retentionRate: 0,
-						inputTokens: 0,
-						outputTokens: 0,
-						totalTokens: 0,
-						range: { type: "current" as const },
-						lastUpload: {
-							status: "failed",
-							message: errorMessage,
-						},
-					},
-				})
-			}
-			break
-		}
-		// kilocode_change end
 		// kilocode_change end - add getUsageData
 		// kilocode_change start - add toggleTaskFavorite
 		case "toggleTaskFavorite":

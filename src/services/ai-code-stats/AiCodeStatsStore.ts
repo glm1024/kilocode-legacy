@@ -2,32 +2,21 @@ import * as fs from "fs/promises"
 import * as path from "path"
 
 import { safeWriteJson } from "../../utils/safeWriteJson"
-import { extractLineFeatures, roundToFour } from "./AiCodeLineFeatures"
 import { hashLineFingerprint } from "./AiCodeLineFingerprint"
+import { AiCodeUploadEventQueue } from "./AiCodeUploadEventQueue"
 import {
 	AI_CODE_STATS_VERSION,
 	CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
-	emptyAggregate,
-	emptySummary,
 	normalizePath,
 	toLocalDateKey,
-	type AiCodeCommitLineMatchDetail,
-	type AiCodeCommitMatchAdjustment,
-	type AiCodeCommitMatchDetail,
-	type AiCodeCommittedBlock,
 	type AiCodeGeneratedBlock,
 	type AiCodePendingCommitMetricBlock,
 	type AiCodeGeneratedBlockState,
-	type AiCodeMetricType,
 	type AiCodePendingLineAttribution,
 	type AiCodeQueuedCommitReport,
-	type AiCodeStatsDailyAggregate,
 	type AiCodeStatsEvent,
 	type AiCodeStatsLastUpload,
 	type AiCodeStatsPersistedState,
-	type AiCodeStatsRange,
-	type AiCodeStatsRangeSummary,
-	type AiCodeStatsSummary,
 } from "./types"
 
 const STATE_FILE = "state.json"
@@ -35,11 +24,9 @@ const PENDING_LINES_FILE = "pending-lines.json"
 const GENERATED_BLOCKS_FILE = "generated-blocks.json"
 const QUEUED_REPORTS_FILE = "queued-reports.json"
 const PENDING_COMMIT_METRIC_BLOCKS_FILE = "pending-commit-metric-blocks.json"
-const DATE_KEY_REGEX = /^\d{4}-\d{2}-\d{2}$/
 
 const createEmptyState = (): AiCodeStatsPersistedState => ({
 	version: AI_CODE_STATS_VERSION,
-	dailyAggregates: {},
 	pendingEventIds: [],
 	supersededEventIds: [],
 	repoObservedCommits: {},
@@ -49,198 +36,9 @@ const createEmptyState = (): AiCodeStatsPersistedState => ({
 const isCurrentSemanticsVersion = (semanticsVersion?: number): boolean =>
 	semanticsVersion === CURRENT_AI_CODE_STATS_SEMANTICS_VERSION
 
-const buildGeneratedMetricEvent = (block: AiCodeGeneratedBlock): AiCodeStatsEvent => ({
-	eventId: block.eventId,
-	generatedBlockId: block.generatedBlockId,
-	timestamp: block.timestamp,
-	semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
-	sourceType: block.sourceType,
-	ide: block.ide,
-	metricType: "generated",
-	userName: block.userName,
-	userEmail: block.userEmail,
-	organizationId: block.organizationId,
-	organizationName: block.organizationName,
-	sourceIp: block.sourceIp,
-	workspaceName: block.workspaceName,
-	workspacePath: block.workspacePath,
-	projectKey: block.projectKey,
-	filePath: block.filePath,
-	relativePath: block.relativePath,
-	language: block.language,
-	gitRemoteUrl: block.gitRemoteUrl,
-	gitBranch: block.gitBranch,
-	lineStart: block.lineStart,
-	lineEnd: block.lineEnd,
-	lineCount: block.lineCount,
-	codeSnippet: block.codeSnippet,
-	fileSnapshotContent: block.fileSnapshotContent,
-	taskId: block.taskId,
-	equivalentLineCount: block.lineCount,
-})
-
-const buildAcceptedMetricEvent = (block: AiCodeGeneratedBlock): AiCodeStatsEvent => ({
-	eventId: block.eventId,
-	generatedBlockId: block.generatedBlockId,
-	timestamp: block.timestamp,
-	semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
-	sourceType: block.sourceType,
-	ide: block.ide,
-	metricType: "accepted",
-	userName: block.userName,
-	userEmail: block.userEmail,
-	organizationId: block.organizationId,
-	organizationName: block.organizationName,
-	sourceIp: block.sourceIp,
-	workspaceName: block.workspaceName,
-	workspacePath: block.workspacePath,
-	projectKey: block.projectKey,
-	filePath: block.filePath,
-	relativePath: block.relativePath,
-	language: block.language,
-	gitRemoteUrl: block.gitRemoteUrl,
-	gitBranch: block.gitBranch,
-	lineStart: block.lineStart,
-	lineEnd: block.lineEnd,
-	lineCount: block.lineCount,
-	codeSnippet: block.codeSnippet,
-	fileSnapshotContent: block.fileSnapshotContent,
-	taskId: block.taskId,
-	equivalentLineCount: block.lineCount,
-})
-
-const buildCommittedMetricEvent = (block: AiCodeCommittedBlock): AiCodeStatsEvent => ({
-	eventId: block.eventId,
-	generatedBlockId: block.generatedBlockId,
-	timestamp: block.timestamp,
-	semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
-	sourceType: block.sourceType,
-	ide: block.ide,
-	metricType: "committed",
-	userName: block.userName,
-	userEmail: block.userEmail,
-	organizationId: block.organizationId,
-	organizationName: block.organizationName,
-	sourceIp: block.sourceIp,
-	workspaceName: block.workspaceName,
-	workspacePath: block.workspacePath,
-	projectKey: block.projectKey,
-	filePath: block.filePath,
-	relativePath: block.relativePath,
-	language: block.language,
-	gitRemoteUrl: block.gitRemoteUrl,
-	gitBranch: block.gitBranch,
-	lineStart: block.lineStart,
-	lineEnd: block.lineEnd,
-	lineCount: block.lineCount,
-	codeSnippet: block.codeSnippet,
-	fileSnapshotContent: block.fileSnapshotContent,
-	taskId: block.taskId,
-	commitHash: block.commitHash,
-	commitOccurredAt: block.commitOccurredAt,
-	matchStrategy: block.matchStrategy,
-	matchConfidence: block.matchConfidence,
-	equivalentLineCount: block.equivalentLineCount,
-	matchDetail: block.matchDetail,
-})
-
-const normalizeAdjustmentArray = (value: unknown): AiCodeCommitMatchAdjustment[] => {
-	if (!Array.isArray(value)) {
-		return []
-	}
-	return value.filter((item): item is AiCodeCommitMatchAdjustment => item === "inline_comment_bonus")
-}
-
-const normalizeLineMatchDetail = (value: unknown): AiCodeCommitLineMatchDetail | undefined => {
-	if (!value || typeof value !== "object") {
-		return undefined
-	}
-	const record = value as Record<string, unknown>
-	if (record.scoreSource !== "attribution") {
-		return undefined
-	}
-	if (
-		typeof record.committedLineNumber !== "number" ||
-		typeof record.generatedLineNumber !== "number" ||
-		typeof record.finalScore !== "number" ||
-		typeof record.baseScore !== "number" ||
-		typeof record.editSimilarity !== "number" ||
-		typeof record.tokenSimilarity !== "number" ||
-		typeof record.overlapSimilarity !== "number" ||
-		(record.overlapKind !== "identifier" && record.overlapKind !== "term")
-	) {
-		return undefined
-	}
-	return {
-		committedLineNumber: record.committedLineNumber,
-		generatedLineNumber: record.generatedLineNumber,
-		scoreSource: "attribution",
-		finalScore: roundToFour(record.finalScore),
-		baseScore: roundToFour(record.baseScore),
-		editSimilarity: roundToFour(record.editSimilarity),
-		tokenSimilarity: roundToFour(record.tokenSimilarity),
-		overlapSimilarity: roundToFour(record.overlapSimilarity),
-		overlapKind: record.overlapKind,
-		adjustments: normalizeAdjustmentArray(record.adjustments),
-	}
-}
-
-const normalizeMatchDetail = (value: unknown): AiCodeCommitMatchDetail | undefined => {
-	if (!value || typeof value !== "object") {
-		return undefined
-	}
-	const record = value as Record<string, unknown>
-	if (record.scoreSource !== "attribution" && record.scoreSource !== "inferred") {
-		return undefined
-	}
-	if (typeof record.finalScore !== "number") {
-		return undefined
-	}
-	const lineDetails = Array.isArray(record.lineDetails)
-		? record.lineDetails
-				.map((detail) => normalizeLineMatchDetail(detail))
-				.filter((detail): detail is AiCodeCommitLineMatchDetail => !!detail)
-		: []
-	return {
-		scoreSource: record.scoreSource,
-		finalScore: roundToFour(record.finalScore),
-		baseScore: typeof record.baseScore === "number" ? roundToFour(record.baseScore) : undefined,
-		editSimilarity: typeof record.editSimilarity === "number" ? roundToFour(record.editSimilarity) : undefined,
-		tokenSimilarity: typeof record.tokenSimilarity === "number" ? roundToFour(record.tokenSimilarity) : undefined,
-		overlapSimilarity:
-			typeof record.overlapSimilarity === "number" ? roundToFour(record.overlapSimilarity) : undefined,
-		adjustments: normalizeAdjustmentArray(record.adjustments),
-		lineDetails,
-	}
-}
-
-const buildGeneratedMetricEventForCommitReport = (
-	block: AiCodeGeneratedBlock,
-	commitOccurredAt: number,
-): AiCodeStatsEvent => ({
-	...buildGeneratedMetricEvent({
-		...block,
-		timestamp: commitOccurredAt,
-	}),
-	timestamp: commitOccurredAt,
-	commitOccurredAt,
-})
-
-const buildAcceptedMetricEventForCommitReport = (
-	block: AiCodeGeneratedBlock,
-	commitOccurredAt: number,
-): AiCodeStatsEvent => ({
-	...buildAcceptedMetricEvent({
-		...block,
-		timestamp: commitOccurredAt,
-	}),
-	timestamp: commitOccurredAt,
-	commitOccurredAt,
-})
-
 export class AiCodeStatsStore {
 	private readonly baseDir: string
-	private readonly eventsDir: string
+	private readonly uploadEventQueue: AiCodeUploadEventQueue
 	private readonly statePath: string
 	private readonly pendingLinesPath: string
 	private readonly generatedBlocksPath: string
@@ -256,7 +54,7 @@ export class AiCodeStatsStore {
 
 	constructor(globalStoragePath: string) {
 		this.baseDir = path.join(globalStoragePath, "ai-code-stats", "v1")
-		this.eventsDir = path.join(this.baseDir, "events")
+		this.uploadEventQueue = new AiCodeUploadEventQueue(this.baseDir)
 		this.statePath = path.join(this.baseDir, STATE_FILE)
 		this.pendingLinesPath = path.join(this.baseDir, PENDING_LINES_FILE)
 		this.generatedBlocksPath = path.join(this.baseDir, GENERATED_BLOCKS_FILE)
@@ -267,17 +65,7 @@ export class AiCodeStatsStore {
 	async appendEvent(event: AiCodeStatsEvent): Promise<void> {
 		await this.enqueue(async () => {
 			await this.ensureLoaded()
-			await this.appendHistoryEventsInternal([event], true)
-		})
-	}
-
-	async appendHistoryEvents(events: AiCodeStatsEvent[]): Promise<void> {
-		if (events.length === 0) {
-			return
-		}
-		await this.enqueue(async () => {
-			await this.ensureLoaded()
-			await this.appendHistoryEventsInternal(events, false)
+			await this.appendUploadEventsToQueue([event], true)
 		})
 	}
 
@@ -288,21 +76,6 @@ export class AiCodeStatsStore {
 			if (this.queuedReports.some((item) => item.report.reportId === normalizedReport.report.reportId)) {
 				return
 			}
-
-			await this.supersedePendingMetricEvents(normalizedReport.generatedBlockIds)
-
-			await this.appendHistoryEventsInternal(
-				[
-					...(normalizedReport.report.generatedBlocks ?? []).map((block) =>
-						buildGeneratedMetricEventForCommitReport(block, normalizedReport.report.commitOccurredAt),
-					),
-					...(normalizedReport.report.acceptedBlocks ?? []).map((block) =>
-						buildAcceptedMetricEventForCommitReport(block, normalizedReport.report.commitOccurredAt),
-					),
-					...normalizedReport.report.committedBlocks.map((block) => buildCommittedMetricEvent(block)),
-				],
-				false,
-			)
 
 			const queuedGeneratedIds = new Set(normalizedReport.generatedBlockIds)
 			this.generatedBlocks = this.generatedBlocks.map((block) => {
@@ -361,10 +134,6 @@ export class AiCodeStatsStore {
 					queuedReportId: undefined,
 				}
 			})
-			if (target.matchedPendingLineIds.length > 0) {
-				const matchedPendingLineIds = new Set(target.matchedPendingLineIds)
-				this.pendingLines = this.pendingLines.filter((line) => !matchedPendingLineIds.has(line.id))
-			}
 			if (this.pruneRepoObservedCommits(this.state!)) {
 				await this.persistState()
 			}
@@ -471,97 +240,6 @@ export class AiCodeStatsStore {
 		})
 	}
 
-	async getSummary(nowTs: number = Date.now()): Promise<AiCodeStatsSummary> {
-		await this.ensureLoaded()
-		const state = this.state!
-		const todayKey = toLocalDateKey(nowTs)
-		const todayAggregate = state.dailyAggregates[todayKey] ?? emptyAggregate()
-
-		let totalSuggestedLines = 0
-		let totalGeneratedLines = 0
-		let totalAcceptedLines = 0
-		let totalStrictCommittedLines = 0
-		let totalEquivalentCommittedLines = 0
-		for (const aggregate of Object.values(state.dailyAggregates)) {
-			totalSuggestedLines += aggregate.suggestedLines
-			totalGeneratedLines += aggregate.generatedLines
-			totalAcceptedLines += aggregate.acceptedLines
-			totalStrictCommittedLines += aggregate.committedLines
-			totalEquivalentCommittedLines += aggregate.equivalentCommittedLines
-		}
-
-		const pendingEvents = await this.getPendingEventCount()
-		const todayStrictAdoptionRate =
-			todayAggregate.generatedLines > 0 ? todayAggregate.acceptedLines / todayAggregate.generatedLines : 0
-		const todayEquivalentAdoptionRate =
-			todayAggregate.generatedLines > 0
-				? todayAggregate.equivalentCommittedLines / todayAggregate.generatedLines
-				: 0
-		const totalStrictAdoptionRate = totalGeneratedLines > 0 ? totalAcceptedLines / totalGeneratedLines : 0
-		const totalEquivalentAdoptionRate =
-			totalGeneratedLines > 0 ? totalEquivalentCommittedLines / totalGeneratedLines : 0
-
-		return {
-			today: {
-				suggestedLines: todayAggregate.suggestedLines,
-				generatedLines: todayAggregate.generatedLines,
-				acceptedLines: todayAggregate.acceptedLines,
-				committedLines: todayAggregate.committedLines,
-				adoptionRate: todayStrictAdoptionRate,
-				retentionRate:
-					todayAggregate.acceptedLines > 0 ? todayAggregate.committedLines / todayAggregate.acceptedLines : 0,
-				strictCommittedLines: todayAggregate.committedLines,
-				equivalentCommittedLines: roundToFour(todayAggregate.equivalentCommittedLines),
-				strictAdoptionRate: todayStrictAdoptionRate,
-				equivalentAdoptionRate: todayEquivalentAdoptionRate,
-			},
-			total: {
-				suggestedLines: totalSuggestedLines,
-				generatedLines: totalGeneratedLines,
-				acceptedLines: totalAcceptedLines,
-				committedLines: totalStrictCommittedLines,
-				adoptionRate: totalStrictAdoptionRate,
-				retentionRate: totalAcceptedLines > 0 ? totalStrictCommittedLines / totalAcceptedLines : 0,
-				strictCommittedLines: totalStrictCommittedLines,
-				equivalentCommittedLines: roundToFour(totalEquivalentCommittedLines),
-				strictAdoptionRate: totalStrictAdoptionRate,
-				equivalentAdoptionRate: totalEquivalentAdoptionRate,
-			},
-			pendingEvents,
-			lastUpload: state.lastUpload,
-		}
-	}
-
-	async getGeneratedLinesForRange(range: AiCodeStatsRange, nowTs: number = Date.now()): Promise<number> {
-		return this.getMetricLinesForRange(range, "generated", nowTs)
-	}
-
-	async getSuggestedLinesForRange(range: AiCodeStatsRange, nowTs: number = Date.now()): Promise<number> {
-		return this.getAggregateLinesForRange(range, (aggregate) => aggregate.suggestedLines, nowTs)
-	}
-
-	async getCommittedLinesForRange(range: AiCodeStatsRange, nowTs: number = Date.now()): Promise<number> {
-		return this.getMetricLinesForRange(range, "committed", nowTs)
-	}
-
-	async getAcceptedLinesForRange(range: AiCodeStatsRange, nowTs: number = Date.now()): Promise<number> {
-		return this.getMetricLinesForRange(range, "accepted", nowTs)
-	}
-
-	async getRangeSummary(range: AiCodeStatsRange, nowTs: number = Date.now()): Promise<AiCodeStatsRangeSummary> {
-		const generatedLines = await this.getGeneratedLinesForRange(range, nowTs)
-		const acceptedLines = await this.getAcceptedLinesForRange(range, nowTs)
-		const committedLines = await this.getCommittedLinesForRange(range, nowTs)
-
-		return {
-			generatedLines,
-			acceptedLines,
-			committedLines,
-			adoptionRate: generatedLines > 0 ? acceptedLines / generatedLines : 0,
-			retentionRate: acceptedLines > 0 ? committedLines / acceptedLines : 0,
-		}
-	}
-
 	async getPendingEventCount(): Promise<number> {
 		await this.ensureLoaded()
 		const pendingStandaloneEvents = (await this.getPendingEvents()).length
@@ -569,105 +247,16 @@ export class AiCodeStatsStore {
 		const pendingGeneratedBlocks = this.generatedBlocks.filter(
 			(block) => block.uploadStatus === "pending" || block.uploadStatus === "queued",
 		).length
-		const queuedCommittedBlocks = this.queuedReports.reduce(
-			(total, report) => total + report.report.committedBlocks.length,
-			0,
-		)
-		return pendingStandaloneEvents + pendingCommitMetricEvents + pendingGeneratedBlocks + queuedCommittedBlocks
+		return pendingStandaloneEvents + pendingCommitMetricEvents + pendingGeneratedBlocks
 	}
 
 	async getPendingEvents(maxEvents?: number): Promise<AiCodeStatsEvent[]> {
 		await this.ensureLoaded()
-		const pendingIds = new Set(this.state!.pendingEventIds)
-		if (pendingIds.size === 0) {
-			return []
-		}
-
-		const eventFiles = await this.getEventFilesSorted()
-		const events: AiCodeStatsEvent[] = []
-		for (const filePath of eventFiles) {
-			const fileEvents = await this.readEventFile(filePath)
-			for (const event of fileEvents) {
-				if (!pendingIds.has(event.eventId)) {
-					continue
-				}
-				if (!this.isUploadableEvent(event)) {
-					continue
-				}
-				events.push(event)
-				if (maxEvents && events.length >= maxEvents) {
-					return events
-				}
-			}
-		}
-
-		return events
-	}
-
-	async getRecentEvents(days: number, maxEvents?: number, nowTs: number = Date.now()): Promise<AiCodeStatsEvent[]> {
-		await this.ensureLoaded()
-		if (days <= 0) {
-			return []
-		}
-
-		const now = new Date(nowTs)
-		const cutoff = new Date(now)
-		cutoff.setHours(0, 0, 0, 0)
-		cutoff.setDate(cutoff.getDate() - (days - 1))
-		const cutoffKey = toLocalDateKey(cutoff.getTime())
-
-		const eventFiles = await this.getEventFilesSorted()
-		const events: AiCodeStatsEvent[] = []
-
-		for (const filePath of eventFiles) {
-			const base = path.basename(filePath)
-			const dateKey = base.replace(/\.ndjson$/, "")
-			if (dateKey < cutoffKey) {
-				continue
-			}
-
-			const fileEvents = await this.readEventFile(filePath)
-			events.push(...fileEvents)
-			if (maxEvents && events.length >= maxEvents) {
-				return events.slice(0, maxEvents)
-			}
-		}
-
-		return events
-	}
-
-	async getEventsForRange(
-		range: AiCodeStatsRange,
-		maxEvents?: number,
-		nowTs: number = Date.now(),
-	): Promise<AiCodeStatsEvent[]> {
-		await this.ensureLoaded()
-		const bounds = this.resolveRangeBounds(range, nowTs)
-		if (bounds === null) {
-			return []
-		}
-
-		const eventFiles = await this.getEventFilesSorted()
-		const events: AiCodeStatsEvent[] = []
-		for (const filePath of eventFiles) {
-			const dateKey = path.basename(filePath).replace(/\.ndjson$/, "")
-			if (!this.isDateInBounds(dateKey, bounds.fromKey, bounds.toKey)) {
-				continue
-			}
-
-			const fileEvents = await this.readEventFile(filePath)
-			for (const event of fileEvents) {
-				if (!this.isUploadableEvent(event)) {
-					continue
-				}
-				events.push(event)
-				if (maxEvents && events.length >= maxEvents) {
-					return events.slice(0, maxEvents)
-				}
-			}
-		}
-
-		return events
+		return this.uploadEventQueue.getPendingEvents(
+			new Set(this.state!.pendingEventIds),
+			new Set(this.state!.supersededEventIds),
+			maxEvents,
+		)
 	}
 
 	async addPendingLineAttributions(lines: AiCodePendingLineAttribution[]): Promise<void> {
@@ -693,28 +282,10 @@ export class AiCodeStatsStore {
 		})
 	}
 
-	async addSuggestedLines(lineCount: number, timestamp: number = Date.now()): Promise<void> {
-		if (!Number.isFinite(lineCount) || lineCount <= 0) {
-			return
-		}
-
-		await this.enqueue(async () => {
-			await this.ensureLoaded()
-			const state = this.state!
-			const dateKey = toLocalDateKey(timestamp)
-			const aggregate = state.dailyAggregates[dateKey] ?? emptyAggregate()
-			aggregate.suggestedLines += lineCount
-			state.dailyAggregates[dateKey] = aggregate
-			await this.persistState()
-		})
-	}
-
 	async getPendingLineAttributions(repoRoot?: string): Promise<AiCodePendingLineAttribution[]> {
 		await this.ensureLoaded()
 		const normalizedRepoRoot = repoRoot ? normalizePath(path.resolve(repoRoot)) : undefined
-		const queuedMatchedLineIds = new Set(this.queuedReports.flatMap((report) => report.matchedPendingLineIds ?? []))
 		return this.pendingLines
-			.filter((line) => !queuedMatchedLineIds.has(line.id))
 			.filter((line) => !normalizedRepoRoot || line.repoRoot === normalizedRepoRoot)
 			.map((line) => ({ ...line }))
 	}
@@ -780,6 +351,15 @@ export class AiCodeStatsStore {
 		})
 	}
 
+	async setLastUploadStatus(lastUpload: AiCodeStatsLastUpload): Promise<void> {
+		await this.enqueue(async () => {
+			await this.ensureLoaded()
+			const state = this.state!
+			state.lastUpload = lastUpload
+			await this.persistState()
+		})
+	}
+
 	async markEventsUploaded(eventIds: string[]): Promise<void> {
 		if (eventIds.length === 0) {
 			return
@@ -787,18 +367,8 @@ export class AiCodeStatsStore {
 
 		await this.enqueue(async () => {
 			await this.ensureLoaded()
-			const state = this.state!
 			const uploadedSet = new Set(eventIds)
-			state.pendingEventIds = state.pendingEventIds.filter((id) => !uploadedSet.has(id))
-			await this.persistState()
-		})
-	}
-
-	async setLastUploadStatus(lastUpload: AiCodeStatsLastUpload): Promise<void> {
-		await this.enqueue(async () => {
-			await this.ensureLoaded()
-			const state = this.state!
-			state.lastUpload = lastUpload
+			this.state!.pendingEventIds = this.state!.pendingEventIds.filter((id) => !uploadedSet.has(id))
 			await this.persistState()
 		})
 	}
@@ -819,21 +389,10 @@ export class AiCodeStatsStore {
 			const state = this.state!
 			const pendingIds = new Set(state.pendingEventIds)
 			const supersededIds = new Set(state.supersededEventIds)
-			const eventFiles = await this.getEventFilesSorted()
-			for (const filePath of eventFiles) {
-				const dateKey = path.basename(filePath).replace(/\.ndjson$/, "")
-				if (dateKey >= cutoffKey) {
-					continue
-				}
-				const events = await this.readEventFile(filePath)
-				for (const event of events) {
-					pendingIds.delete(event.eventId)
-					supersededIds.delete(event.eventId)
-				}
-				await fs.unlink(filePath).catch(() => undefined)
-				delete state.dailyAggregates[dateKey]
+			for (const eventId of await this.uploadEventQueue.pruneBefore(cutoffKey)) {
+				pendingIds.delete(eventId)
+				supersededIds.delete(eventId)
 			}
-
 			state.pendingEventIds = [...pendingIds]
 			state.supersededEventIds = [...supersededIds]
 			this.pendingLines = this.pendingLines.filter((line) => line.timestamp >= cutoffTimestamp)
@@ -865,7 +424,7 @@ export class AiCodeStatsStore {
 
 	private async load(): Promise<void> {
 		await fs.mkdir(this.baseDir, { recursive: true })
-		await fs.mkdir(this.eventsDir, { recursive: true })
+		await this.uploadEventQueue.ensureReady()
 
 		let shouldResetStorage = false
 		try {
@@ -876,8 +435,7 @@ export class AiCodeStatsStore {
 			} else {
 				this.state = {
 					version: AI_CODE_STATS_VERSION,
-					dailyAggregates: this.normalizeDailyAggregates(parsed.dailyAggregates),
-					pendingEventIds: Array.isArray(parsed.pendingEventIds) ? parsed.pendingEventIds : [],
+					pendingEventIds: this.normalizeEventIds(parsed.pendingEventIds),
 					supersededEventIds: this.normalizeEventIds(parsed.supersededEventIds),
 					repoObservedCommits: this.normalizeRepoObservedCommits(parsed.repoObservedCommits),
 					lastUpload: parsed.lastUpload ?? { status: "idle" },
@@ -896,7 +454,8 @@ export class AiCodeStatsStore {
 
 		if (shouldResetStorage) {
 			await fs.rm(this.baseDir, { recursive: true, force: true })
-			await fs.mkdir(this.eventsDir, { recursive: true })
+			await fs.mkdir(this.baseDir, { recursive: true })
+			await this.uploadEventQueue.ensureReady()
 			this.state = createEmptyState()
 			this.pendingLines = []
 			this.generatedBlocks = []
@@ -988,112 +547,23 @@ export class AiCodeStatsStore {
 		this.pruneInactiveUploadedBlocks()
 	}
 
-	private async appendHistoryEventsInternal(events: AiCodeStatsEvent[], markLegacyPending: boolean): Promise<void> {
+	private async appendUploadEventsToQueue(events: AiCodeStatsEvent[], markPending: boolean): Promise<void> {
+		const uploadableEvents = events.filter(
+			(event) => event.metricType === "generated" || event.metricType === "accepted",
+		)
 		const state = this.state!
-		const dateBuckets = new Map<string, AiCodeStatsEvent[]>()
-		for (const event of events) {
-			const normalizedEvent = this.normalizeHistoryEvent(event)
-			const dateKey = toLocalDateKey(normalizedEvent.timestamp)
-			const bucket = dateBuckets.get(dateKey) ?? []
-			bucket.push(normalizedEvent)
-			dateBuckets.set(dateKey, bucket)
-
-			const aggregate = state.dailyAggregates[dateKey] ?? emptyAggregate()
-			aggregate.eventCount += 1
-			if (normalizedEvent.metricType === "committed") {
-				aggregate.committedLines += normalizedEvent.lineCount
-				aggregate.equivalentCommittedLines += normalizedEvent.equivalentLineCount ?? normalizedEvent.lineCount
-			} else if (normalizedEvent.metricType === "accepted") {
-				aggregate.acceptedLines += normalizedEvent.lineCount
-			} else {
-				aggregate.generatedLines += normalizedEvent.lineCount
-			}
-			state.dailyAggregates[dateKey] = aggregate
-
-			if (markLegacyPending && !state.pendingEventIds.includes(normalizedEvent.eventId)) {
-				state.pendingEventIds.push(normalizedEvent.eventId)
+		let stateChanged = false
+		for (const event of uploadableEvents) {
+			if (markPending && !state.pendingEventIds.includes(event.eventId)) {
+				state.pendingEventIds.push(event.eventId)
+				stateChanged = true
 			}
 		}
 
-		for (const [dateKey, bucket] of dateBuckets.entries()) {
-			const filePath = path.join(this.eventsDir, `${dateKey}.ndjson`)
-			const content = bucket.map((event) => JSON.stringify(event)).join("\n")
-			await fs.appendFile(filePath, `${content}\n`, "utf8")
+		await this.uploadEventQueue.append(uploadableEvents)
+		if (stateChanged) {
+			await this.persistState()
 		}
-		await this.persistState()
-	}
-
-	private async supersedePendingMetricEvents(generatedBlockIds: string[]): Promise<void> {
-		if (generatedBlockIds.length === 0) {
-			return
-		}
-
-		const state = this.state!
-		const pendingIds = new Set(state.pendingEventIds)
-		const supersededIds = new Set(state.supersededEventIds)
-		const targetGeneratedBlockIds = new Set(generatedBlockIds)
-		let changed = false
-
-		const eventFiles = await this.getEventFilesSorted()
-		for (const filePath of eventFiles) {
-			const events = await this.readEventFile(filePath)
-			for (const event of events) {
-				if (!pendingIds.has(event.eventId)) {
-					continue
-				}
-				if (event.metricType !== "generated" && event.metricType !== "accepted") {
-					continue
-				}
-				if (!event.generatedBlockId || !targetGeneratedBlockIds.has(event.generatedBlockId)) {
-					continue
-				}
-				pendingIds.delete(event.eventId)
-				supersededIds.add(event.eventId)
-				this.applyAggregateDelta(state, event, -1)
-				changed = true
-			}
-		}
-
-		if (!changed) {
-			return
-		}
-
-		state.pendingEventIds = [...pendingIds]
-		state.supersededEventIds = [...supersededIds]
-		await this.persistState()
-	}
-
-	private applyAggregateDelta(state: AiCodeStatsPersistedState, event: AiCodeStatsEvent, direction: 1 | -1): void {
-		const dateKey = toLocalDateKey(event.timestamp)
-		const aggregate = state.dailyAggregates[dateKey] ?? emptyAggregate()
-		aggregate.eventCount = Math.max(0, aggregate.eventCount + direction)
-		if (event.metricType === "committed") {
-			aggregate.committedLines = Math.max(0, aggregate.committedLines + event.lineCount * direction)
-			aggregate.equivalentCommittedLines = Math.max(
-				0,
-				roundToFour(
-					aggregate.equivalentCommittedLines + (event.equivalentLineCount ?? event.lineCount) * direction,
-				),
-			)
-		} else if (event.metricType === "accepted") {
-			aggregate.acceptedLines = Math.max(0, aggregate.acceptedLines + event.lineCount * direction)
-		} else {
-			aggregate.generatedLines = Math.max(0, aggregate.generatedLines + event.lineCount * direction)
-		}
-
-		if (
-			aggregate.suggestedLines === 0 &&
-			aggregate.generatedLines === 0 &&
-			aggregate.acceptedLines === 0 &&
-			aggregate.committedLines === 0 &&
-			aggregate.equivalentCommittedLines === 0 &&
-			aggregate.eventCount === 0
-		) {
-			delete state.dailyAggregates[dateKey]
-			return
-		}
-
-		state.dailyAggregates[dateKey] = aggregate
 	}
 
 	private async persistState(): Promise<void> {
@@ -1114,85 +584,6 @@ export class AiCodeStatsStore {
 
 	private async persistQueuedReports(): Promise<void> {
 		await safeWriteJson(this.queuedReportsPath, this.queuedReports)
-	}
-
-	private async getEventFilesSorted(): Promise<string[]> {
-		try {
-			const names = await fs.readdir(this.eventsDir)
-			return names
-				.filter((name) => name.endsWith(".ndjson"))
-				.sort((a, b) => a.localeCompare(b))
-				.map((name) => path.join(this.eventsDir, name))
-		} catch {
-			return []
-		}
-	}
-
-	private async readEventFile(filePath: string): Promise<AiCodeStatsEvent[]> {
-		try {
-			const raw = await fs.readFile(filePath, "utf8")
-			const lines = raw.split("\n")
-			const events: AiCodeStatsEvent[] = []
-			for (const line of lines) {
-				if (!line.trim()) {
-					continue
-				}
-				try {
-					const parsed = JSON.parse(line) as Partial<AiCodeStatsEvent>
-					if (
-						parsed?.eventId &&
-						typeof parsed.timestamp === "number" &&
-						isCurrentSemanticsVersion(parsed.semanticsVersion)
-					) {
-						events.push(this.normalizeHistoryEvent(parsed as AiCodeStatsEvent))
-					}
-				} catch {
-					// Skip malformed lines to preserve remaining records.
-				}
-			}
-			return events
-		} catch {
-			return []
-		}
-	}
-
-	private normalizeHistoryEvent(event: AiCodeStatsEvent): AiCodeStatsEvent {
-		return {
-			...event,
-			semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
-			metricType:
-				event.metricType === "committed"
-					? "committed"
-					: event.metricType === "accepted"
-						? "accepted"
-						: "generated",
-			workspacePath: normalizePath(event.workspacePath ?? ""),
-			filePath: normalizePath(event.filePath ?? ""),
-			relativePath: normalizePath(event.relativePath ?? ""),
-			matchStrategy:
-				event.matchStrategy === "exact" || event.matchStrategy === "partial" ? event.matchStrategy : undefined,
-			matchConfidence: typeof event.matchConfidence === "number" ? event.matchConfidence : undefined,
-			matchDetail: normalizeMatchDetail(event.matchDetail),
-			equivalentLineCount:
-				typeof event.equivalentLineCount === "number"
-					? event.equivalentLineCount
-					: typeof event.lineCount === "number"
-						? event.lineCount
-						: 0,
-			fileSnapshotContent: typeof event.fileSnapshotContent === "string" ? event.fileSnapshotContent : undefined,
-			generatedBlockId:
-				typeof event.generatedBlockId === "string" && event.generatedBlockId.trim()
-					? event.generatedBlockId
-					: undefined,
-		}
-	}
-
-	private isUploadableEvent(event: AiCodeStatsEvent): boolean {
-		return (
-			event.semanticsVersion === CURRENT_AI_CODE_STATS_SEMANTICS_VERSION &&
-			(event.sourceType === "agent_insert" || event.sourceType === "autocomplete") &&
-			!this.state?.supersededEventIds.includes(event.eventId)
-		)
 	}
 
 	private normalizePendingCommitMetricBlock(block: AiCodePendingCommitMetricBlock): AiCodePendingCommitMetricBlock {
@@ -1220,143 +611,6 @@ export class AiCodeStatsStore {
 			codeSnippet: typeof block.codeSnippet === "string" ? block.codeSnippet : "",
 			fileSnapshotContent: typeof block.fileSnapshotContent === "string" ? block.fileSnapshotContent : undefined,
 		}
-	}
-
-	private async getMetricLinesForRange(
-		range: AiCodeStatsRange,
-		metricType: AiCodeMetricType,
-		nowTs: number,
-	): Promise<number> {
-		await this.ensureLoaded()
-		const bounds = this.resolveRangeBounds(range, nowTs)
-		if (bounds === null) {
-			return 0
-		}
-
-		let totalLines = 0
-		const eventFiles = await this.getEventFilesSorted()
-		for (const filePath of eventFiles) {
-			const dateKey = path.basename(filePath).replace(/\.ndjson$/, "")
-			if (!this.isDateInBounds(dateKey, bounds.fromKey, bounds.toKey)) {
-				continue
-			}
-
-			const events = await this.readEventFile(filePath)
-			for (const event of events) {
-				if (!this.isUploadableEvent(event) || event.metricType !== metricType) {
-					continue
-				}
-				totalLines += event.lineCount
-			}
-		}
-
-		return totalLines
-	}
-
-	private async getAggregateLinesForRange(
-		range: AiCodeStatsRange,
-		selectLines: (aggregate: AiCodeStatsDailyAggregate) => number,
-		nowTs: number,
-	): Promise<number> {
-		await this.ensureLoaded()
-		const bounds = this.resolveRangeBounds(range, nowTs)
-		if (bounds === null) {
-			return 0
-		}
-
-		let totalLines = 0
-		for (const [dateKey, aggregate] of Object.entries(this.state!.dailyAggregates)) {
-			if (!this.isDateInBounds(dateKey, bounds.fromKey, bounds.toKey)) {
-				continue
-			}
-			totalLines += selectLines(aggregate)
-		}
-
-		return totalLines
-	}
-
-	private resolveRangeBounds(range: AiCodeStatsRange, nowTs: number): { fromKey?: string; toKey?: string } | null {
-		const type = range.type
-		if (type === "all") {
-			return {}
-		}
-
-		if (type === "custom") {
-			const startKey = this.normalizeDateKey(range.startDate)
-			const endKey = this.normalizeDateKey(range.endDate)
-			if (!startKey || !endKey) {
-				return null
-			}
-			return startKey <= endKey ? { fromKey: startKey, toKey: endKey } : { fromKey: endKey, toKey: startKey }
-		}
-
-		const endDate = new Date(nowTs)
-		endDate.setHours(0, 0, 0, 0)
-		const startDate = new Date(endDate)
-		if (type === "last7days") {
-			const dayOfWeek = endDate.getDay()
-			const diffToMonday = (dayOfWeek + 6) % 7
-			startDate.setDate(startDate.getDate() - diffToMonday)
-		} else if (type === "last30days") {
-			startDate.setDate(1)
-		}
-
-		return {
-			fromKey: toLocalDateKey(startDate.getTime()),
-			toKey: toLocalDateKey(endDate.getTime()),
-		}
-	}
-
-	private normalizeDateKey(value?: string): string | undefined {
-		if (!value || !DATE_KEY_REGEX.test(value)) {
-			return undefined
-		}
-		const parsed = new Date(`${value}T00:00:00`)
-		if (Number.isNaN(parsed.getTime())) {
-			return undefined
-		}
-		return value
-	}
-
-	private isDateInBounds(dateKey: string, fromKey?: string, toKey?: string): boolean {
-		if (!DATE_KEY_REGEX.test(dateKey)) {
-			return false
-		}
-		if (fromKey && dateKey < fromKey) {
-			return false
-		}
-		if (toKey && dateKey > toKey) {
-			return false
-		}
-		return true
-	}
-
-	private normalizeDailyAggregates(
-		dailyAggregates: Partial<Record<string, AiCodeStatsDailyAggregate | Record<string, unknown>>> | undefined,
-	): Record<string, AiCodeStatsDailyAggregate> {
-		const normalized: Record<string, AiCodeStatsDailyAggregate> = {}
-		for (const [dateKey, aggregate] of Object.entries(dailyAggregates ?? {})) {
-			if (!DATE_KEY_REGEX.test(dateKey) || !aggregate) {
-				continue
-			}
-			const aggregateRecord = aggregate as Record<string, unknown>
-
-			normalized[dateKey] = {
-				suggestedLines: typeof aggregateRecord.suggestedLines === "number" ? aggregateRecord.suggestedLines : 0,
-				generatedLines: typeof aggregateRecord.generatedLines === "number" ? aggregateRecord.generatedLines : 0,
-				acceptedLines: typeof aggregateRecord.acceptedLines === "number" ? aggregateRecord.acceptedLines : 0,
-				committedLines: typeof aggregateRecord.committedLines === "number" ? aggregateRecord.committedLines : 0,
-				equivalentCommittedLines:
-					typeof aggregateRecord.equivalentCommittedLines === "number"
-						? aggregateRecord.equivalentCommittedLines
-						: typeof aggregateRecord.committedLines === "number"
-							? aggregateRecord.committedLines
-							: 0,
-				eventCount: typeof aggregateRecord.eventCount === "number" ? aggregateRecord.eventCount : 0,
-			}
-		}
-
-		return normalized
 	}
 
 	private normalizeEventIds(eventIds: unknown): string[] {
@@ -1478,17 +732,25 @@ export class AiCodeStatsStore {
 		return {
 			createdAt: typeof report.createdAt === "number" ? report.createdAt : Date.now(),
 			generatedBlockIds: Array.isArray(report.generatedBlockIds) ? [...new Set(report.generatedBlockIds)] : [],
-			matchedPendingLineIds: Array.isArray(report.matchedPendingLineIds)
-				? [...new Set(report.matchedPendingLineIds)]
-				: [],
 			report: {
-				...report.report,
 				version: "v2",
 				source: "kilocode-ai-code-stats",
 				mode: "commit_report",
 				semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
+				attributionInputVersion: 1,
+				reportId: report.report.reportId,
+				reportGeneratedAt:
+					typeof report.report.reportGeneratedAt === "number" ? report.report.reportGeneratedAt : Date.now(),
+				client: report.report.client,
 				repoRoot: normalizePath(report.report.repoRoot),
+				workspaceName: report.report.workspaceName,
 				workspacePath: normalizePath(report.report.workspacePath),
+				projectKey: report.report.projectKey,
+				gitRemoteUrl: report.report.gitRemoteUrl,
+				gitBranch: report.report.gitBranch,
+				commitHash: report.report.commitHash,
+				previousCommitHash: report.report.previousCommitHash,
+				commitOccurredAt: report.report.commitOccurredAt,
 				acceptedBlocks: (report.report.acceptedBlocks ?? []).map((block) =>
 					this.normalizeGeneratedBlockState({
 						...block,
@@ -1503,24 +765,6 @@ export class AiCodeStatsStore {
 						uploadStatus: "queued",
 					}),
 				),
-				committedBlocks: (report.report.committedBlocks ?? []).map((block) => ({
-					...block,
-					semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
-					workspacePath: normalizePath(block.workspacePath),
-					filePath: normalizePath(block.filePath),
-					relativePath: normalizePath(block.relativePath),
-					generatedBlockId: block.generatedBlockId,
-					fileSnapshotContent:
-						typeof block.fileSnapshotContent === "string" ? block.fileSnapshotContent : undefined,
-					matchStrategy:
-						block.matchStrategy === "exact" || block.matchStrategy === "partial"
-							? block.matchStrategy
-							: undefined,
-					matchConfidence: typeof block.matchConfidence === "number" ? block.matchConfidence : undefined,
-					matchDetail: normalizeMatchDetail(block.matchDetail),
-					equivalentLineCount:
-						typeof block.equivalentLineCount === "number" ? block.equivalentLineCount : block.lineCount,
-				})),
 				changedFiles: (report.report.changedFiles ?? []).map((file) => ({
 					relativePath: normalizePath(file.relativePath),
 					filePath: normalizePath(file.filePath),
@@ -1547,7 +791,75 @@ export class AiCodeStatsStore {
 									: index + 1,
 						}
 					}),
+					addedLines: (file.addedLines ?? []).map((line, index) => ({
+						addedIndex:
+							typeof line.addedIndex === "number" && line.addedIndex >= 0 ? line.addedIndex : index,
+						lineNumber: typeof line.lineNumber === "number" && line.lineNumber > 0 ? line.lineNumber : 1,
+						content: typeof line.content === "string" ? line.content : "",
+						lineHash:
+							typeof line.lineHash === "string" && line.lineHash.trim()
+								? line.lineHash
+								: hashLineFingerprint(typeof line.content === "string" ? line.content : ""),
+					})),
 				})),
+				candidateLines: (report.report.candidateLines ?? []).map((line, index) => {
+					const sourceTimestamp =
+						typeof line.sourceTimestamp === "number" && Number.isFinite(line.sourceTimestamp)
+							? line.sourceTimestamp
+							: undefined
+					if (sourceTimestamp === undefined) {
+						throw new Error(
+							`Queued commit report ${report.report.reportId} has candidate line ${index} without sourceTimestamp`,
+						)
+					}
+
+					return {
+						clientLineId:
+							typeof line.clientLineId === "string" && line.clientLineId.trim()
+								? line.clientLineId
+								: `${report.report.reportId}:${index}`,
+						generatedBlockId: line.generatedBlockId,
+						baselineEventId: line.baselineEventId,
+						baselineMetricType: line.baselineMetricType === "accepted" ? "accepted" : "generated",
+						sourceTimestamp,
+						sourceType: "agent_insert",
+						ide: line.ide === "jetbrains" ? "jetbrains" : "vscode",
+						userName: line.userName,
+						userEmail: line.userEmail,
+						organizationId: line.organizationId,
+						organizationName: line.organizationName,
+						sourceIp: line.sourceIp,
+						workspaceName: line.workspaceName,
+						workspacePath: normalizePath(line.workspacePath),
+						projectKey: line.projectKey,
+						filePath: normalizePath(line.filePath),
+						relativePath: normalizePath(line.relativePath),
+						repoRoot: normalizePath(line.repoRoot),
+						repoRelativePath: normalizePath(line.repoRelativePath),
+						language: line.language,
+						gitRemoteUrl: line.gitRemoteUrl,
+						gitBranch: line.gitBranch,
+						taskId: line.taskId,
+						lineNumber: typeof line.lineNumber === "number" && line.lineNumber > 0 ? line.lineNumber : 1,
+						rawLine: typeof line.rawLine === "string" ? line.rawLine : "",
+						blockLineIndex:
+							typeof line.blockLineIndex === "number" && line.blockLineIndex > 0
+								? line.blockLineIndex
+								: 1,
+						blockLineCount:
+							typeof line.blockLineCount === "number" && line.blockLineCount > 0
+								? line.blockLineCount
+								: 1,
+						lineHash:
+							typeof line.lineHash === "string" && line.lineHash.trim()
+								? line.lineHash
+								: hashLineFingerprint(typeof line.rawLine === "string" ? line.rawLine : ""),
+						occurrenceIndex:
+							typeof line.occurrenceIndex === "number" && line.occurrenceIndex > 0
+								? line.occurrenceIndex
+								: 1,
+					}
+				}),
 			},
 		}
 	}
@@ -1577,7 +889,6 @@ export class AiCodeStatsStore {
 
 	private normalizePendingLine(line: AiCodePendingLineAttribution): AiCodePendingLineAttribution {
 		const rawLine = typeof line.rawLine === "string" ? line.rawLine : ""
-		const lineFeatures = extractLineFeatures(rawLine)
 		const lineHash =
 			typeof line.lineHash === "string" && line.lineHash.trim() ? line.lineHash : hashLineFingerprint(rawLine)
 		const blockId = typeof line.blockId === "string" && line.blockId.trim() ? line.blockId : line.generatedEventId
@@ -1602,14 +913,6 @@ export class AiCodeStatsStore {
 			blockLineIndex,
 			blockLineCount,
 			lineHash,
-			normalizedLine: line.normalizedLine || lineFeatures.normalizedLine,
-			normalizedTokenLine: line.normalizedTokenLine || lineFeatures.normalizedTokenLine,
-			rareIdentifiers:
-				Array.isArray(line.rareIdentifiers) && line.rareIdentifiers.length > 0
-					? [...new Set(line.rareIdentifiers.map((value) => String(value).toLowerCase()))].sort(
-							(left, right) => left.localeCompare(right),
-						)
-					: lineFeatures.rareIdentifiers,
 		}
 	}
 
@@ -1643,7 +946,8 @@ export class AiCodeStatsStore {
 			this.queuedReports = []
 			this.pendingCommitMetricBlocks = []
 			await fs.rm(this.baseDir, { recursive: true, force: true })
-			await fs.mkdir(this.eventsDir, { recursive: true })
+			await fs.mkdir(this.baseDir, { recursive: true })
+			await this.uploadEventQueue.ensureReady()
 			await this.persistState()
 			await this.persistPendingLines()
 			await this.persistGeneratedBlocks()
@@ -1657,11 +961,10 @@ export class AiCodeStatsStore {
 		return (
 			this.state ?? {
 				version: AI_CODE_STATS_VERSION,
-				dailyAggregates: {},
 				pendingEventIds: [],
 				supersededEventIds: [],
 				repoObservedCommits: {},
-				lastUpload: emptySummary().lastUpload,
+				lastUpload: { status: "idle" },
 			}
 		)
 	}

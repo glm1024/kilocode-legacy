@@ -87,64 +87,16 @@ vi.mock("vscode", () => ({
 }))
 
 import { AiCodeStatsService } from "../AiCodeStatsService"
-import { CURRENT_AI_CODE_STATS_SEMANTICS_VERSION, type AiCodeStatsEvent } from "../types"
+import { hashLineFingerprint } from "../AiCodeLineFingerprint"
+import { CURRENT_AI_CODE_STATS_SEMANTICS_VERSION } from "../types"
 
 const execFileAsync = promisify(execFileCallback)
-
-const buildEvent = (overrides: Partial<AiCodeStatsEvent> = {}): AiCodeStatsEvent => ({
-	eventId: overrides.eventId ?? `evt-${Math.random().toString(36).slice(2)}`,
-	timestamp: overrides.timestamp ?? Date.now(),
-	semanticsVersion: overrides.semanticsVersion ?? CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
-	sourceType: overrides.sourceType ?? "agent_insert",
-	ide: overrides.ide ?? "vscode",
-	metricType: overrides.metricType ?? "generated",
-	workspaceName: overrides.workspaceName ?? "workspace",
-	workspacePath: overrides.workspacePath ?? "/workspace",
-	filePath: overrides.filePath ?? "/workspace/src/a.ts",
-	relativePath: overrides.relativePath ?? "src/a.ts",
-	lineStart: overrides.lineStart ?? 1,
-	lineEnd: overrides.lineEnd ?? 1,
-	lineCount: overrides.lineCount ?? 1,
-	codeSnippet: overrides.codeSnippet ?? "const value = 1",
-	taskId: overrides.taskId,
-})
 
 const createGitRepo = async (): Promise<string> => {
 	const repoDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-repo-"))
 	await execFileAsync("git", ["init"], { cwd: repoDir })
 	await fs.mkdir(path.join(repoDir, "src"), { recursive: true })
 	return fs.realpath(repoDir)
-}
-
-const buildCommittedBlockFromGeneratedBlock = (generatedBlock: any, overrides: Record<string, any> = {}) => {
-	const commitOccurredAt = overrides.commitOccurredAt ?? Date.now()
-	return {
-		eventId: overrides.eventId ?? `committed-${generatedBlock.generatedBlockId}`,
-		generatedBlockId: generatedBlock.generatedBlockId,
-		timestamp: commitOccurredAt,
-		semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
-		sourceType: generatedBlock.sourceType,
-		ide: generatedBlock.ide,
-		workspaceName: generatedBlock.workspaceName,
-		workspacePath: generatedBlock.workspacePath,
-		projectKey: generatedBlock.projectKey,
-		filePath: generatedBlock.filePath,
-		relativePath: generatedBlock.relativePath,
-		language: generatedBlock.language,
-		gitRemoteUrl: generatedBlock.gitRemoteUrl,
-		gitBranch: overrides.gitBranch ?? generatedBlock.gitBranch ?? "feature/stats",
-		lineStart: overrides.lineStart ?? generatedBlock.lineStart,
-		lineEnd: overrides.lineEnd ?? generatedBlock.lineEnd,
-		lineCount: overrides.lineCount ?? generatedBlock.lineCount,
-		codeSnippet: overrides.codeSnippet ?? generatedBlock.codeSnippet,
-		fileSnapshotContent: overrides.fileSnapshotContent ?? generatedBlock.fileSnapshotContent,
-		taskId: generatedBlock.taskId,
-		commitHash: overrides.commitHash ?? "commit-test",
-		commitOccurredAt,
-		matchStrategy: overrides.matchStrategy ?? "exact",
-		matchConfidence: overrides.matchConfidence ?? 1,
-		equivalentLineCount: overrides.equivalentLineCount ?? generatedBlock.lineCount,
-	}
 }
 
 describe("AiCodeStatsService", () => {
@@ -178,14 +130,8 @@ describe("AiCodeStatsService", () => {
 			newContent: "const a = 1\nconst b = 2\n",
 		})
 
-		const summary = await service.getSummary()
-		expect(summary.total.suggestedLines).toBe(0)
-		expect(summary.total.generatedLines).toBe(0)
-		expect(summary.total.acceptedLines).toBe(0)
-		expect(summary.total.committedLines).toBe(0)
-		expect(summary.pendingEvents).toBe(3)
-
 		const store = (service as any).store
+		expect(await store.getPendingEventCount()).toBe(3)
 		const pendingCommitMetricBlocks = await store.getPendingCommitMetricBlocksForTests()
 		expect(pendingCommitMetricBlocks).toHaveLength(1)
 		expect(pendingCommitMetricBlocks[0]).toMatchObject({
@@ -240,72 +186,34 @@ describe("AiCodeStatsService", () => {
 		expect(fetchMock).not.toHaveBeenCalled()
 	})
 
-	it("records suggested lines without persisting generated events", async () => {
+	it("queues rejected agent suggestions as generated events", async () => {
 		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
-		const service = AiCodeStatsService.initialize(tmpDir, async () => ({ enabled: false }))
+		const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-workspace-"))
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({ enabled: false, userName: "tester" }))
 
-		await service.recordAgentSuggestion({
+		await service.recordRejectedAgentSuggestion({
+			cwd: workspaceDir,
+			filePath: path.join(workspaceDir, "src/rejected.ts"),
+			relativePath: "src/rejected.ts",
 			originalContent: "const a = 1\n",
-			newContent: "const a = 1\nconst b = 2\nconst c = 3\n",
+			newContent: "const a = 1\nconst rejected = true\n",
+			taskId: "task-rejected",
 		})
 
-		const summary = await service.getSummary()
-		expect(summary.total.suggestedLines).toBe(2)
-		expect(summary.total.generatedLines).toBe(0)
-		expect(summary.total.committedLines).toBe(0)
-		expect(summary.pendingEvents).toBe(0)
-		expect(await service.getSuggestedLines({ type: "current" })).toBe(2)
-	})
-
-	it("uses incremental-only uploads for commit-triggered automatic uploads and coalesces a follow-up run", async () => {
-		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
-		const service = AiCodeStatsService.initialize(tmpDir, async () => ({
-			webhookUrl: "https://example.com/webhook",
-		}))
 		const store = (service as any).store
-
-		await store.appendEvent(buildEvent({ eventId: "e1" }))
-
-		let requestTriggered = false
-		const fetchMock = vi.fn(async () => {
-			if (!requestTriggered) {
-				requestTriggered = true
-				await store.appendEvent(buildEvent({ eventId: "e2", timestamp: Date.now() + 1 }))
-				void (service as any).requestCommitTriggeredUpload()
-			}
-
-			return new Response("ok", { status: 200 })
+		const events = await store.getPendingEvents()
+		expect(events).toHaveLength(1)
+		expect(events[0]).toMatchObject({
+			sourceType: "agent_insert",
+			metricType: "generated",
+			userName: "tester",
+			relativePath: "src/rejected.ts",
+			lineStart: 2,
+			lineEnd: 2,
+			lineCount: 1,
+			codeSnippet: "const rejected = true",
+			taskId: "task-rejected",
 		})
-		vi.stubGlobal("fetch", fetchMock)
-
-		await (service as any).requestCommitTriggeredUpload()
-
-		expect(fetchMock).toHaveBeenCalledTimes(2)
-		const bodies = (fetchMock.mock.calls as unknown as Array<[unknown, { body: string }]>).map((call) =>
-			JSON.parse(call[1].body),
-		)
-		expect(bodies).toHaveLength(2)
-		expect(bodies.every((body) => body.mode === "incremental")).toBe(true)
-		expect(await store.getPendingEventCount()).toBe(0)
-
-		const summary = await service.getSummary()
-		expect(summary.lastUpload).toMatchObject({
-			status: "success",
-			trigger: "commit",
-			mode: "incremental",
-			uploadedEvents: 1,
-		})
-	})
-
-	it("rejects manual incremental uploads while another upload is already in progress", async () => {
-		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
-		const service = AiCodeStatsService.initialize(tmpDir, async () => ({
-			webhookUrl: "https://example.com/webhook",
-		}))
-
-		;(service as any).isUploading = true
-
-		await expect(service.triggerManualUpload()).rejects.toThrow("Upload is already in progress.")
 	})
 
 	// kilocode_change start
@@ -409,15 +317,13 @@ describe("AiCodeStatsService", () => {
 
 		const store = (service as any).store
 		const initialGeneratedBlock = (await store.getGeneratedBlocksForTests())[0]
-		await (service as any).handleCommitMatched({
+		await (service as any).handleCommitCollected({
 			repoRoot: repoDir,
 			branch: "feature/stats",
 			commitHash: "commit-1",
 			previousCommit: "commit-0",
 			commitOccurredAt: Date.now(),
-			committedBlocks: [],
 			changedFiles: [],
-			matchedPendingLineIds: [],
 		})
 
 		await service.recordAgentFileWrite({
@@ -437,7 +343,7 @@ describe("AiCodeStatsService", () => {
 		).toBe(true)
 	})
 
-	it("skips report upload when a commit callback has no pending or committed blocks", async () => {
+	it("skips report upload when a commit callback has no pending AI facts or changed files", async () => {
 		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
 		const service = AiCodeStatsService.initialize(tmpDir, async () => ({
 			webhookUrl: "https://example.com/webhook",
@@ -445,15 +351,13 @@ describe("AiCodeStatsService", () => {
 		const fetchMock = vi.fn().mockResolvedValue(new Response("ok", { status: 200 }))
 		vi.stubGlobal("fetch", fetchMock)
 
-		await (service as any).handleCommitMatched({
+		await (service as any).handleCommitCollected({
 			repoRoot: "/tmp/no-data",
 			branch: "feature/stats",
 			commitHash: "commit-empty",
 			previousCommit: "commit-prev",
 			commitOccurredAt: Date.now(),
-			committedBlocks: [],
 			changedFiles: [],
-			matchedPendingLineIds: [],
 		})
 
 		expect(fetchMock).not.toHaveBeenCalled()
@@ -480,13 +384,12 @@ describe("AiCodeStatsService", () => {
 			newContent: "const b = 1\nconst aiB = 2\n",
 		})
 
-		await (service as any).handleCommitMatched({
+		await (service as any).handleCommitCollected({
 			repoRoot: repoDir,
 			branch: "feature/stats",
 			commitHash: "commit-filtered",
 			previousCommit: "commit-prev",
 			commitOccurredAt: Date.now(),
-			committedBlocks: [],
 			changedFiles: [
 				{
 					relativePath: "src/b.ts",
@@ -504,7 +407,6 @@ describe("AiCodeStatsService", () => {
 					],
 				},
 			],
-			matchedPendingLineIds: [],
 		})
 
 		const queuedReports = await (service as any).store.getQueuedReportsForTests()
@@ -573,13 +475,12 @@ describe("AiCodeStatsService", () => {
 			taskId: "task-math",
 		})
 
-		await (service as any).handleCommitMatched({
+		await (service as any).handleCommitCollected({
 			repoRoot: repoDir,
 			branch: "feature/stats",
 			commitHash: "commit-math",
 			previousCommit: "commit-prev",
 			commitOccurredAt: Date.now(),
-			committedBlocks: [],
 			changedFiles: [
 				{
 					relativePath: "math_utils.py",
@@ -597,7 +498,6 @@ describe("AiCodeStatsService", () => {
 					],
 				},
 			],
-			matchedPendingLineIds: [],
 		})
 
 		const queuedReports = await (service as any).store.getQueuedReportsForTests()
@@ -637,20 +537,18 @@ describe("AiCodeStatsService", () => {
 		;(store as any).pendingCommitMetricBlocks = []
 
 		await expect(
-			(service as any).handleCommitMatched({
+			(service as any).handleCommitCollected({
 				repoRoot: repoDir,
 				branch: "feature/stats",
 				commitHash: "commit-missing-baseline",
 				previousCommit: "commit-prev",
 				commitOccurredAt: Date.now(),
-				committedBlocks: [],
 				changedFiles: [],
-				matchedPendingLineIds: [],
 			}),
 		).rejects.toThrow("Missing pending commit metric baseline")
 	})
 
-	it("counts generated from the original proposal while accepted and committed follow retained AI lines", async () => {
+	it("queues commit facts only for retained AI lines", async () => {
 		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
 		const repoDir = await createGitRepo()
 		mockIsGitRepository.mockResolvedValue(true)
@@ -701,14 +599,6 @@ describe("AiCodeStatsService", () => {
 		})
 
 		const store = (service as any).store
-		const pendingStandaloneEvents = await store.getPendingEvents()
-		expect(pendingStandaloneEvents).toHaveLength(1)
-		expect(pendingStandaloneEvents[0]).toMatchObject({
-			metricType: "generated",
-			lineCount: 2,
-			codeSnippet: rejectedHeader,
-			fileSnapshotContent: `${proposedContent}\n`,
-		})
 
 		const generatedBlock = (await store.getGeneratedBlocksForTests())[0]
 		expect(generatedBlock).toMatchObject({
@@ -718,23 +608,12 @@ describe("AiCodeStatsService", () => {
 		})
 
 		const commitOccurredAt = Date.now()
-		await (service as any).handleCommitMatched({
+		await (service as any).handleCommitCollected({
 			repoRoot: repoDir,
 			branch: "feature/stats",
 			commitHash: "commit-divide",
 			previousCommit: "commit-prev",
 			commitOccurredAt,
-			committedBlocks: [
-				buildCommittedBlockFromGeneratedBlock(generatedBlock, {
-					eventId: "committed-divide",
-					commitHash: "commit-divide",
-					commitOccurredAt,
-					codeSnippet: retainedBlock,
-					fileSnapshotContent: `${finalAcceptedContent}\n`,
-					lineCount: 14,
-					equivalentLineCount: 14,
-				}),
-			],
 			changedFiles: [
 				{
 					relativePath: "src/divide.py",
@@ -752,16 +631,11 @@ describe("AiCodeStatsService", () => {
 					],
 				},
 			],
-			matchedPendingLineIds: [],
 		})
-
-		const summary = await service.getSummary()
-		expect(summary.total.generatedLines).toBe(16)
-		expect(summary.total.acceptedLines).toBe(14)
-		expect(summary.total.committedLines).toBe(14)
 
 		const queuedReports = await store.getQueuedReportsForTests()
 		expect(queuedReports).toHaveLength(1)
+		expect(queuedReports[0].report.attributionInputVersion).toBe(1)
 		expect(queuedReports[0].report.generatedBlocks?.[0]).toMatchObject({
 			codeSnippet: retainedBlock,
 			fileSnapshotContent: `${finalAcceptedContent}\n`,
@@ -770,9 +644,11 @@ describe("AiCodeStatsService", () => {
 			codeSnippet: retainedBlock,
 			fileSnapshotContent: `${finalAcceptedContent}\n`,
 		})
-		expect(queuedReports[0].report.committedBlocks[0]).toMatchObject({
-			codeSnippet: retainedBlock,
-			lineCount: 14,
+		expect(queuedReports[0].report.candidateLines).toHaveLength(14)
+		expect(queuedReports[0].report.candidateLines?.[0]).toMatchObject({
+			baselineMetricType: "accepted",
+			sourceTimestamp: generatedBlock.timestamp,
+			repoRelativePath: "src/divide.py",
 		})
 	})
 
@@ -821,27 +697,15 @@ describe("AiCodeStatsService", () => {
 		})
 
 		const store = (service as any).store
-		expect(await store.getPendingEvents()).toHaveLength(0)
 
 		const generatedBlock = (await store.getGeneratedBlocksForTests())[0]
 		const commitOccurredAt = Date.now()
-		await (service as any).handleCommitMatched({
+		await (service as any).handleCommitCollected({
 			repoRoot: repoDir,
 			branch: "feature/stats",
 			commitHash: "commit-rewrite",
 			previousCommit: "commit-prev",
 			commitOccurredAt,
-			committedBlocks: [
-				buildCommittedBlockFromGeneratedBlock(generatedBlock, {
-					eventId: "committed-rewrite",
-					commitHash: "commit-rewrite",
-					commitOccurredAt,
-					codeSnippet: finalLines.join("\n"),
-					fileSnapshotContent: finalAcceptedContent,
-					lineCount: 10,
-					equivalentLineCount: 10,
-				}),
-			],
 			changedFiles: [
 				{
 					relativePath: "src/rewrite.ts",
@@ -859,16 +723,14 @@ describe("AiCodeStatsService", () => {
 					],
 				},
 			],
-			matchedPendingLineIds: [],
 		})
 
-		const summary = await service.getSummary()
-		expect(summary.total.generatedLines).toBe(10)
-		expect(summary.total.acceptedLines).toBe(10)
-		expect(summary.total.committedLines).toBe(10)
+		const queuedReports = await store.getQueuedReportsForTests()
+		expect(queuedReports).toHaveLength(1)
+		expect(queuedReports[0].report.candidateLines).toHaveLength(10)
 	})
 
-	it("records generated-only deletions from the middle of a single AI block without affecting accepted attribution", async () => {
+	it("ignores generated-only deletions while preserving accepted attribution", async () => {
 		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
 		const repoDir = await createGitRepo()
 		mockIsGitRepository.mockResolvedValue(true)
@@ -884,7 +746,6 @@ describe("AiCodeStatsService", () => {
 			"const ai6 = 6",
 		]
 		const retainedLines = ["const ai1 = 1", "const ai2 = 2", "const ai5 = 5", "const ai6 = 6"]
-		const deletedLines = ["const ai3 = 3", "const ai4 = 4"].join("\n")
 		const proposedContent = `${originalContent}${proposedLines.join("\n")}\n`
 		const finalAcceptedContent = `${originalContent}${retainedLines.join("\n")}\n`
 
@@ -899,14 +760,6 @@ describe("AiCodeStatsService", () => {
 		})
 
 		const store = (service as any).store
-		const pendingStandaloneEvents = await store.getPendingEvents()
-		expect(pendingStandaloneEvents).toHaveLength(1)
-		expect(pendingStandaloneEvents[0]).toMatchObject({
-			metricType: "generated",
-			lineCount: 2,
-			codeSnippet: deletedLines,
-			fileSnapshotContent: proposedContent,
-		})
 
 		const generatedBlock = (await store.getGeneratedBlocksForTests())[0]
 		expect(generatedBlock).toMatchObject({
@@ -916,23 +769,12 @@ describe("AiCodeStatsService", () => {
 		})
 
 		const commitOccurredAt = Date.now()
-		await (service as any).handleCommitMatched({
+		await (service as any).handleCommitCollected({
 			repoRoot: repoDir,
 			branch: "feature/stats",
 			commitHash: "commit-middle-delete",
 			previousCommit: "commit-prev",
 			commitOccurredAt,
-			committedBlocks: [
-				buildCommittedBlockFromGeneratedBlock(generatedBlock, {
-					eventId: "committed-middle-delete",
-					commitHash: "commit-middle-delete",
-					commitOccurredAt,
-					codeSnippet: retainedLines.join("\n"),
-					fileSnapshotContent: finalAcceptedContent,
-					lineCount: 4,
-					equivalentLineCount: 4,
-				}),
-			],
 			changedFiles: [
 				{
 					relativePath: "src/middle-delete.ts",
@@ -950,16 +792,201 @@ describe("AiCodeStatsService", () => {
 					],
 				},
 			],
-			matchedPendingLineIds: [],
 		})
 
-		const summary = await service.getSummary()
-		expect(summary.total.generatedLines).toBe(6)
-		expect(summary.total.acceptedLines).toBe(4)
-		expect(summary.total.committedLines).toBe(4)
+		const queuedReports = await store.getQueuedReportsForTests()
+		expect(queuedReports).toHaveLength(1)
+		expect(queuedReports[0].report.candidateLines).toHaveLength(4)
 	})
 
-	it("records non-git writes with generated from the original proposal and accepted from the retained content", async () => {
+	it("queues duplicate candidate line occurrence facts without client committed attribution fields", async () => {
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const repoDir = await createGitRepo()
+		mockIsGitRepository.mockResolvedValue(true)
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({ enabled: false }))
+		const filePath = path.join(repoDir, "src/duplicates.ts")
+		const newContent = [
+			"const base = 0",
+			"const repeated = true",
+			"const repeated = true",
+			"const done = true",
+			"",
+		].join("\n")
+
+		await service.recordAgentFileWrite({
+			cwd: repoDir,
+			filePath,
+			relativePath: "src/duplicates.ts",
+			originalContent: "const base = 0\n",
+			newContent,
+			taskId: "task-duplicates",
+		})
+
+		await (service as any).handleCommitCollected({
+			repoRoot: repoDir,
+			branch: "feature/stats",
+			commitHash: "commit-duplicates",
+			previousCommit: "commit-prev",
+			commitOccurredAt: Date.now(),
+			changedFiles: [
+				{
+					relativePath: "src/duplicates.ts",
+					filePath,
+					language: "typescript",
+					committedSnapshotContent: newContent,
+					changedBlocks: [
+						{
+							startLine: 2,
+							endLine: 4,
+							lineCount: 3,
+							codeSnippet: "const repeated = true\nconst repeated = true\nconst done = true",
+							displayOrder: 1,
+						},
+					],
+					addedLines: [
+						{
+							addedIndex: 0,
+							lineNumber: 2,
+							content: "const repeated = true",
+							lineHash: hashLineFingerprint("const repeated = true"),
+						},
+						{
+							addedIndex: 1,
+							lineNumber: 3,
+							content: "const repeated = true",
+							lineHash: hashLineFingerprint("const repeated = true"),
+						},
+						{
+							addedIndex: 2,
+							lineNumber: 4,
+							content: "const done = true",
+							lineHash: hashLineFingerprint("const done = true"),
+						},
+					],
+				},
+			],
+		})
+
+		const queuedReports = await (service as any).store.getQueuedReportsForTests()
+		expect(queuedReports).toHaveLength(1)
+		const report = queuedReports[0].report
+		expect((report as any).committedBlocks).toBeUndefined()
+		expect((report as any).matchedPendingLineIds).toBeUndefined()
+		expect(report.attributionInputVersion).toBe(1)
+		expect(report.candidateLines).toHaveLength(3)
+		expect(report.candidateLines?.map((line: any) => line.rawLine)).toEqual([
+			"const repeated = true",
+			"const repeated = true",
+			"const done = true",
+		])
+		expect(report.candidateLines?.map((line: any) => line.occurrenceIndex)).toEqual([1, 2, 1])
+		expect(report.candidateLines?.map((line: any) => line.blockLineIndex)).toEqual([1, 2, 3])
+		expect(report.candidateLines?.[0]).toMatchObject({
+			baselineMetricType: "accepted",
+			lineHash: hashLineFingerprint("const repeated = true"),
+			repoRelativePath: "src/duplicates.ts",
+		})
+		expect(report.changedFiles[0].addedLines).toEqual([
+			{
+				addedIndex: 0,
+				lineNumber: 2,
+				content: "const repeated = true",
+				lineHash: hashLineFingerprint("const repeated = true"),
+			},
+			{
+				addedIndex: 1,
+				lineNumber: 3,
+				content: "const repeated = true",
+				lineHash: hashLineFingerprint("const repeated = true"),
+			},
+			{
+				addedIndex: 2,
+				lineNumber: 4,
+				content: "const done = true",
+				lineHash: hashLineFingerprint("const done = true"),
+			},
+		])
+	})
+
+	it("keeps old-path candidates when commit facts report a rename", async () => {
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const repoDir = await createGitRepo()
+		mockIsGitRepository.mockResolvedValue(true)
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({ enabled: false }))
+		const oldPath = path.join(repoDir, "src/oldName.ts")
+		const newPath = path.join(repoDir, "src/newName.ts")
+
+		await service.recordAgentFileWrite({
+			cwd: repoDir,
+			filePath: oldPath,
+			relativePath: "src/oldName.ts",
+			originalContent: "",
+			newContent: "export const renamedValue = 1\n",
+			taskId: "task-rename",
+		})
+
+		await (service as any).handleCommitCollected({
+			repoRoot: repoDir,
+			branch: "feature/stats",
+			commitHash: "commit-rename",
+			previousCommit: "commit-prev",
+			commitOccurredAt: Date.now(),
+			changedFiles: [
+				{
+					relativePath: "src/newName.ts",
+					filePath: newPath,
+					previousFilePath: oldPath,
+					language: "typescript",
+					committedSnapshotContent: "export const renamedValue = 1\n",
+					changedBlocks: [
+						{
+							startLine: 1,
+							endLine: 1,
+							lineCount: 1,
+							codeSnippet: "export const renamedValue = 1",
+							displayOrder: 1,
+						},
+					],
+					addedLines: [
+						{
+							addedIndex: 0,
+							lineNumber: 1,
+							content: "export const renamedValue = 1",
+							lineHash: hashLineFingerprint("export const renamedValue = 1"),
+						},
+					],
+				},
+			],
+		})
+
+		const queuedReports = await (service as any).store.getQueuedReportsForTests()
+		expect(queuedReports).toHaveLength(1)
+		const report = queuedReports[0].report
+		expect(report.generatedBlocks?.[0]).toMatchObject({
+			relativePath: "src/oldName.ts",
+			filePath: oldPath,
+		})
+		expect(report.candidateLines?.[0]).toMatchObject({
+			repoRelativePath: "src/oldName.ts",
+			relativePath: "src/oldName.ts",
+			rawLine: "export const renamedValue = 1",
+		})
+		expect(report.changedFiles[0]).toMatchObject({
+			relativePath: "src/newName.ts",
+			filePath: newPath,
+			previousFilePath: oldPath,
+			addedLines: [
+				{
+					addedIndex: 0,
+					lineNumber: 1,
+					content: "export const renamedValue = 1",
+					lineHash: hashLineFingerprint("export const renamedValue = 1"),
+				},
+			],
+		})
+	})
+
+	it("ignores non-git writes", async () => {
 		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
 		const service = AiCodeStatsService.initialize(tmpDir, async () => ({ enabled: false }))
 		const fileDir = path.join(tmpDir, "src")
@@ -981,20 +1008,13 @@ describe("AiCodeStatsService", () => {
 			taskId: "task-non-git",
 		})
 
-		const summary = await service.getSummary()
-		expect(summary.total.generatedLines).toBe(5)
-		expect(summary.total.acceptedLines).toBe(3)
-		expect(summary.total.committedLines).toBe(0)
-
-		const pendingEvents = await (service as any).store.getPendingEvents()
-		expect(pendingEvents).toHaveLength(2)
-		expect(pendingEvents.map((event: any) => [event.metricType, event.lineCount])).toEqual([
-			["generated", 5],
-			["accepted", 3],
-		])
+		const store = (service as any).store
+		expect(await store.getPendingEventCount()).toBe(0)
+		expect(await store.getGeneratedBlocksForTests()).toHaveLength(0)
+		expect(await store.getQueuedReportsForTests()).toHaveLength(0)
 	})
 
-	it("normalizes exact committed trailing blank lines before queueing the report", async () => {
+	it("queues trailing blank lines exactly as generated and changed facts", async () => {
 		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
 		const repoDir = await createGitRepo()
 		mockIsGitRepository.mockResolvedValue(true)
@@ -1021,41 +1041,12 @@ describe("AiCodeStatsService", () => {
 		})
 
 		const commitOccurredAt = Date.now()
-		await (service as any).handleCommitMatched({
+		await (service as any).handleCommitCollected({
 			repoRoot: repoDir,
 			branch: "feature/stats",
 			commitHash: "commit-trailing-exact",
 			previousCommit: "commit-prev",
 			commitOccurredAt,
-			committedBlocks: [
-				{
-					eventId: "committed-trailing-exact",
-					generatedBlockId: generatedBlock.generatedBlockId,
-					timestamp: commitOccurredAt,
-					semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
-					sourceType: generatedBlock.sourceType,
-					ide: generatedBlock.ide,
-					workspaceName: generatedBlock.workspaceName,
-					workspacePath: generatedBlock.workspacePath,
-					projectKey: generatedBlock.projectKey,
-					filePath: generatedBlock.filePath,
-					relativePath: generatedBlock.relativePath,
-					language: generatedBlock.language,
-					gitRemoteUrl: generatedBlock.gitRemoteUrl,
-					gitBranch: "feature/stats",
-					lineStart: 2,
-					lineEnd: 2,
-					lineCount: 1,
-					codeSnippet: "const ai = 1",
-					fileSnapshotContent: committedSnapshotContent,
-					taskId: generatedBlock.taskId,
-					commitHash: "commit-trailing-exact",
-					commitOccurredAt,
-					matchStrategy: "exact",
-					matchConfidence: 1,
-					equivalentLineCount: 1,
-				},
-			],
 			changedFiles: [
 				{
 					relativePath: "src/trailing.py",
@@ -1073,19 +1064,11 @@ describe("AiCodeStatsService", () => {
 					],
 				},
 			],
-			matchedPendingLineIds: [],
 		})
 
 		const queuedReports = await store.getQueuedReportsForTests()
 		expect(queuedReports).toHaveLength(1)
-		expect(queuedReports[0].report.committedBlocks[0]).toMatchObject({
-			lineStart: 2,
-			lineEnd: 4,
-			lineCount: 3,
-			codeSnippet: "const ai = 1\n\n",
-			matchStrategy: "exact",
-			equivalentLineCount: 3,
-		})
+		expect(queuedReports[0].report.attributionInputVersion).toBe(1)
 		expect(queuedReports[0].report.acceptedBlocks?.[0]).toMatchObject({
 			lineStart: 2,
 			lineEnd: 4,
@@ -1098,13 +1081,9 @@ describe("AiCodeStatsService", () => {
 			lineCount: 3,
 			codeSnippet: "const ai = 1\n\n",
 		})
-
-		const summary = await service.getSummary()
-		expect(summary.total.acceptedLines).toBe(3)
-		expect(summary.total.committedLines).toBe(3)
 	})
 
-	it("does not normalize partial committed trailing blank lines before queueing the report", async () => {
+	it("preserves shorter trailing blank line facts before queueing the report", async () => {
 		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
 		const repoDir = await createGitRepo()
 		mockIsGitRepository.mockResolvedValue(true)
@@ -1131,41 +1110,12 @@ describe("AiCodeStatsService", () => {
 		})
 
 		const commitOccurredAt = Date.now()
-		await (service as any).handleCommitMatched({
+		await (service as any).handleCommitCollected({
 			repoRoot: repoDir,
 			branch: "feature/stats",
 			commitHash: "commit-trailing-partial",
 			previousCommit: "commit-prev",
 			commitOccurredAt,
-			committedBlocks: [
-				{
-					eventId: "committed-trailing-partial",
-					generatedBlockId: generatedBlock.generatedBlockId,
-					timestamp: commitOccurredAt,
-					semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
-					sourceType: generatedBlock.sourceType,
-					ide: generatedBlock.ide,
-					workspaceName: generatedBlock.workspaceName,
-					workspacePath: generatedBlock.workspacePath,
-					projectKey: generatedBlock.projectKey,
-					filePath: generatedBlock.filePath,
-					relativePath: generatedBlock.relativePath,
-					language: generatedBlock.language,
-					gitRemoteUrl: generatedBlock.gitRemoteUrl,
-					gitBranch: "feature/stats",
-					lineStart: 2,
-					lineEnd: 2,
-					lineCount: 1,
-					codeSnippet: "const ai = 1",
-					fileSnapshotContent: committedSnapshotContent,
-					taskId: generatedBlock.taskId,
-					commitHash: "commit-trailing-partial",
-					commitOccurredAt,
-					matchStrategy: "partial",
-					matchConfidence: 0.75,
-					equivalentLineCount: 0.75,
-				},
-			],
 			changedFiles: [
 				{
 					relativePath: "src/trailing-partial.py",
@@ -1183,29 +1133,17 @@ describe("AiCodeStatsService", () => {
 					],
 				},
 			],
-			matchedPendingLineIds: [],
 		})
 
 		const queuedReports = await store.getQueuedReportsForTests()
 		expect(queuedReports).toHaveLength(1)
-		expect(queuedReports[0].report.committedBlocks[0]).toMatchObject({
-			lineStart: 2,
-			lineEnd: 2,
-			lineCount: 1,
-			codeSnippet: "const ai = 1",
-			matchStrategy: "partial",
-			equivalentLineCount: 0.75,
-		})
+		expect(queuedReports[0].report.attributionInputVersion).toBe(1)
 		expect(queuedReports[0].report.acceptedBlocks?.[0]).toMatchObject({
 			lineStart: 2,
 			lineEnd: 3,
 			lineCount: 2,
 			codeSnippet: "const ai = 1\n",
 		})
-
-		const summary = await service.getSummary()
-		expect(summary.total.acceptedLines).toBe(2)
-		expect(summary.total.committedLines).toBe(1)
 	})
 
 	it("includes cloud user and git metadata in uploaded events", async () => {
@@ -1239,15 +1177,13 @@ describe("AiCodeStatsService", () => {
 		const fetchMock = vi.fn().mockResolvedValue(new Response("ok", { status: 200 }))
 		vi.stubGlobal("fetch", fetchMock)
 
-		await (service as any).handleCommitMatched({
+		await (service as any).handleCommitCollected({
 			repoRoot: repoDir,
 			branch: "feature/stats",
 			commitHash: "commit-1",
 			previousCommit: "commit-0",
 			commitOccurredAt: Date.now(),
-			committedBlocks: [],
 			changedFiles: [],
-			matchedPendingLineIds: [],
 		})
 
 		const firstBody = JSON.parse(fetchMock.mock.calls[0][1].body as string)

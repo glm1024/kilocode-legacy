@@ -15,30 +15,6 @@ import {
 	type AiCodeStatsEvent,
 } from "../types"
 
-const buildEvent = (overrides: Partial<AiCodeStatsEvent> = {}): AiCodeStatsEvent => ({
-	eventId: overrides.eventId ?? `evt-${Math.random().toString(36).slice(2)}`,
-	timestamp: overrides.timestamp ?? Date.now(),
-	semanticsVersion: overrides.semanticsVersion ?? CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
-	sourceType: overrides.sourceType ?? "agent_insert",
-	ide: overrides.ide ?? "vscode",
-	metricType: overrides.metricType ?? "generated",
-	workspaceName: overrides.workspaceName ?? "project",
-	workspacePath: overrides.workspacePath ?? "/workspace/project",
-	filePath: overrides.filePath ?? "/workspace/project/src/a.ts",
-	relativePath: overrides.relativePath ?? "src/a.ts",
-	lineStart: overrides.lineStart ?? 1,
-	lineEnd: overrides.lineEnd ?? 1,
-	lineCount: overrides.lineCount ?? 1,
-	codeSnippet: overrides.codeSnippet ?? "const x = 1",
-	taskId: overrides.taskId,
-	matchStrategy: overrides.matchStrategy,
-	matchConfidence: overrides.matchConfidence,
-	equivalentLineCount: overrides.equivalentLineCount,
-	commitHash: overrides.commitHash,
-	commitOccurredAt: overrides.commitOccurredAt,
-	matchDetail: overrides.matchDetail,
-})
-
 const buildCommitReport = (overrides: Partial<AiCodeCommitReport> = {}): AiCodeCommitReport => ({
 	version: "v2",
 	source: "kilocode-ai-code-stats",
@@ -80,7 +56,6 @@ const buildCommitReport = (overrides: Partial<AiCodeCommitReport> = {}): AiCodeC
 		},
 	],
 	generatedBlocks: overrides.generatedBlocks,
-	committedBlocks: overrides.committedBlocks ?? [],
 	changedFiles: overrides.changedFiles ?? [
 		{
 			relativePath: "src/a.ts",
@@ -104,7 +79,6 @@ const buildQueuedReport = (overrides: Partial<AiCodeQueuedCommitReport> = {}): A
 	report: overrides.report ?? buildCommitReport(),
 	createdAt: overrides.createdAt ?? Date.now(),
 	generatedBlockIds: overrides.generatedBlockIds ?? ["generated-1"],
-	matchedPendingLineIds: overrides.matchedPendingLineIds ?? [],
 })
 
 describe("AiCodeStatsUploader", () => {
@@ -125,165 +99,12 @@ describe("AiCodeStatsUploader", () => {
 		vi.unstubAllGlobals()
 	})
 
-	it("uploads incremental envelopes only and advances the pending cursor", async () => {
-		const now = Date.now()
-		await store.appendEvent(
-			buildEvent({
-				eventId: "e1",
-				timestamp: now,
-				metricType: "committed",
-				matchStrategy: "partial",
-				matchConfidence: 0.9345,
-				equivalentLineCount: 2.7182,
-				commitHash: "abc123",
-				commitOccurredAt: now,
-			}),
-		)
-		await store.appendEvent(buildEvent({ eventId: "e2", timestamp: now }))
-
-		const fetchMock = vi.fn().mockResolvedValue(new Response("ok", { status: 200 }))
-		vi.stubGlobal("fetch", fetchMock)
-
-		const result = await uploader.upload(
-			{ enabled: true, webhookUrl: "https://example.com/webhook" },
-			{
-				client: {
-					ide: "vscode",
-				},
-			},
-		)
-
-		expect(result.uploaded).toBe(2)
-
-		const bodies = fetchMock.mock.calls.map((call) => JSON.parse(call[1].body as string))
-		expect(bodies).toHaveLength(1)
-		expect(bodies[0].mode).toBe("incremental")
-		expect(bodies[0].events[0]).toMatchObject({
-			eventId: "e1",
-			matchStrategy: "partial",
-			matchConfidence: 0.9345,
-			equivalentLineCount: 2.7182,
-			commitHash: "abc123",
-			commitOccurredAt: now,
-		})
-
-		const pendingAfter = await store.getPendingEventCount()
-		expect(pendingAfter).toBe(0)
-	})
-
-	it("uploads autocomplete and agent events when both exist in history", async () => {
-		const now = Date.now()
-		await store.appendEvent(buildEvent({ eventId: "e-auto", timestamp: now, sourceType: "autocomplete" }))
-		await store.appendEvent(buildEvent({ eventId: "e-agent", timestamp: now, sourceType: "agent_insert" }))
-
-		const fetchMock = vi.fn().mockResolvedValue(new Response("ok", { status: 200 }))
-		vi.stubGlobal("fetch", fetchMock)
-
-		const result = await uploader.upload(
-			{ enabled: true, webhookUrl: "https://example.com/webhook" },
-			{
-				client: {
-					ide: "vscode",
-				},
-			},
-		)
-
-		expect(result.uploaded).toBe(2)
-		expect(await store.getPendingEventCount()).toBe(0)
-
-		const bodies = fetchMock.mock.calls.map((call) => JSON.parse(call[1].body as string))
-		expect(bodies).toHaveLength(1)
-		expect(bodies[0].events.map((event: AiCodeStatsEvent) => event.sourceType).sort()).toEqual([
-			"agent_insert",
-			"autocomplete",
-		])
-	})
-
-	it("keeps pending events when incremental upload fails", async () => {
-		await store.appendEvent(buildEvent({ eventId: "e1" }))
-
-		const fetchMock = vi.fn().mockResolvedValue(new Response("fail", { status: 500, statusText: "err" }))
-		vi.stubGlobal("fetch", fetchMock)
-
-		await expect(
-			uploader.upload(
-				{ enabled: true, webhookUrl: "https://example.com/webhook" },
-				{
-					client: { ide: "vscode" },
-				},
-			),
-		).rejects.toThrow()
-
-		expect(await store.getPendingEventCount()).toBe(1)
-	})
-
-	it("uploads when webhook url is set even if enabled flag is false", async () => {
-		await store.appendEvent(buildEvent({ eventId: "e1" }))
-
-		const fetchMock = vi.fn().mockResolvedValue(new Response("ok", { status: 200 }))
-		vi.stubGlobal("fetch", fetchMock)
-
-		const result = await uploader.upload(
-			{ enabled: false, webhookUrl: "https://example.com/webhook" },
-			{
-				client: { ide: "vscode" },
-			},
-		)
-
-		expect(result.uploaded).toBe(1)
-		expect(fetchMock).toHaveBeenCalled()
-	})
-
-	it("appends the ingest path when only the server root URL is configured", async () => {
-		await store.appendEvent(buildEvent({ eventId: "e1" }))
-
-		const fetchMock = vi.fn().mockResolvedValue(new Response("ok", { status: 200 }))
-		vi.stubGlobal("fetch", fetchMock)
-
-		const result = await uploader.upload(
-			{ enabled: true, webhookUrl: "http://localhost:8081" },
-			{
-				client: { ide: "vscode" },
-			},
-		)
-
-		expect(result.uploaded).toBe(1)
-		expect(fetchMock).toHaveBeenCalledWith("http://localhost:8081/api/v1/ingest/ai-code-stats", expect.any(Object))
-	})
-
 	it("uploads queued commit reports and acknowledges them in FIFO order", async () => {
 		await store.queueCommitReport(
 			buildQueuedReport({
 				report: buildCommitReport({
 					reportId: "report-1",
 					commitHash: "commit-1",
-					committedBlocks: [
-						{
-							eventId: "committed-1",
-							generatedBlockId: "generated-1",
-							timestamp: Date.now(),
-							sourceType: "agent_insert",
-							ide: "vscode",
-							workspaceName: "project",
-							workspacePath: "/workspace/project",
-							projectKey: "project-key",
-							filePath: "/workspace/project/src/a.ts",
-							relativePath: "src/a.ts",
-							language: "typescript",
-							gitRemoteUrl: "https://github.com/example/repo.git",
-							gitBranch: "feature/stats",
-							lineStart: 1,
-							lineEnd: 1,
-							lineCount: 1,
-							codeSnippet: "const a = 1",
-							fileSnapshotContent: "const a = 1\nconst b = 2\n",
-							commitHash: "commit-1",
-							commitOccurredAt: Date.now(),
-							matchStrategy: "exact",
-							matchConfidence: 1,
-							equivalentLineCount: 1,
-						},
-					],
 				}),
 			}),
 		)
@@ -323,17 +144,13 @@ describe("AiCodeStatsUploader", () => {
 		const fetchMock = vi.fn().mockResolvedValue(new Response("ok", { status: 200 }))
 		vi.stubGlobal("fetch", fetchMock)
 
-		const result = await uploader.uploadQueuedReports(
-			{ enabled: true, webhookUrl: "https://example.com/webhook" },
-			{ client: { ide: "vscode" } },
-		)
+		const result = await uploader.uploadQueuedReports({ enabled: true, webhookUrl: "https://example.com/webhook" })
 
-		expect(result).toEqual({ uploadedReports: 2, uploadedBlocks: 3 })
+		expect(result).toEqual({ uploadedReports: 2, uploadedBlocks: 2 })
 		expect(fetchMock.mock.calls).toHaveLength(2)
 		const firstBody = JSON.parse(fetchMock.mock.calls[0][1].body as string)
 		expect(firstBody.reportId).toBe("report-1")
 		expect(firstBody.acceptedBlocks[0].fileSnapshotContent).toBe("const a = 1\n")
-		expect(firstBody.committedBlocks[0].fileSnapshotContent).toBe("const a = 1\nconst b = 2\n")
 		const secondBody = JSON.parse(fetchMock.mock.calls[1][1].body as string)
 		expect(secondBody.reportId).toBe("report-2")
 		expect(secondBody.generatedBlocks[0].fileSnapshotContent).toBe("const b = 2\n")
@@ -353,91 +170,76 @@ describe("AiCodeStatsUploader", () => {
 		expect(await store.getQueuedReportsForTests()).toHaveLength(0)
 	})
 
-	it("keeps committed partial matchDetail when uploading queued commit reports", async () => {
-		await store.queueCommitReport(
-			buildQueuedReport({
-				report: buildCommitReport({
-					reportId: "report-score-detail",
-					commitHash: "commit-score-detail",
-					acceptedBlocks: [],
-					generatedBlocks: [],
-					committedBlocks: [
-						{
-							eventId: "committed-partial-score",
-							generatedBlockId: "generated-score",
-							timestamp: Date.now(),
-							sourceType: "agent_insert",
-							ide: "vscode",
-							workspaceName: "project",
-							workspacePath: "/workspace/project",
-							projectKey: "project-key",
-							filePath: "/workspace/project/src/a.ts",
-							relativePath: "src/a.ts",
-							language: "typescript",
-							gitRemoteUrl: "https://github.com/example/repo.git",
-							gitBranch: "feature/stats",
-							lineStart: 2,
-							lineEnd: 2,
-							lineCount: 1,
-							codeSnippet: "return total - tax",
-							commitHash: "commit-score-detail",
-							commitOccurredAt: Date.now(),
-							matchStrategy: "partial",
-							matchConfidence: 0.724,
-							equivalentLineCount: 0.724,
-							matchDetail: {
-								scoreSource: "attribution",
-								finalScore: 0.724,
-								baseScore: 0.694,
-								editSimilarity: 0.812,
-								tokenSimilarity: 0.7,
-								overlapSimilarity: 0.5,
-								adjustments: ["inline_comment_bonus"],
-								lineDetails: [
-									{
-										committedLineNumber: 2,
-										generatedLineNumber: 2,
-										scoreSource: "attribution",
-										finalScore: 0.724,
-										baseScore: 0.694,
-										editSimilarity: 0.812,
-										tokenSimilarity: 0.7,
-										overlapSimilarity: 0.5,
-										overlapKind: "identifier",
-										adjustments: ["inline_comment_bonus"],
-									},
-								],
-							},
-						},
-					],
-					changedFiles: [],
-				}),
-			}),
-		)
+	it("uploads standalone generated events from the local queue", async () => {
+		const event: AiCodeStatsEvent = {
+			eventId: "event-1",
+			timestamp: Date.now(),
+			semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
+			sourceType: "agent_insert",
+			ide: "vscode",
+			metricType: "generated",
+			workspaceName: "project",
+			workspacePath: "/workspace/project",
+			filePath: "/workspace/project/src/rejected.ts",
+			relativePath: "src/rejected.ts",
+			lineStart: 2,
+			lineEnd: 2,
+			lineCount: 1,
+			codeSnippet: "const rejected = true",
+		}
+		await store.appendEvent(event)
 
 		const fetchMock = vi.fn().mockResolvedValue(new Response("ok", { status: 200 }))
 		vi.stubGlobal("fetch", fetchMock)
 
-		await uploader.uploadQueuedReports(
+		const result = await uploader.upload(
 			{ enabled: true, webhookUrl: "https://example.com/webhook" },
-			{ client: { ide: "vscode" } },
+			{ client: { ide: "vscode", machineId: "machine-1" } },
 		)
 
+		expect(result).toEqual({ uploaded: 1 })
 		expect(fetchMock.mock.calls).toHaveLength(1)
-		const requestBody = JSON.parse(fetchMock.mock.calls[0][1].body as string)
-		expect(requestBody.committedBlocks[0].matchDetail).toMatchObject({
-			scoreSource: "attribution",
-			finalScore: 0.724,
-			baseScore: 0.694,
-			adjustments: ["inline_comment_bonus"],
-			lineDetails: [
-				{
-					committedLineNumber: 2,
-					generatedLineNumber: 2,
-					overlapKind: "identifier",
-				},
-			],
+		const body = JSON.parse(fetchMock.mock.calls[0][1].body as string)
+		expect(body.mode).toBe("incremental")
+		expect(body.events).toHaveLength(1)
+		expect(body.events[0]).toMatchObject({
+			eventId: "event-1",
+			sourceType: "agent_insert",
+			metricType: "generated",
+			relativePath: "src/rejected.ts",
 		})
+		expect(await store.getPendingEvents()).toHaveLength(0)
+	})
+
+	it("does not upload client-side committed events from the local queue", async () => {
+		await store.appendEvent({
+			eventId: "client-committed",
+			timestamp: Date.now(),
+			semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
+			sourceType: "agent_insert",
+			ide: "vscode",
+			metricType: "committed",
+			workspaceName: "project",
+			workspacePath: "/workspace/project",
+			filePath: "/workspace/project/src/a.ts",
+			relativePath: "src/a.ts",
+			lineStart: 1,
+			lineEnd: 1,
+			lineCount: 1,
+			codeSnippet: "const committed = true",
+		} as any)
+
+		const fetchMock = vi.fn().mockResolvedValue(new Response("ok", { status: 200 }))
+		vi.stubGlobal("fetch", fetchMock)
+
+		const result = await uploader.upload(
+			{ enabled: true, webhookUrl: "https://example.com/webhook" },
+			{ client: { ide: "vscode", machineId: "machine-1" } },
+		)
+
+		expect(result).toEqual({ uploaded: 0 })
+		expect(fetchMock).not.toHaveBeenCalled()
+		expect(await store.getPendingEvents()).toHaveLength(0)
 	})
 
 	it("keeps queued commit reports frozen when upload fails and retries them later", async () => {
@@ -457,17 +259,14 @@ describe("AiCodeStatsUploader", () => {
 		vi.stubGlobal("fetch", fetchMock)
 
 		await expect(
-			uploader.uploadQueuedReports(
-				{ enabled: true, webhookUrl: "https://example.com/webhook" },
-				{ client: { ide: "vscode" } },
-			),
+			uploader.uploadQueuedReports({ enabled: true, webhookUrl: "https://example.com/webhook" }),
 		).rejects.toThrow()
 		expect(await store.getQueuedReportsForTests()).toHaveLength(1)
 
-		const retryResult = await uploader.uploadQueuedReports(
-			{ enabled: true, webhookUrl: "https://example.com/webhook" },
-			{ client: { ide: "vscode" } },
-		)
+		const retryResult = await uploader.uploadQueuedReports({
+			enabled: true,
+			webhookUrl: "https://example.com/webhook",
+		})
 		expect(retryResult).toEqual({ uploadedReports: 1, uploadedBlocks: 1 })
 		expect(await store.getQueuedReportsForTests()).toHaveLength(0)
 		expect(fetchMock.mock.calls).toHaveLength(2)

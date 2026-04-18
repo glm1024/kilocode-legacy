@@ -162,10 +162,6 @@ export type CostTrackingCallback = (cost: number, inputTokens: number, outputTok
 export interface LastSuggestionInfo extends AutocompleteContext {
 	length: number
 	lineCount: number
-	suggestionId: string
-	suggestionText: string
-	document: vscode.TextDocument
-	position: vscode.Position
 }
 
 export interface PendingRequest {

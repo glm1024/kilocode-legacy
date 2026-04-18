@@ -13,8 +13,8 @@ import {
 	buildUserKey,
 	normalizeDimensionValue,
 	normalizePath,
-	type AiCodeStatsRange,
 	type AiTokenUsageIde,
+	type AiTokenUsageRange,
 	type AiTokenUsageSummary,
 	type AiTokenUsageUploadSettings,
 } from "./types"
@@ -104,7 +104,7 @@ export class AiTokenUsageService {
 		this.watchers.clear()
 	}
 
-	async getSummary(range: AiCodeStatsRange): Promise<AiTokenUsageSummary> {
+	async getSummary(range: AiTokenUsageRange): Promise<AiTokenUsageSummary> {
 		return this.store.getSummaryForRange(range)
 	}
 

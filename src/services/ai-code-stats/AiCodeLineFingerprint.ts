@@ -2,7 +2,7 @@
 
 import crypto from "crypto"
 
-import { normalizeLineForFingerprint } from "./AiCodeLineFeatures"
+const normalizeLineForFingerprint = (value: string): string => value.replace(/\r?\n$/, "").trim()
 
 export const hashLineFingerprint = (value: string): string =>
 	crypto.createHash("sha1").update(normalizeLineForFingerprint(value), "utf8").digest("hex")

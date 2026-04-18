@@ -48,7 +48,6 @@
 		"statistics": "Coding Analysis"
 	},
 	"statistics": {
-		"tip": "This page shows locally recorded coding analysis metrics for this plugin, including retention rate, committed lines, adoption rate, accepted lines, generated lines, and token usage.",
 		"userName": {
 			"label": "Username",
 			"placeholder": "e.g. Alice Zhang…",
@@ -71,59 +70,6 @@
 				"httpError": "The server returned an unexpected response",
 				"networkError": "Could not connect to the upload server. Check the address, port, and whether the server is running."
 			}
-		},
-		"analysis": {
-			"label": "Analysis Range"
-		},
-		"customDate": {
-			"startLabel": "Start Date",
-			"endLabel": "End Date"
-		},
-		"retentionRate": {
-			"label": "Retention Rate",
-			"empty": "No data yet",
-			"tooltip": "Committed lines / accepted lines",
-			"ariaLabel": "Show retention rate details"
-		},
-		"generatedLines": {
-			"label": "Generated Lines",
-			"empty": "No data yet",
-			"tooltip": "Total AI-generated code lines in the selected range",
-			"ariaLabel": "Show generated lines details"
-		},
-		"acceptedLines": {
-			"label": "Accepted Lines",
-			"empty": "No data yet",
-			"tooltip": "Total AI code lines that were accepted",
-			"ariaLabel": "Show accepted lines details"
-		},
-		"committedLines": {
-			"label": "Committed Lines",
-			"empty": "No data yet",
-			"tooltip": "Total AI code lines that ultimately entered a commit",
-			"ariaLabel": "Show committed lines details"
-		},
-		"adoptionRate": {
-			"label": "Adoption Rate",
-			"empty": "No data yet",
-			"tooltip": "Accepted lines / generated lines",
-			"ariaLabel": "Show adoption rate details"
-		},
-		"tokenUsage": {
-			"label": "Token Usage",
-			"empty": "No data yet",
-			"tooltip": "Cumulative input, output, and total token usage in the selected range",
-			"ariaLabel": "Show token usage details",
-			"input": "Input",
-			"output": "Output",
-			"total": "Total Tokens"
-		},
-		"range": {
-			"current": "Today",
-			"last7days": "This week",
-			"last30days": "This month",
-			"custom": "Custom range",
-			"all": "All"
 		}
 	},
 	"about": {

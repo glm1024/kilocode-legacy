@@ -40,28 +40,14 @@ export class ContributionTrackingService {
 
 	private constructor() {}
 
-	private async recordSuggestedLinesLocally(params: TrackContributionParams): Promise<void> {
-		const aiCodeStatsService = AiCodeStatsService.getInstance()
-		if (!aiCodeStatsService) {
-			return
-		}
-
-		await aiCodeStatsService.recordAgentSuggestion({
-			originalContent: params.originalContent,
-			newContent: params.newContent,
-		})
-	}
-
 	private async recordRejectedSuggestionLocally(params: TrackContributionParams): Promise<void> {
 		if (params.status !== "rejected") {
 			return
 		}
-
 		const aiCodeStatsService = AiCodeStatsService.getInstance()
 		if (!aiCodeStatsService) {
 			return
 		}
-
 		await aiCodeStatsService.recordRejectedAgentSuggestion({
 			cwd: params.cwd,
 			filePath: params.filePath,
@@ -323,17 +309,12 @@ export class ContributionTrackingService {
 	 */
 	async trackContribution(params: TrackContributionParams): Promise<void> {
 		try {
-			try {
-				await this.recordSuggestedLinesLocally(params)
-			} catch (error) {
-				console.error("[ContributionTracking] Failed to record local suggested lines:", error)
-			}
-			try {
-				await this.recordRejectedSuggestionLocally(params)
-			} catch (error) {
-				console.error("[ContributionTracking] Failed to record rejected AI suggestion locally:", error)
-			}
+			await this.recordRejectedSuggestionLocally(params)
+		} catch (error) {
+			console.error("[ContributionTracking] Failed to record rejected suggestion locally:", error)
+		}
 
+		try {
 			// Skip tracking if telemetry is disabled (respects user's privacy preferences)
 			if (TelemetryService.hasInstance() && !TelemetryService.instance.isTelemetryEnabled()) {
 				return

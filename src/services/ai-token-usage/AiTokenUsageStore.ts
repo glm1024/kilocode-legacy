@@ -7,10 +7,10 @@ import {
 	AI_TOKEN_USAGE_VERSION,
 	buildAggregateKey,
 	toLocalDateKey,
-	type AiCodeStatsRange,
 	type AiTokenUsageAggregateRow,
 	type AiTokenUsagePersistedState,
 	type AiTokenUsageRecordInput,
+	type AiTokenUsageRange,
 	type AiTokenUsageSummary,
 } from "./types"
 
@@ -118,7 +118,7 @@ export class AiTokenUsageStore {
 		})
 	}
 
-	async getSummaryForRange(range: AiCodeStatsRange, nowTs: number = Date.now()): Promise<AiTokenUsageSummary> {
+	async getSummaryForRange(range: AiTokenUsageRange, nowTs: number = Date.now()): Promise<AiTokenUsageSummary> {
 		await this.ensureLoaded()
 		const bounds = this.resolveRangeBounds(range, nowTs)
 		if (bounds === null) {
@@ -200,7 +200,7 @@ export class AiTokenUsageStore {
 		await this.operationQueue
 	}
 
-	private resolveRangeBounds(range: AiCodeStatsRange, nowTs: number): { fromKey?: string; toKey?: string } | null {
+	private resolveRangeBounds(range: AiTokenUsageRange, nowTs: number): { fromKey?: string; toKey?: string } | null {
 		const type = range.type
 		if (type === "all") {
 			return {}

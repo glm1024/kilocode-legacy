@@ -7,9 +7,8 @@ import * as vscode from "vscode"
 
 import { Package } from "../../shared/package"
 import { getKiloCodeWrapperProperties } from "../../core/kilocode/wrapper"
-import { AiCodeCommitAttributionService, type AiCodeCommitMatchedPayload } from "./AiCodeCommitAttributionService"
+import { AiCodeCommitAttributionService, type AiCodeCommitFactsPayload } from "./AiCodeCommitAttributionService"
 import { AiCodeDiffExtractor } from "./AiCodeDiffExtractor"
-import { extractLineFeatures } from "./AiCodeLineFeatures"
 import { hashLineFingerprint } from "./AiCodeLineFingerprint"
 // kilocode_change start
 import { AiCodeStatsMetadataResolver } from "./AiCodeStatsMetadataResolver"
@@ -21,19 +20,15 @@ import {
 	CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
 	normalizePath,
 	type AiCodeAddedCodeBlock,
-	type AiCodeCommittedBlock,
+	type AiCodeCommitCandidateLine,
 	type AiCodeCommitReport,
 	type AiCodeGeneratedBlock,
 	type AiCodeGeneratedBlockState,
 	type AiCodeIde,
-	type AiCodeMetricType,
 	type AiCodePatchHunk,
 	type AiCodePendingLineAttribution,
 	type AiCodeStatsEvent,
 	type AiCodeStatsLastUpload,
-	type AiCodeStatsRange,
-	type AiCodeStatsRangeSummary,
-	type AiCodeStatsSummary,
 	type AiCodeStatsUploadSettings,
 } from "./types"
 
@@ -68,40 +63,6 @@ const buildLineOccurrenceIndexes = (content: string): number[] => {
 	return indexes
 }
 
-const countTextLines = (content: string): number => {
-	if (!content) {
-		return 0
-	}
-
-	const normalized = content.replace(/\r\n/g, "\n")
-	const lineBreakCount = (normalized.match(/\n/g) || []).length
-	return lineBreakCount + 1 - (normalized.endsWith("\n") ? 1 : 0)
-}
-
-const splitBlockCodeLines = (codeSnippet: string, expectedLineCount?: number): string[] => {
-	if (typeof expectedLineCount === "number" && expectedLineCount <= 0) {
-		return []
-	}
-
-	const normalized = codeSnippet.replace(/\r\n/g, "\n")
-	const lines = normalized.length > 0 ? normalized.split("\n") : [""]
-	if (typeof expectedLineCount !== "number" || expectedLineCount <= 0) {
-		return lines
-	}
-	if (lines.length < expectedLineCount) {
-		return [...lines, ...Array.from({ length: expectedLineCount - lines.length }, () => "")]
-	}
-	return lines.slice(0, expectedLineCount)
-}
-
-const trimTrailingBlankLines = (lines: string[]): string[] => {
-	let end = lines.length
-	while (end > 0 && lines[end - 1].trim().length === 0) {
-		end -= 1
-	}
-	return lines.slice(0, end)
-}
-
 const normalizeGeneratedBlockId = (generatedBlockId?: string): string =>
 	typeof generatedBlockId === "string" ? generatedBlockId.trim() : ""
 
@@ -116,9 +77,7 @@ interface GeneratedStateBuildResult {
 }
 
 interface AgentWriteBlockAnalysis {
-	proposedGeneratedBlocks: AiCodeAddedCodeBlock[]
 	acceptedBlocks: AiCodeAddedCodeBlock[]
-	generatedOnlyBlocks: AiCodeAddedCodeBlock[]
 }
 
 const detectIde = (): AiCodeIde => {
@@ -166,30 +125,11 @@ export interface AgentFileWriteRecord {
 	taskId?: string
 }
 
-export interface AgentSuggestionRecord {
-	originalContent: string
-	newContent: string
-	timestamp?: number
-}
-
 interface ResolvedFileContext {
 	filePath: string
 	workspacePath: string
 	workspaceName: string
 	relativePath: string
-}
-
-interface AutocompleteSuggestionRecord {
-	suggestionId: string
-	document: vscode.TextDocument
-	position: vscode.Position
-	suggestionText: string
-	timestamp?: number
-}
-
-export interface AiCodeStatsManualUploadResult {
-	uploadedEvents: number
-	timestamp: number
 }
 
 export class AiCodeStatsService {
@@ -214,8 +154,8 @@ export class AiCodeStatsService {
 		this.uploader = new AiCodeStatsUploader(this.store)
 		this.extractor = new AiCodeDiffExtractor()
 		this.commitAttributionService = new AiCodeCommitAttributionService(this.store, {
-			onCommitMatched: async (payload) => {
-				await this.handleCommitMatched(payload)
+			onCommitCollected: async (payload) => {
+				await this.handleCommitCollected(payload)
 			},
 		})
 		// kilocode_change start
@@ -253,168 +193,9 @@ export class AiCodeStatsService {
 		this.commitAttributionService.stop()
 	}
 
-	async getSummary(): Promise<AiCodeStatsSummary> {
-		await this.store.pruneOldData(AI_CODE_STATS_RETENTION_DAYS)
-		return this.store.getSummary()
-	}
-
-	async getGeneratedLines(range: AiCodeStatsRange): Promise<number> {
-		await this.store.pruneOldData(AI_CODE_STATS_RETENTION_DAYS)
-		return this.store.getGeneratedLinesForRange(range)
-	}
-
-	async getSuggestedLines(range: AiCodeStatsRange): Promise<number> {
-		await this.store.pruneOldData(AI_CODE_STATS_RETENTION_DAYS)
-		return this.store.getSuggestedLinesForRange(range)
-	}
-
-	async getCommittedLines(range: AiCodeStatsRange): Promise<number> {
-		await this.store.pruneOldData(AI_CODE_STATS_RETENTION_DAYS)
-		return this.store.getCommittedLinesForRange(range)
-	}
-
-	async getRangeSummary(range: AiCodeStatsRange): Promise<AiCodeStatsRangeSummary> {
-		await this.store.pruneOldData(AI_CODE_STATS_RETENTION_DAYS)
-		return this.store.getRangeSummary(range)
-	}
-
-	async recordAgentSuggestion(record: AgentSuggestionRecord): Promise<void> {
-		const blocks = this.extractor.extractAddedBlocks(record.originalContent, record.newContent, "suggested")
-		if (blocks.length === 0) {
-			return
-		}
-
-		const suggestedLines = blocks.reduce((total, block) => total + block.lineCount, 0)
-		if (suggestedLines === 0) {
-			return
-		}
-
-		await this.store.addSuggestedLines(suggestedLines, record.timestamp)
-	}
-
-	async recordRejectedAgentSuggestion(record: AgentFileWriteRecord): Promise<void> {
-		const context = await this.resolveFileContext(record.cwd, record.filePath, record.relativePath)
-		const settings = await this.getUploadSettings()
-		const metadata = await this.metadataResolver.resolve(context.workspacePath, context.filePath, settings)
-		const blocks = this.extractor.extractAddedBlocks(
-			record.originalContent,
-			record.newContent,
-			context.relativePath,
-		)
-		if (blocks.length === 0) {
-			return
-		}
-
-		const timestamp = Date.now()
-		const events = this.buildMetricEventsForGeneratedBlocks({
-			metricTypes: ["generated"],
-			blocks: blocks.map((block) =>
-				this.createGeneratedMetricBlock({
-					generatedBlockId: crypto.randomUUID(),
-					timestamp,
-					sourceType: "agent_insert",
-					workspaceName: context.workspaceName,
-					workspacePath: context.workspacePath,
-					filePath: context.filePath,
-					relativePath: context.relativePath,
-					taskId: record.taskId,
-					metadata,
-					fileSnapshotContent: record.newContent,
-					lineStart: block.lineStart,
-					lineEnd: block.lineEnd,
-					codeSnippet: block.codeSnippet,
-				}),
-			),
-		})
-		await this.appendPendingMetricEvents(events)
-	}
-
-	async recordAutocompleteSuggestionShown(record: AutocompleteSuggestionRecord): Promise<void> {
-		const event = await this.buildAutocompleteMetricEvent(record, "generated")
-		if (!event) {
-			return
-		}
-
-		await this.store.appendEvent(event)
-	}
-
-	async recordAutocompleteSuggestionAccepted(record: AutocompleteSuggestionRecord): Promise<void> {
-		const event = await this.buildAutocompleteMetricEvent(record, "accepted")
-		if (!event) {
-			return
-		}
-
-		await this.store.appendEvent(event)
-	}
-
-	async triggerManualUpload(): Promise<void> {
-		if (this.isUploading) {
-			throw new Error("Upload is already in progress.")
-		}
-
-		this.isUploading = true
-		try {
-			await this.performIncrementalUpload("manual")
-		} finally {
-			this.isUploading = false
-			this.scheduleQueuedCommitUpload()
-		}
-	}
-
-	async triggerManualRangeUpload(range: AiCodeStatsRange): Promise<AiCodeStatsManualUploadResult> {
-		if (this.isUploading) {
-			throw new Error("Upload is already in progress.")
-		}
-
-		this.isUploading = true
-		try {
-			await this.store.pruneOldData(AI_CODE_STATS_RETENTION_DAYS)
-			const settings = await this.getUploadSettings()
-			if (!settings.webhookUrl?.trim()) {
-				throw new Error("Upload webhook URL is not configured.")
-			}
-
-			const uploadResult = await this.uploader.uploadRange(settings, {
-				range,
-				client: this.buildUploadClient(),
-			})
-
-			const timestamp = Date.now()
-			await this.store.setLastUploadStatus({
-				status: "success",
-				timestamp,
-				uploadedEvents: uploadResult.uploaded,
-				mode: "backfill",
-				trigger: "manual",
-			})
-
-			return {
-				uploadedEvents: uploadResult.uploaded,
-				timestamp,
-			}
-		} catch (error) {
-			const errorMessage = error instanceof Error ? error.message : String(error)
-			await this.store.setLastUploadStatus({
-				status: "failed",
-				timestamp: Date.now(),
-				message: errorMessage,
-				mode: "backfill",
-				trigger: "manual",
-			})
-			throw error
-		} finally {
-			this.isUploading = false
-			this.scheduleQueuedCommitUpload()
-		}
-	}
-
 	async recordAgentFileWrite(record: AgentFileWriteRecord): Promise<void> {
 		const context = await this.resolveFileContext(record.cwd, record.filePath, record.relativePath)
 		const proposedContent = record.proposedContent ?? record.newContent
-		// kilocode_change start
-		const settings = await this.getUploadSettings()
-		const metadata = await this.metadataResolver.resolve(context.workspacePath, context.filePath, settings)
-		// kilocode_change end
 
 		const blockAnalysis = this.analyzeAgentWriteBlocks({
 			originalContent: record.originalContent,
@@ -422,11 +203,7 @@ export class AiCodeStatsService {
 			finalAcceptedContent: record.newContent,
 			filePath: context.relativePath,
 		})
-		if (
-			blockAnalysis.proposedGeneratedBlocks.length === 0 &&
-			blockAnalysis.acceptedBlocks.length === 0 &&
-			blockAnalysis.generatedOnlyBlocks.length === 0
-		) {
+		if (blockAnalysis.acceptedBlocks.length === 0) {
 			return
 		}
 		const timestamp = Date.now()
@@ -438,52 +215,13 @@ export class AiCodeStatsService {
 				: undefined
 
 		if (!repoRoot || !repoRelativePath) {
-			const metricEvents = [
-				...this.buildMetricEventsForAddedBlocks({
-					metricType: "generated",
-					addedBlocks: blockAnalysis.proposedGeneratedBlocks,
-					timestamp,
-					workspaceName: context.workspaceName,
-					workspacePath: context.workspacePath,
-					filePath: context.filePath,
-					relativePath: context.relativePath,
-					taskId: record.taskId,
-					metadata,
-					fileSnapshotContent: proposedContent,
-				}),
-				...this.buildMetricEventsForAddedBlocks({
-					metricType: "accepted",
-					addedBlocks: blockAnalysis.acceptedBlocks,
-					timestamp,
-					workspaceName: context.workspaceName,
-					workspacePath: context.workspacePath,
-					filePath: context.filePath,
-					relativePath: context.relativePath,
-					taskId: record.taskId,
-					metadata,
-					fileSnapshotContent: record.newContent,
-				}),
-			]
-			await this.appendPendingMetricEvents(metricEvents)
 			return
 		}
 
-		if (blockAnalysis.generatedOnlyBlocks.length > 0) {
-			await this.appendPendingMetricEvents(
-				this.buildMetricEventsForAddedBlocks({
-					metricType: "generated",
-					addedBlocks: blockAnalysis.generatedOnlyBlocks,
-					timestamp,
-					workspaceName: context.workspaceName,
-					workspacePath: context.workspacePath,
-					filePath: context.filePath,
-					relativePath: context.relativePath,
-					taskId: record.taskId,
-					metadata,
-					fileSnapshotContent: proposedContent,
-				}),
-			)
-		}
+		// kilocode_change start
+		const settings = await this.getUploadSettings()
+		const metadata = await this.metadataResolver.resolve(context.workspacePath, context.filePath, settings)
+		// kilocode_change end
 
 		const existingPendingBlocks = await this.getPendingGeneratedBlocksForContext(
 			context.filePath,
@@ -527,6 +265,55 @@ export class AiCodeStatsService {
 		await this.commitAttributionService.refreshRepoTracking(repoRoot)
 	}
 
+	async recordRejectedAgentSuggestion(record: AgentFileWriteRecord): Promise<void> {
+		const context = await this.resolveFileContext(record.cwd, record.filePath, record.relativePath)
+		const blocks = this.extractor.extractAddedBlocks(
+			record.originalContent,
+			record.newContent,
+			context.relativePath,
+		)
+		if (blocks.length === 0) {
+			return
+		}
+
+		const settings = await this.getUploadSettings()
+		const metadata = await this.metadataResolver.resolve(context.workspacePath, context.filePath, settings)
+		const timestamp = Date.now()
+		const events = blocks
+			.filter((block) => block.codeSnippet.trim().length > 0)
+			.map(
+				(block): AiCodeStatsEvent => ({
+					eventId: crypto.randomUUID(),
+					timestamp,
+					semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
+					sourceType: "agent_insert",
+					ide: this.ide,
+					metricType: "generated",
+					userName: metadata.userName,
+					userEmail: metadata.userEmail,
+					organizationId: metadata.organizationId,
+					organizationName: metadata.organizationName,
+					sourceIp: metadata.sourceIp,
+					workspaceName: context.workspaceName,
+					workspacePath: context.workspacePath,
+					projectKey: metadata.projectKey,
+					filePath: context.filePath,
+					relativePath: context.relativePath,
+					language: metadata.language,
+					gitRemoteUrl: metadata.gitRemoteUrl,
+					gitBranch: metadata.gitBranch,
+					lineStart: block.lineStart,
+					lineEnd: block.lineEnd,
+					lineCount: block.lineCount,
+					codeSnippet: block.codeSnippet,
+					fileSnapshotContent: record.newContent,
+					taskId: record.taskId,
+				}),
+			)
+
+		await this.appendPendingMetricEvents(events)
+	}
+
 	private async resolveFileContext(
 		cwd: string,
 		filePath: string,
@@ -544,12 +331,6 @@ export class AiCodeStatsService {
 		}
 	}
 
-	private async appendPendingMetricEvents(events: AiCodeStatsEvent[]): Promise<void> {
-		for (const event of events) {
-			await this.store.appendEvent(event)
-		}
-	}
-
 	private analyzeAgentWriteBlocks(params: {
 		originalContent: string
 		proposedContent: string
@@ -563,9 +344,7 @@ export class AiCodeStatsService {
 		)
 		if (proposedGeneratedBlocks.length === 0) {
 			return {
-				proposedGeneratedBlocks: [],
 				acceptedBlocks: [],
-				generatedOnlyBlocks: [],
 			}
 		}
 
@@ -574,197 +353,9 @@ export class AiCodeStatsService {
 			params.finalAcceptedContent,
 			params.filePath,
 		)
-		const deletedProposalBlocks = this.extractor.extractDeletedBlocks(
-			params.proposedContent,
-			params.finalAcceptedContent,
-			params.filePath,
-		)
-		const generatedOnlyBlocks = this.extractGeneratedOnlyBlocks({
-			proposedGeneratedBlocks,
-			deletedProposalBlocks,
-		})
 
 		return {
-			proposedGeneratedBlocks,
 			acceptedBlocks,
-			generatedOnlyBlocks,
-		}
-	}
-
-	private extractGeneratedOnlyBlocks(params: {
-		proposedGeneratedBlocks: AiCodeAddedCodeBlock[]
-		deletedProposalBlocks: AiCodeAddedCodeBlock[]
-	}): AiCodeAddedCodeBlock[] {
-		const generatedOnlyBlocks: AiCodeAddedCodeBlock[] = []
-
-		for (const deletedBlock of params.deletedProposalBlocks) {
-			const deletedLines = splitBlockCodeLines(deletedBlock.codeSnippet, deletedBlock.lineCount)
-			for (const proposedBlock of params.proposedGeneratedBlocks) {
-				const overlapStart = Math.max(deletedBlock.lineStart, proposedBlock.lineStart)
-				const overlapEnd = Math.min(deletedBlock.lineEnd, proposedBlock.lineEnd)
-				if (overlapStart > overlapEnd) {
-					continue
-				}
-
-				const sliceStart = overlapStart - deletedBlock.lineStart
-				const sliceEnd = overlapEnd - deletedBlock.lineStart + 1
-				const overlapLines = deletedLines.slice(sliceStart, sliceEnd)
-				if (overlapLines.length === 0) {
-					continue
-				}
-
-				generatedOnlyBlocks.push({
-					lineStart: overlapStart,
-					lineEnd: overlapEnd,
-					lineCount: overlapLines.length,
-					codeSnippet: overlapLines.join("\n"),
-				})
-			}
-		}
-
-		return generatedOnlyBlocks.sort(
-			(left, right) => left.lineStart - right.lineStart || left.lineEnd - right.lineEnd,
-		)
-	}
-
-	private buildMetricEventsForAddedBlocks(params: {
-		metricType: "generated" | "accepted"
-		addedBlocks: AiCodeAddedCodeBlock[]
-		timestamp: number
-		workspaceName: string
-		workspacePath: string
-		filePath: string
-		relativePath: string
-		taskId?: string
-		metadata: Awaited<ReturnType<AiCodeStatsMetadataResolver["resolve"]>>
-		fileSnapshotContent: string
-	}): AiCodeStatsEvent[] {
-		if (params.addedBlocks.length === 0) {
-			return []
-		}
-
-		return this.buildMetricEventsForGeneratedBlocks({
-			metricTypes: [params.metricType],
-			blocks: params.addedBlocks.map((block) =>
-				this.createGeneratedMetricBlock({
-					generatedBlockId: crypto.randomUUID(),
-					timestamp: params.timestamp,
-					sourceType: "agent_insert",
-					workspaceName: params.workspaceName,
-					workspacePath: params.workspacePath,
-					filePath: params.filePath,
-					relativePath: params.relativePath,
-					taskId: params.taskId,
-					metadata: params.metadata,
-					fileSnapshotContent: params.fileSnapshotContent,
-					lineStart: block.lineStart,
-					lineEnd: block.lineEnd,
-					codeSnippet: block.codeSnippet,
-				}),
-			),
-		})
-	}
-
-	private buildMetricEventsForGeneratedBlocks(params: {
-		metricTypes: AiCodeMetricType[]
-		blocks: AiCodeGeneratedBlock[]
-	}): AiCodeStatsEvent[] {
-		const events: AiCodeStatsEvent[] = []
-
-		for (const block of params.blocks) {
-			if (!Number.isFinite(block.lineCount) || block.lineCount <= 0) {
-				continue
-			}
-
-			for (const metricType of params.metricTypes) {
-				events.push({
-					eventId: `${block.eventId}:${metricType}`,
-					generatedBlockId: block.generatedBlockId,
-					timestamp: block.timestamp,
-					semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
-					sourceType: block.sourceType,
-					ide: this.ide,
-					metricType,
-					userName: block.userName,
-					userEmail: block.userEmail,
-					organizationId: block.organizationId,
-					organizationName: block.organizationName,
-					sourceIp: block.sourceIp,
-					workspaceName: block.workspaceName,
-					workspacePath: block.workspacePath,
-					projectKey: block.projectKey,
-					filePath: block.filePath,
-					relativePath: block.relativePath,
-					language: block.language,
-					gitRemoteUrl: block.gitRemoteUrl,
-					gitBranch: block.gitBranch,
-					lineStart: block.lineStart,
-					lineEnd: block.lineEnd,
-					lineCount: block.lineCount,
-					codeSnippet: block.codeSnippet,
-					fileSnapshotContent: block.fileSnapshotContent,
-					taskId: block.taskId,
-					equivalentLineCount: block.lineCount,
-				})
-			}
-		}
-
-		return events
-	}
-
-	private async buildAutocompleteMetricEvent(
-		record: AutocompleteSuggestionRecord,
-		metricType: Exclude<AiCodeMetricType, "committed">,
-	): Promise<AiCodeStatsEvent | null> {
-		if (!record.suggestionText || record.document.uri.scheme !== "file") {
-			return null
-		}
-
-		const lineCount = countTextLines(record.suggestionText)
-		if (lineCount <= 0) {
-			return null
-		}
-
-		const filePath = normalizePath(path.resolve(record.document.uri.fsPath))
-		const workspaceFolder = vscode.workspace.getWorkspaceFolder(record.document.uri)
-		const workspacePath = normalizePath(workspaceFolder ? workspaceFolder.uri.fsPath : path.dirname(filePath))
-		const workspaceName = workspaceFolder?.name || path.basename(workspacePath)
-		const relativePath = normalizePath(
-			workspaceFolder ? path.relative(workspacePath, filePath) : path.basename(filePath),
-		)
-		const settings = await this.getUploadSettings()
-		const metadata = await this.metadataResolver.resolve(workspacePath, filePath, settings)
-		const normalizedSnippet = normalizeContentLines(record.suggestionText).join("\n")
-		const lineStart = record.position.line + 1
-		const lineEnd = lineStart + lineCount - 1
-
-		return {
-			eventId: `${record.suggestionId}:${metricType}`,
-			generatedBlockId: record.suggestionId,
-			timestamp: record.timestamp ?? Date.now(),
-			semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
-			sourceType: "autocomplete",
-			ide: this.ide,
-			metricType,
-			userName: metadata.userName,
-			userEmail: metadata.userEmail,
-			organizationId: metadata.organizationId,
-			organizationName: metadata.organizationName,
-			sourceIp: metadata.sourceIp,
-			workspaceName,
-			workspacePath,
-			projectKey: metadata.projectKey,
-			filePath,
-			relativePath,
-			language: metadata.language,
-			gitRemoteUrl: metadata.gitRemoteUrl,
-			gitBranch: metadata.gitBranch,
-			lineStart,
-			lineEnd,
-			lineCount,
-			codeSnippet: normalizedSnippet,
-			fileSnapshotContent: undefined,
-			equivalentLineCount: lineCount,
 		}
 	}
 
@@ -777,7 +368,6 @@ export class AiCodeStatsService {
 		return lines.map((line, index) => {
 			const lineNumber = block.lineStart + index
 			const occurrenceIndex = lineOccurrenceIndexes[lineNumber - 1] ?? index + 1
-			const lineFeatures = extractLineFeatures(line)
 			return {
 				id: crypto.randomUUID(),
 				generatedEventId: block.generatedBlockId,
@@ -801,19 +391,16 @@ export class AiCodeStatsService {
 				gitRemoteUrl: block.gitRemoteUrl,
 				gitBranch: block.gitBranch,
 				taskId: block.taskId,
-				rawLine: lineFeatures.rawLine,
+				rawLine: line,
 				blockLineIndex: index + 1,
 				blockLineCount: lines.length,
 				lineHash: hashLineFingerprint(line),
 				occurrenceIndex,
-				normalizedLine: lineFeatures.normalizedLine,
-				normalizedTokenLine: lineFeatures.normalizedTokenLine,
-				rareIdentifiers: lineFeatures.rareIdentifiers,
 			}
 		})
 	}
 
-	private async handleCommitMatched(payload: AiCodeCommitMatchedPayload): Promise<void> {
+	private async handleCommitCollected(payload: AiCodeCommitFactsPayload): Promise<void> {
 		const normalizeCommitFilePath = (value: string): string =>
 			path.isAbsolute(value) ? normalizePath(path.relative(payload.repoRoot, value)) : normalizePath(value)
 		const changedPathSet = new Set(
@@ -832,15 +419,11 @@ export class AiCodeStatsService {
 				return repoRelativePath && changedPathSet.has(repoRelativePath)
 			},
 		)
-		if (
-			pendingGeneratedBlocks.length === 0 &&
-			payload.committedBlocks.length === 0 &&
-			payload.changedFiles.length === 0
-		) {
+		if (pendingGeneratedBlocks.length === 0 && payload.changedFiles.length === 0) {
 			return
 		}
 
-		const referenceBlock = pendingGeneratedBlocks[0] ?? payload.committedBlocks[0]
+		const referenceBlock = pendingGeneratedBlocks[0]
 		if (!referenceBlock) {
 			return
 		}
@@ -849,10 +432,13 @@ export class AiCodeStatsService {
 			commitOccurredAt: payload.commitOccurredAt,
 		})
 		const reportAcceptedBlocks = reportBaselineBlocks.acceptedBlocks
-		const committedBlocks = this.normalizeCommittedBlocksForTrailingBlankLines(
-			payload.committedBlocks,
-			reportAcceptedBlocks,
-		)
+		const candidateLines = await this.buildCommitReportCandidateLines({
+			repoRoot: payload.repoRoot,
+			changedPathSet,
+			pendingGeneratedBlocks,
+			acceptedBlocks: reportAcceptedBlocks,
+			generatedBlocks: reportBaselineBlocks.generatedBlocks,
+		})
 
 		const reportGeneratedAt = Date.now()
 		const report: AiCodeCommitReport = {
@@ -860,6 +446,7 @@ export class AiCodeStatsService {
 			source: "kilocode-ai-code-stats",
 			mode: "commit_report",
 			semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
+			attributionInputVersion: 1,
 			reportId: crypto.randomUUID(),
 			reportGeneratedAt,
 			client: this.buildUploadClient(),
@@ -874,7 +461,6 @@ export class AiCodeStatsService {
 			commitOccurredAt: payload.commitOccurredAt,
 			generatedBlocks: reportBaselineBlocks.generatedBlocks,
 			acceptedBlocks: reportAcceptedBlocks,
-			committedBlocks,
 			changedFiles: payload.changedFiles.map((file) => ({
 				...file,
 				filePath: normalizePath(file.filePath),
@@ -887,16 +473,110 @@ export class AiCodeStatsService {
 					codeSnippet: block.codeSnippet,
 					displayOrder: block.displayOrder,
 				})),
+				addedLines: (file.addedLines || []).map((line) => ({
+					addedIndex: line.addedIndex,
+					lineNumber: line.lineNumber,
+					content: line.content,
+					lineHash: line.lineHash,
+				})),
 			})),
+			candidateLines,
 		}
 
 		await this.store.queueCommitReport({
 			report,
 			createdAt: reportGeneratedAt,
 			generatedBlockIds: pendingGeneratedBlocks.map((block) => block.generatedBlockId),
-			matchedPendingLineIds: payload.matchedPendingLineIds,
 		})
 		await this.requestCommitTriggeredUpload()
+	}
+
+	private async buildCommitReportCandidateLines(params: {
+		repoRoot: string
+		changedPathSet: Set<string>
+		pendingGeneratedBlocks: AiCodeGeneratedBlockState[]
+		acceptedBlocks: AiCodeGeneratedBlock[]
+		generatedBlocks: AiCodeGeneratedBlock[]
+	}): Promise<AiCodeCommitCandidateLine[]> {
+		const pendingBlockIds = new Set(params.pendingGeneratedBlocks.map((block) => block.generatedBlockId))
+		if (pendingBlockIds.size === 0) {
+			return []
+		}
+
+		const baselineMetricType = params.acceptedBlocks.length > 0 ? "accepted" : "generated"
+		const baselineBlocks = baselineMetricType === "accepted" ? params.acceptedBlocks : params.generatedBlocks
+		const baselineEventIdsByBlockId = new Map<string, string>()
+		for (const block of baselineBlocks) {
+			const generatedBlockId = normalizeGeneratedBlockId(block.generatedBlockId)
+			if (generatedBlockId && !baselineEventIdsByBlockId.has(generatedBlockId)) {
+				baselineEventIdsByBlockId.set(generatedBlockId, block.eventId)
+			}
+		}
+
+		const lineStartsByBlockId = new Map<string, number>()
+		for (const block of params.pendingGeneratedBlocks) {
+			const generatedBlockId = normalizeGeneratedBlockId(block.generatedBlockId)
+			if (generatedBlockId && !lineStartsByBlockId.has(generatedBlockId)) {
+				lineStartsByBlockId.set(generatedBlockId, block.currentLineStart ?? block.lineStart)
+			}
+		}
+
+		const pendingLines = await this.store.getPendingLineAttributions(params.repoRoot)
+		const candidateLines: AiCodeCommitCandidateLine[] = []
+		for (const pendingLine of pendingLines) {
+			const generatedBlockId = normalizeGeneratedBlockId(pendingLine.generatedEventId || pendingLine.blockId)
+			if (!generatedBlockId || !pendingBlockIds.has(generatedBlockId)) {
+				continue
+			}
+			const repoRelativePath = normalizePath(pendingLine.repoRelativePath || pendingLine.relativePath || "")
+			if (params.changedPathSet.size > 0 && (!repoRelativePath || !params.changedPathSet.has(repoRelativePath))) {
+				continue
+			}
+
+			const lineStart = lineStartsByBlockId.get(generatedBlockId)
+			const lineNumber =
+				typeof lineStart === "number" ? lineStart + pendingLine.blockLineIndex - 1 : pendingLine.blockLineIndex
+			candidateLines.push({
+				clientLineId: `${pendingLine.id}:${pendingLine.lineHash}`,
+				generatedBlockId,
+				baselineEventId:
+					baselineEventIdsByBlockId.get(generatedBlockId) ?? `${generatedBlockId}:${baselineMetricType}`,
+				baselineMetricType,
+				sourceTimestamp: pendingLine.timestamp,
+				sourceType: pendingLine.sourceType,
+				ide: pendingLine.ide,
+				userName: pendingLine.userName,
+				userEmail: pendingLine.userEmail,
+				organizationId: pendingLine.organizationId,
+				organizationName: pendingLine.organizationName,
+				sourceIp: pendingLine.sourceIp,
+				workspaceName: pendingLine.workspaceName,
+				workspacePath: pendingLine.workspacePath,
+				projectKey: pendingLine.projectKey,
+				filePath: normalizePath(pendingLine.filePath),
+				relativePath: normalizePath(pendingLine.relativePath),
+				repoRoot: normalizePath(pendingLine.repoRoot || params.repoRoot),
+				repoRelativePath,
+				language: pendingLine.language,
+				gitRemoteUrl: pendingLine.gitRemoteUrl,
+				gitBranch: pendingLine.gitBranch,
+				taskId: pendingLine.taskId,
+				lineNumber,
+				rawLine: pendingLine.rawLine,
+				blockLineIndex: pendingLine.blockLineIndex,
+				blockLineCount: pendingLine.blockLineCount,
+				lineHash: pendingLine.lineHash,
+				occurrenceIndex: pendingLine.occurrenceIndex,
+			})
+		}
+
+		return candidateLines.sort(
+			(left, right) =>
+				left.repoRelativePath.localeCompare(right.repoRelativePath) ||
+				left.generatedBlockId.localeCompare(right.generatedBlockId) ||
+				left.blockLineIndex - right.blockLineIndex ||
+				left.clientLineId.localeCompare(right.clientLineId),
+		)
 	}
 
 	private async buildCommitReportBaselineBlocks(params: {
@@ -993,74 +673,6 @@ export class AiCodeStatsService {
 			left.timestamp - right.timestamp ||
 			left.eventId.localeCompare(right.eventId)
 		)
-	}
-
-	private normalizeCommittedBlocksForTrailingBlankLines(
-		committedBlocks: AiCodeCommitMatchedPayload["committedBlocks"],
-		acceptedBlocks: AiCodeGeneratedBlock[],
-	): AiCodeCommittedBlock[] {
-		if (committedBlocks.length === 0 || acceptedBlocks.length === 0) {
-			return committedBlocks.map((block) => ({ ...block }))
-		}
-
-		const acceptedBlocksById = new Map<string, AiCodeGeneratedBlock>()
-		for (const acceptedBlock of acceptedBlocks) {
-			const generatedBlockId = normalizeGeneratedBlockId(acceptedBlock.generatedBlockId)
-			if (!generatedBlockId || acceptedBlocksById.has(generatedBlockId)) {
-				continue
-			}
-			acceptedBlocksById.set(generatedBlockId, acceptedBlock)
-		}
-
-		return committedBlocks.map((committedBlock) => {
-			const normalizedGeneratedBlockId = normalizeGeneratedBlockId(committedBlock.generatedBlockId)
-			const acceptedBlock =
-				committedBlock.matchStrategy === "exact" && normalizedGeneratedBlockId
-					? acceptedBlocksById.get(normalizedGeneratedBlockId)
-					: undefined
-			return this.normalizeCommittedBlockTrailingBlankLines(committedBlock, acceptedBlock)
-		})
-	}
-
-	private normalizeCommittedBlockTrailingBlankLines(
-		committedBlock: AiCodeCommittedBlock,
-		acceptedBlock?: AiCodeGeneratedBlock,
-	): AiCodeCommittedBlock {
-		if (
-			!acceptedBlock ||
-			committedBlock.matchStrategy !== "exact" ||
-			acceptedBlock.lineCount <= committedBlock.lineCount
-		) {
-			return { ...committedBlock }
-		}
-
-		const committedLines = splitBlockCodeLines(committedBlock.codeSnippet, committedBlock.lineCount)
-		const acceptedLines = splitBlockCodeLines(acceptedBlock.codeSnippet, acceptedBlock.lineCount)
-		const trimmedCommittedLines = trimTrailingBlankLines(committedLines)
-		const trimmedAcceptedLines = trimTrailingBlankLines(acceptedLines)
-
-		if (trimmedCommittedLines.length !== trimmedAcceptedLines.length) {
-			return { ...committedBlock }
-		}
-		for (let index = 0; index < trimmedCommittedLines.length; index += 1) {
-			if (trimmedCommittedLines[index] !== trimmedAcceptedLines[index]) {
-				return { ...committedBlock }
-			}
-		}
-
-		const committedTrailingBlankLines = committedLines.length - trimmedCommittedLines.length
-		const acceptedTrailingBlankLines = acceptedLines.length - trimmedAcceptedLines.length
-		if (acceptedTrailingBlankLines <= committedTrailingBlankLines) {
-			return { ...committedBlock }
-		}
-
-		return {
-			...committedBlock,
-			lineEnd: acceptedBlock.lineEnd,
-			lineCount: acceptedBlock.lineCount,
-			codeSnippet: acceptedBlock.codeSnippet,
-			equivalentLineCount: acceptedBlock.lineCount,
-		}
 	}
 
 	private async getPendingGeneratedBlocksForContext(
@@ -1536,6 +1148,12 @@ export class AiCodeStatsService {
 		return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative)
 	}
 
+	private async appendPendingMetricEvents(events: AiCodeStatsEvent[]): Promise<void> {
+		for (const event of events) {
+			await this.store.appendEvent(event)
+		}
+	}
+
 	private async requestCommitTriggeredUpload(): Promise<void> {
 		if (this.isUploading) {
 			this.uploadRequestedWhileRunning = true
@@ -1553,7 +1171,7 @@ export class AiCodeStatsService {
 		}
 	}
 
-	private async performIncrementalUpload(trigger: "commit" | "manual"): Promise<void> {
+	private async performIncrementalUpload(trigger: "commit"): Promise<void> {
 		try {
 			await this.store.pruneOldData(AI_CODE_STATS_RETENTION_DAYS)
 			const settings = await this.getUploadSettings()
@@ -1561,12 +1179,8 @@ export class AiCodeStatsService {
 				return
 			}
 
-			const reportUploadResult = await this.uploader.uploadQueuedReports(settings, {
-				client: this.buildUploadClient(),
-			})
-			const eventUploadResult = await this.uploader.upload(settings, {
-				client: this.buildUploadClient(),
-			})
+			const reportUploadResult = await this.uploader.uploadQueuedReports(settings)
+			const eventUploadResult = await this.uploader.upload(settings, { client: this.buildUploadClient() })
 
 			const lastUpload: AiCodeStatsLastUpload = {
 				status: "success",
@@ -1587,16 +1201,6 @@ export class AiCodeStatsService {
 			}
 			await this.store.setLastUploadStatus(lastUpload)
 		}
-	}
-
-	private scheduleQueuedCommitUpload(): void {
-		if (!this.uploadRequestedWhileRunning || this.isUploading) {
-			return
-		}
-
-		void this.requestCommitTriggeredUpload().catch((error) => {
-			console.error("[AiCodeStats] Failed to upload pending commit-triggered events:", error)
-		})
 	}
 
 	private buildUploadClient() {
