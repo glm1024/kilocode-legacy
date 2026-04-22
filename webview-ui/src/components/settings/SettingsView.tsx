@@ -88,7 +88,13 @@ import { SlashCommandsSettings } from "./SlashCommandsSettings"
 import { UISettings } from "./UISettings"
 import AgentBehaviourView from "../kilocode/settings/AgentBehaviourView" // kilocode_change - new combined view
 // kilocode_change start
-import { StatisticsSettings } from "./StatisticsSettings"
+import {
+	StatisticsSettings,
+	type StatisticsIdentityValidationField,
+	getStatisticsIdentityValidationKey,
+	getStatisticsTeamOptions,
+	normalizeStatisticsEmail,
+} from "./StatisticsSettings"
 // kilocode_change end
 // import ModesView from "../modes/ModesView" // kilocode_change - now used inside AgentBehaviourView
 // import McpView from "../mcp/McpView" // kilocode_change: own view
@@ -98,6 +104,17 @@ import { useSearchIndexRegistry, SearchIndexProvider } from "./useSettingsSearch
 export const settingsTabsContainer = "flex flex-1 overflow-hidden [&.narrow_.tab-label]:hidden"
 export const settingsTabList =
 	"w-48 data-[compact=true]:w-12 flex-shrink-0 flex flex-col overflow-y-auto overflow-x-hidden border-r border-vscode-sideBar-background"
+
+// kilocode_change start
+const statisticsIdentityValidationFieldByKey: Record<string, StatisticsIdentityValidationField> = {
+	"settings:statistics.validation.departmentRequired": "department",
+	"settings:statistics.validation.officeRequired": "office",
+	"settings:statistics.validation.teamRequired": "team",
+	"settings:statistics.validation.nameRequired": "userName",
+	"settings:statistics.validation.emailRequired": "userEmail",
+	"settings:statistics.validation.emailInvalid": "userEmail",
+}
+// kilocode_change end
 export const settingsTabTrigger =
 	"whitespace-nowrap overflow-hidden min-w-0 h-12 px-4 py-3 box-border flex items-center border-l-2 border-transparent text-vscode-foreground opacity-70 hover:bg-vscode-list-hoverBackground data-[compact=true]:w-12 data-[compact=true]:p-4 cursor-pointer" // kilocode_change add cursor-pointer
 export const settingsTabTriggerActive =
@@ -208,11 +225,23 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 	// kilocode_change start
 	const pendingSavedStatisticsStateRef = useRef<{
 		aiCodeStatsWebhookUrl: string
+		aiCodeStatsDepartmentName: string
+		aiCodeStatsOfficeName: string
+		aiCodeStatsTeamName: string
 		aiCodeStatsUserName: string
+		aiCodeStatsUserEmail: string
 	} | null>(null)
 	// kilocode_change end
 
 	const [cachedState, setCachedState] = useState(() => extensionState)
+	// kilocode_change start
+	const [aiCodeStatsIdentityValidationError, setAiCodeStatsIdentityValidationError] = useState<string | undefined>(
+		undefined,
+	)
+	const [aiCodeStatsIdentityValidationErrorField, setAiCodeStatsIdentityValidationErrorField] = useState<
+		StatisticsIdentityValidationField | undefined
+	>(undefined)
+	// kilocode_change end
 
 	// kilocode_change begin
 	useEffect(() => {
@@ -296,7 +325,11 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 		followupAutoApproveTimeoutMs,
 		ghostServiceSettings, // kilocode_change
 		aiCodeStatsWebhookUrl, // kilocode_change
+		aiCodeStatsDepartmentName, // kilocode_change
+		aiCodeStatsOfficeName, // kilocode_change
+		aiCodeStatsTeamName, // kilocode_change
 		aiCodeStatsUserName, // kilocode_change
+		aiCodeStatsUserEmail, // kilocode_change
 		// kilocode_change start - Auto-purge settings
 		autoPurgeEnabled,
 		autoPurgeDefaultRetentionDays,
@@ -403,7 +436,11 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 			const extensionStateMatchesPendingSavedStatistics =
 				hasPendingSavedStatisticsState &&
 				extensionState.aiCodeStatsWebhookUrl === pendingSavedStatisticsState.aiCodeStatsWebhookUrl &&
-				extensionState.aiCodeStatsUserName === pendingSavedStatisticsState.aiCodeStatsUserName
+				extensionState.aiCodeStatsDepartmentName === pendingSavedStatisticsState.aiCodeStatsDepartmentName &&
+				extensionState.aiCodeStatsOfficeName === pendingSavedStatisticsState.aiCodeStatsOfficeName &&
+				extensionState.aiCodeStatsTeamName === pendingSavedStatisticsState.aiCodeStatsTeamName &&
+				extensionState.aiCodeStatsUserName === pendingSavedStatisticsState.aiCodeStatsUserName &&
+				extensionState.aiCodeStatsUserEmail === pendingSavedStatisticsState.aiCodeStatsUserEmail
 			if (extensionStateMatchesPendingSavedStatistics) {
 				pendingSavedStatisticsStateRef.current = null
 			}
@@ -466,6 +503,16 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 
 		if (field === "aiCodeStatsWebhookUrl") {
 			setAiCodeStatsWebhookValidationError(undefined)
+		}
+		if (
+			field === "aiCodeStatsDepartmentName" ||
+			field === "aiCodeStatsOfficeName" ||
+			field === "aiCodeStatsTeamName" ||
+			field === "aiCodeStatsUserName" ||
+			field === "aiCodeStatsUserEmail"
+		) {
+			setAiCodeStatsIdentityValidationError(undefined)
+			setAiCodeStatsIdentityValidationErrorField(undefined)
 		}
 	}, [])
 
@@ -701,18 +748,53 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 			try {
 				const trimmedWebhookUrl = (aiCodeStatsWebhookUrl ?? "").trim()
 				const normalizedWebhookUrl = normalizeAiCodeStatsWebhookUrl(trimmedWebhookUrl)
+				const normalizedDepartmentName = (aiCodeStatsDepartmentName ?? "").trim()
+				const normalizedOfficeName = (aiCodeStatsOfficeName ?? "").trim()
+				const selectedTeamOptions = getStatisticsTeamOptions(normalizedDepartmentName, normalizedOfficeName)
+				const normalizedTeamName =
+					selectedTeamOptions.length > 0 && selectedTeamOptions.includes((aiCodeStatsTeamName ?? "").trim())
+						? (aiCodeStatsTeamName ?? "").trim()
+						: ""
 				const normalizedUserName = (aiCodeStatsUserName ?? "").trim()
+				const normalizedUserEmail = normalizeStatisticsEmail(aiCodeStatsUserEmail)
 				const originalWebhookUrl = (extensionState.aiCodeStatsWebhookUrl ?? "").trim()
 				const shouldTestWebhook = normalizedWebhookUrl.length > 0 && trimmedWebhookUrl !== originalWebhookUrl
+				const shouldValidateStatistics = activeTab === "statistics"
+				const identityValidationKey = shouldValidateStatistics
+					? getStatisticsIdentityValidationKey({
+							departmentName: normalizedDepartmentName,
+							officeName: normalizedOfficeName,
+							teamName: normalizedTeamName,
+							userName: normalizedUserName,
+							userEmail: normalizedUserEmail,
+						})
+					: undefined
 
-				if (shouldTestWebhook) {
-					const testResult = await testAiCodeStatsWebhook(normalizedWebhookUrl)
-					if (!testResult.success) {
-						setAiCodeStatsWebhookValidationError(testResult.message)
+				if (identityValidationKey) {
+					setAiCodeStatsIdentityValidationError(t(identityValidationKey))
+					setAiCodeStatsIdentityValidationErrorField(
+						statisticsIdentityValidationFieldByKey[identityValidationKey] ?? "userEmail",
+					)
+					return
+				}
+
+				if (shouldValidateStatistics) {
+					if (!normalizedWebhookUrl) {
+						setAiCodeStatsWebhookValidationError(t("settings:statistics.webhook.test.required"))
 						return
+					}
+
+					if (shouldTestWebhook) {
+						const testResult = await testAiCodeStatsWebhook(normalizedWebhookUrl)
+						if (!testResult.success) {
+							setAiCodeStatsWebhookValidationError(testResult.message)
+							return
+						}
 					}
 				}
 				setAiCodeStatsWebhookValidationError(undefined)
+				setAiCodeStatsIdentityValidationError(undefined)
+				setAiCodeStatsIdentityValidationErrorField(undefined)
 				// kilocode_change end
 
 				vscode.postMessage({
@@ -792,7 +874,11 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 						experiments,
 						customSupportPrompts,
 						aiCodeStatsWebhookUrl: trimmedWebhookUrl, // kilocode_change
+						aiCodeStatsDepartmentName: normalizedDepartmentName, // kilocode_change
+						aiCodeStatsOfficeName: normalizedOfficeName, // kilocode_change
+						aiCodeStatsTeamName: normalizedTeamName, // kilocode_change
 						aiCodeStatsUserName: normalizedUserName, // kilocode_change
+						aiCodeStatsUserEmail: normalizedUserEmail, // kilocode_change
 					},
 				})
 				vscode.postMessage({ type: "ttsEnabled", bool: ttsEnabled })
@@ -838,15 +924,27 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 
 				// kilocode_change start
 				extensionState.setAiCodeStatsWebhookUrl?.(trimmedWebhookUrl)
+				extensionState.setAiCodeStatsDepartmentName?.(normalizedDepartmentName)
+				extensionState.setAiCodeStatsOfficeName?.(normalizedOfficeName)
+				extensionState.setAiCodeStatsTeamName?.(normalizedTeamName)
 				extensionState.setAiCodeStatsUserName?.(normalizedUserName)
+				extensionState.setAiCodeStatsUserEmail?.(normalizedUserEmail)
 				pendingSavedStatisticsStateRef.current = {
 					aiCodeStatsWebhookUrl: trimmedWebhookUrl,
+					aiCodeStatsDepartmentName: normalizedDepartmentName,
+					aiCodeStatsOfficeName: normalizedOfficeName,
+					aiCodeStatsTeamName: normalizedTeamName,
 					aiCodeStatsUserName: normalizedUserName,
+					aiCodeStatsUserEmail: normalizedUserEmail,
 				}
 				setCachedState((prevState) => ({
 					...prevState,
 					aiCodeStatsWebhookUrl: trimmedWebhookUrl,
+					aiCodeStatsDepartmentName: normalizedDepartmentName,
+					aiCodeStatsOfficeName: normalizedOfficeName,
+					aiCodeStatsTeamName: normalizedTeamName,
 					aiCodeStatsUserName: normalizedUserName,
+					aiCodeStatsUserEmail: normalizedUserEmail,
 				}))
 				// kilocode_change end
 				setChangeDetected(false)
@@ -1385,9 +1483,15 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 						{activeTab === "statistics" && (
 							<StatisticsSettings
 								aiCodeStatsWebhookUrl={aiCodeStatsWebhookUrl}
+								aiCodeStatsDepartmentName={aiCodeStatsDepartmentName}
+								aiCodeStatsOfficeName={aiCodeStatsOfficeName}
+								aiCodeStatsTeamName={aiCodeStatsTeamName}
 								aiCodeStatsUserName={aiCodeStatsUserName}
+								aiCodeStatsUserEmail={aiCodeStatsUserEmail}
 								setCachedStateField={setCachedStateField}
 								webhookValidationError={aiCodeStatsWebhookValidationError}
+								identityValidationError={aiCodeStatsIdentityValidationError}
+								identityValidationErrorField={aiCodeStatsIdentityValidationErrorField}
 							/>
 						)}
 						{/* kilocode_change end */}

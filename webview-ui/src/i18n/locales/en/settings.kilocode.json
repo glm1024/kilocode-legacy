@@ -1,8 +1,12 @@
 {
 	"statistics": {
 		"userName": {
-			"label": "Username",
+			"label": "Name",
 			"placeholder": "e.g. Alice Zhang"
+		},
+		"userEmail": {
+			"label": "Company Email",
+			"placeholder": "e.g. alice.zhang@example.com"
 		}
 	}
 }

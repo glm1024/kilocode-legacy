@@ -5,13 +5,14 @@ import * as path from "path"
 import { promisify } from "util"
 import * as vscode from "vscode"
 
-import { Package } from "../../shared/package"
 import { getKiloCodeWrapperProperties } from "../../core/kilocode/wrapper"
 import { AiCodeCommitAttributionService, type AiCodeCommitFactsPayload } from "./AiCodeCommitAttributionService"
+import { AI_CODING_CLIENT_VERSION } from "./AiCodingClientVersion"
 import { AiCodeDiffExtractor } from "./AiCodeDiffExtractor"
 import { hashLineFingerprint } from "./AiCodeLineFingerprint"
 // kilocode_change start
 import { AiCodeStatsMetadataResolver } from "./AiCodeStatsMetadataResolver"
+import { AiTokenUsageService } from "../ai-token-usage/AiTokenUsageService"
 // kilocode_change end
 import { AiCodeStatsStore } from "./AiCodeStatsStore"
 import { AiCodeStatsUploader } from "./AiCodeStatsUploader"
@@ -34,11 +35,6 @@ import {
 
 const execAsync = promisify(execCallback)
 const EXEC_MAX_BUFFER_BYTES = 4 * 1024 * 1024
-
-const toRelativePath = (workspacePath: string, filePath: string): string => {
-	const relative = path.relative(workspacePath, filePath)
-	return normalizePath(relative || path.basename(filePath))
-}
 
 const normalizeContentLines = (content: string): string[] => {
 	const normalized = content.replace(/\r\n/g, "\n")
@@ -80,9 +76,36 @@ interface AgentWriteBlockAnalysis {
 	acceptedBlocks: AiCodeAddedCodeBlock[]
 }
 
+const JETBRAINS_IDE_BY_WRAPPER_CODE: Record<string, AiCodeIde> = {
+	AC: "appcode",
+	IC: "idea",
+	IU: "idea",
+	AS: "android-studio",
+	AI: "android-studio",
+	WS: "webstorm",
+	PS: "phpstorm",
+	PY: "pycharm",
+	PC: "pycharm",
+	GO: "goland",
+	CL: "clion",
+	RD: "rider",
+	RM: "rubymine",
+	DB: "datagrip",
+	DS: "dataspell",
+	JB: "jetbrains",
+}
+
+const resolveJetBrainsIde = (wrapperCode: string | null | undefined): AiCodeIde => {
+	const normalizedCode = typeof wrapperCode === "string" ? wrapperCode.trim().toUpperCase() : ""
+	return JETBRAINS_IDE_BY_WRAPPER_CODE[normalizedCode] ?? "jetbrains"
+}
+
 const detectIde = (): AiCodeIde => {
 	const wrapper = getKiloCodeWrapperProperties()
-	return wrapper.kiloCodeWrapped && wrapper.kiloCodeWrapperJetbrains ? "jetbrains" : "vscode"
+	if (!wrapper.kiloCodeWrapped || !wrapper.kiloCodeWrapperJetbrains) {
+		return "vscode"
+	}
+	return resolveJetBrainsIde(wrapper.kiloCodeWrapperCode)
 }
 
 const resolveRealPath = async (targetPath: string): Promise<string> => {
@@ -127,9 +150,9 @@ export interface AgentFileWriteRecord {
 
 interface ResolvedFileContext {
 	filePath: string
-	workspacePath: string
-	workspaceName: string
 	relativePath: string
+	repoRoot: string
+	repoRelativePath: string
 }
 
 export class AiCodeStatsService {
@@ -195,32 +218,30 @@ export class AiCodeStatsService {
 
 	async recordAgentFileWrite(record: AgentFileWriteRecord): Promise<void> {
 		const context = await this.resolveFileContext(record.cwd, record.filePath, record.relativePath)
+		if (!context) {
+			return
+		}
 		const proposedContent = record.proposedContent ?? record.newContent
 
 		const blockAnalysis = this.analyzeAgentWriteBlocks({
 			originalContent: record.originalContent,
 			proposedContent,
 			finalAcceptedContent: record.newContent,
-			filePath: context.relativePath,
+			filePath: context.repoRelativePath,
 		})
 		if (blockAnalysis.acceptedBlocks.length === 0) {
 			return
 		}
 		const timestamp = Date.now()
 
-		const repoRoot = await resolveGitRepositoryRoot(path.dirname(context.filePath))
-		const repoRelativePath =
-			repoRoot && this.isPathInsideRepo(repoRoot, context.filePath)
-				? normalizePath(path.relative(repoRoot, context.filePath))
-				: undefined
-
-		if (!repoRoot || !repoRelativePath) {
-			return
-		}
-
 		// kilocode_change start
 		const settings = await this.getUploadSettings()
-		const metadata = await this.metadataResolver.resolve(context.workspacePath, context.filePath, settings)
+		const metadata = await this.metadataResolver.resolve(context.repoRoot, context.filePath, settings)
+		try {
+			await AiTokenUsageService.getInstance()?.trackRepositoryForCommitUpload(context.repoRoot)
+		} catch (error) {
+			console.error("[AiCodeStats] Failed to track token usage commit trigger repository:", error)
+		}
 		// kilocode_change end
 
 		const existingPendingBlocks = await this.getPendingGeneratedBlocksForContext(
@@ -231,7 +252,7 @@ export class AiCodeStatsService {
 		const patchHunks = this.extractor.extractPatchHunks(
 			record.originalContent,
 			record.newContent,
-			context.relativePath,
+			context.repoRelativePath,
 		)
 		const nextBlocks = this.buildGeneratedBlocksForSnapshot({
 			existingPendingBlocks,
@@ -239,12 +260,9 @@ export class AiCodeStatsService {
 			patchHunks,
 			timestamp,
 			finalContent: record.newContent,
-			repoRoot,
-			repoRelativePath,
-			workspaceName: context.workspaceName,
-			workspacePath: context.workspacePath,
+			repoRoot: context.repoRoot,
+			repoRelativePath: context.repoRelativePath,
 			filePath: context.filePath,
-			relativePath: context.relativePath,
 			taskId: record.taskId,
 			metadata,
 		})
@@ -262,22 +280,25 @@ export class AiCodeStatsService {
 			nextBlocks: nextBlocks.nextBlocks,
 			nextPendingLines: pendingLineAttributions,
 		})
-		await this.commitAttributionService.refreshRepoTracking(repoRoot)
+		await this.commitAttributionService.refreshRepoTracking(context.repoRoot)
 	}
 
 	async recordRejectedAgentSuggestion(record: AgentFileWriteRecord): Promise<void> {
 		const context = await this.resolveFileContext(record.cwd, record.filePath, record.relativePath)
+		if (!context) {
+			return
+		}
 		const blocks = this.extractor.extractAddedBlocks(
 			record.originalContent,
 			record.newContent,
-			context.relativePath,
+			context.repoRelativePath,
 		)
 		if (blocks.length === 0) {
 			return
 		}
 
 		const settings = await this.getUploadSettings()
-		const metadata = await this.metadataResolver.resolve(context.workspacePath, context.filePath, settings)
+		const metadata = await this.metadataResolver.resolve(context.repoRoot, context.filePath, settings)
 		const timestamp = Date.now()
 		const events = blocks
 			.filter((block) => block.codeSnippet.trim().length > 0)
@@ -290,15 +311,19 @@ export class AiCodeStatsService {
 					ide: this.ide,
 					metricType: "generated",
 					userName: metadata.userName,
+					departmentName: metadata.departmentName,
+					officeName: metadata.officeName,
+					teamName: metadata.teamName,
 					userEmail: metadata.userEmail,
 					organizationId: metadata.organizationId,
 					organizationName: metadata.organizationName,
 					sourceIp: metadata.sourceIp,
-					workspaceName: context.workspaceName,
-					workspacePath: context.workspacePath,
 					projectKey: metadata.projectKey,
+					projectName: metadata.projectName,
+					repoRoot: context.repoRoot,
+					repoRelativePath: context.repoRelativePath,
 					filePath: context.filePath,
-					relativePath: context.relativePath,
+					relativePath: context.repoRelativePath,
 					language: metadata.language,
 					gitRemoteUrl: metadata.gitRemoteUrl,
 					gitBranch: metadata.gitBranch,
@@ -317,17 +342,21 @@ export class AiCodeStatsService {
 	private async resolveFileContext(
 		cwd: string,
 		filePath: string,
-		relativePath?: string,
-	): Promise<ResolvedFileContext> {
+		_relativePath?: string,
+	): Promise<ResolvedFileContext | undefined> {
 		const resolvedInputPath = path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath)
 		const resolvedFilePath = await resolveFilePathFromParent(resolvedInputPath)
-		const workspacePath = await resolveRealPath(cwd)
-		const workspaceName = path.basename(workspacePath)
+		const repoRoot =
+			(await resolveGitRepositoryRoot(path.dirname(resolvedFilePath))) ?? (await resolveGitRepositoryRoot(cwd))
+		if (!repoRoot || !this.isPathInsideRepo(repoRoot, resolvedFilePath)) {
+			return undefined
+		}
+		const repoRelativePath = normalizePath(path.relative(repoRoot, resolvedFilePath))
 		return {
 			filePath: resolvedFilePath,
-			workspacePath,
-			workspaceName,
-			relativePath: normalizePath(relativePath ? relativePath : toRelativePath(workspacePath, resolvedFilePath)),
+			relativePath: repoRelativePath,
+			repoRoot,
+			repoRelativePath,
 		}
 	}
 
@@ -376,16 +405,18 @@ export class AiCodeStatsService {
 				sourceType: block.sourceType,
 				ide: block.ide,
 				userName: block.userName,
+				departmentName: block.departmentName,
+				officeName: block.officeName,
+				teamName: block.teamName,
 				userEmail: block.userEmail,
 				organizationId: block.organizationId,
 				organizationName: block.organizationName,
 				sourceIp: block.sourceIp,
-				workspaceName: block.workspaceName,
-				workspacePath: block.workspacePath,
 				projectKey: block.projectKey,
+				projectName: block.projectName,
 				filePath: block.filePath,
 				relativePath: block.relativePath,
-				repoRoot: block.repoRoot || block.workspacePath,
+				repoRoot: block.repoRoot || "",
 				repoRelativePath: block.repoRelativePath || block.relativePath,
 				language: block.language,
 				gitRemoteUrl: block.gitRemoteUrl,
@@ -427,9 +458,11 @@ export class AiCodeStatsService {
 		if (!referenceBlock) {
 			return
 		}
+		const reportBranch = payload.branch || referenceBlock.gitBranch
 		const reportBaselineBlocks = await this.buildCommitReportBaselineBlocks({
 			pendingGeneratedBlocks,
 			commitOccurredAt: payload.commitOccurredAt,
+			gitBranch: reportBranch,
 		})
 		const reportAcceptedBlocks = reportBaselineBlocks.acceptedBlocks
 		const candidateLines = await this.buildCommitReportCandidateLines({
@@ -438,6 +471,7 @@ export class AiCodeStatsService {
 			pendingGeneratedBlocks,
 			acceptedBlocks: reportAcceptedBlocks,
 			generatedBlocks: reportBaselineBlocks.generatedBlocks,
+			gitBranch: reportBranch,
 		})
 
 		const reportGeneratedAt = Date.now()
@@ -451,11 +485,10 @@ export class AiCodeStatsService {
 			reportGeneratedAt,
 			client: this.buildUploadClient(),
 			repoRoot: payload.repoRoot,
-			workspaceName: referenceBlock.workspaceName,
-			workspacePath: referenceBlock.workspacePath,
 			projectKey: referenceBlock.projectKey,
+			projectName: referenceBlock.projectName,
 			gitRemoteUrl: referenceBlock.gitRemoteUrl,
-			gitBranch: payload.branch || referenceBlock.gitBranch,
+			gitBranch: reportBranch,
 			commitHash: payload.commitHash,
 			previousCommitHash: payload.previousCommit || undefined,
 			commitOccurredAt: payload.commitOccurredAt,
@@ -497,6 +530,7 @@ export class AiCodeStatsService {
 		pendingGeneratedBlocks: AiCodeGeneratedBlockState[]
 		acceptedBlocks: AiCodeGeneratedBlock[]
 		generatedBlocks: AiCodeGeneratedBlock[]
+		gitBranch?: string
 	}): Promise<AiCodeCommitCandidateLine[]> {
 		const pendingBlockIds = new Set(params.pendingGeneratedBlocks.map((block) => block.generatedBlockId))
 		if (pendingBlockIds.size === 0) {
@@ -546,20 +580,22 @@ export class AiCodeStatsService {
 				sourceType: pendingLine.sourceType,
 				ide: pendingLine.ide,
 				userName: pendingLine.userName,
+				departmentName: pendingLine.departmentName,
+				officeName: pendingLine.officeName,
+				teamName: pendingLine.teamName,
 				userEmail: pendingLine.userEmail,
 				organizationId: pendingLine.organizationId,
 				organizationName: pendingLine.organizationName,
 				sourceIp: pendingLine.sourceIp,
-				workspaceName: pendingLine.workspaceName,
-				workspacePath: pendingLine.workspacePath,
 				projectKey: pendingLine.projectKey,
+				projectName: pendingLine.projectName,
 				filePath: normalizePath(pendingLine.filePath),
 				relativePath: normalizePath(pendingLine.relativePath),
 				repoRoot: normalizePath(pendingLine.repoRoot || params.repoRoot),
 				repoRelativePath,
 				language: pendingLine.language,
 				gitRemoteUrl: pendingLine.gitRemoteUrl,
-				gitBranch: pendingLine.gitBranch,
+				gitBranch: params.gitBranch || pendingLine.gitBranch,
 				taskId: pendingLine.taskId,
 				lineNumber,
 				rawLine: pendingLine.rawLine,
@@ -582,6 +618,7 @@ export class AiCodeStatsService {
 	private async buildCommitReportBaselineBlocks(params: {
 		pendingGeneratedBlocks: AiCodeGeneratedBlockState[]
 		commitOccurredAt: number
+		gitBranch?: string
 	}): Promise<{ generatedBlocks: AiCodeGeneratedBlock[]; acceptedBlocks: AiCodeGeneratedBlock[] }> {
 		if (params.pendingGeneratedBlocks.length === 0) {
 			return {
@@ -625,12 +662,22 @@ export class AiCodeStatsService {
 
 			generatedBlocks.push(
 				...baselineBlocks.map((baselineBlock) =>
-					this.preparePendingCommitMetricBlockForReport(baselineBlock, "generated", params.commitOccurredAt),
+					this.preparePendingCommitMetricBlockForReport(
+						baselineBlock,
+						"generated",
+						params.commitOccurredAt,
+						params.gitBranch,
+					),
 				),
 			)
 			acceptedBlocks.push(
 				...baselineBlocks.map((baselineBlock) =>
-					this.preparePendingCommitMetricBlockForReport(baselineBlock, "accepted", params.commitOccurredAt),
+					this.preparePendingCommitMetricBlockForReport(
+						baselineBlock,
+						"accepted",
+						params.commitOccurredAt,
+						params.gitBranch,
+					),
 				),
 			)
 		}
@@ -645,11 +692,13 @@ export class AiCodeStatsService {
 		block: AiCodeGeneratedBlock,
 		metricType: "generated" | "accepted",
 		commitOccurredAt: number,
+		gitBranch?: string,
 	): AiCodeGeneratedBlock {
 		return this.prepareGeneratedBlockForReport(
 			{
 				...block,
 				eventId: `${block.eventId}:${metricType}`,
+				gitBranch: gitBranch || block.gitBranch,
 			},
 			commitOccurredAt,
 		)
@@ -700,10 +749,7 @@ export class AiCodeStatsService {
 		finalContent: string
 		repoRoot: string
 		repoRelativePath: string
-		workspaceName: string
-		workspacePath: string
 		filePath: string
-		relativePath: string
 		taskId?: string
 		metadata: Awaited<ReturnType<AiCodeStatsMetadataResolver["resolve"]>>
 	}): GeneratedStateBuildResult {
@@ -750,10 +796,10 @@ export class AiCodeStatsService {
 						generatedBlockId: baseBlock.generatedBlockId,
 						timestamp: params.timestamp,
 						sourceType: baseBlock.sourceType,
-						workspaceName: baseBlock.workspaceName,
-						workspacePath: baseBlock.workspacePath,
 						filePath: baseBlock.filePath,
-						relativePath: baseBlock.relativePath,
+						repoRoot: baseBlock.repoRoot || params.repoRoot,
+						repoRelativePath:
+							baseBlock.repoRelativePath || baseBlock.relativePath || params.repoRelativePath,
 						taskId: baseBlock.taskId,
 						metadata: params.metadata,
 						fileSnapshotContent: params.finalContent,
@@ -768,10 +814,7 @@ export class AiCodeStatsService {
 			const nextBlock = this.createNewGeneratedBlockState({
 				timestamp: params.timestamp,
 				sourceType: "agent_insert",
-				workspaceName: params.workspaceName,
-				workspacePath: params.workspacePath,
 				filePath: params.filePath,
-				relativePath: params.relativePath,
 				repoRoot: params.repoRoot,
 				repoRelativePath: params.repoRelativePath,
 				taskId: params.taskId,
@@ -787,10 +830,9 @@ export class AiCodeStatsService {
 					generatedBlockId: nextBlock.generatedBlockId,
 					timestamp: params.timestamp,
 					sourceType: nextBlock.sourceType,
-					workspaceName: nextBlock.workspaceName,
-					workspacePath: nextBlock.workspacePath,
 					filePath: nextBlock.filePath,
-					relativePath: nextBlock.relativePath,
+					repoRoot: nextBlock.repoRoot || params.repoRoot,
+					repoRelativePath: nextBlock.repoRelativePath || params.repoRelativePath,
 					taskId: nextBlock.taskId,
 					metadata: params.metadata,
 					fileSnapshotContent: params.finalContent,
@@ -926,10 +968,9 @@ export class AiCodeStatsService {
 		generatedBlockId: string
 		timestamp: number
 		sourceType: AiCodeGeneratedBlock["sourceType"]
-		workspaceName: string
-		workspacePath: string
 		filePath: string
-		relativePath: string
+		repoRoot: string
+		repoRelativePath: string
 		taskId?: string
 		metadata: Awaited<ReturnType<AiCodeStatsMetadataResolver["resolve"]>>
 		fileSnapshotContent: string
@@ -946,15 +987,19 @@ export class AiCodeStatsService {
 			sourceType: params.sourceType,
 			ide: this.ide,
 			userName: params.metadata.userName,
+			departmentName: params.metadata.departmentName,
+			officeName: params.metadata.officeName,
+			teamName: params.metadata.teamName,
 			userEmail: params.metadata.userEmail,
 			organizationId: params.metadata.organizationId,
 			organizationName: params.metadata.organizationName,
 			sourceIp: params.metadata.sourceIp,
-			workspaceName: params.workspaceName,
-			workspacePath: params.workspacePath,
 			projectKey: params.metadata.projectKey,
+			projectName: params.metadata.projectName,
+			repoRoot: params.repoRoot,
+			repoRelativePath: params.repoRelativePath,
 			filePath: params.filePath,
-			relativePath: params.relativePath,
+			relativePath: params.repoRelativePath,
 			language: params.metadata.language,
 			gitRemoteUrl: params.metadata.gitRemoteUrl,
 			gitBranch: params.metadata.gitBranch,
@@ -970,10 +1015,7 @@ export class AiCodeStatsService {
 	private createNewGeneratedBlockState(params: {
 		timestamp: number
 		sourceType: "agent_insert"
-		workspaceName: string
-		workspacePath: string
 		filePath: string
-		relativePath: string
 		repoRoot: string
 		repoRelativePath: string
 		taskId?: string
@@ -995,15 +1037,17 @@ export class AiCodeStatsService {
 			sourceType: params.sourceType,
 			ide: this.ide,
 			userName: params.metadata.userName,
+			departmentName: params.metadata.departmentName,
+			officeName: params.metadata.officeName,
+			teamName: params.metadata.teamName,
 			userEmail: params.metadata.userEmail,
 			organizationId: params.metadata.organizationId,
 			organizationName: params.metadata.organizationName,
 			sourceIp: params.metadata.sourceIp,
-			workspaceName: params.workspaceName,
-			workspacePath: params.workspacePath,
 			projectKey: params.metadata.projectKey,
+			projectName: params.metadata.projectName,
 			filePath: params.filePath,
-			relativePath: params.relativePath,
+			relativePath: params.repoRelativePath,
 			repoRoot: params.repoRoot,
 			repoRelativePath: params.repoRelativePath,
 			language: params.metadata.language,
@@ -1120,13 +1164,17 @@ export class AiCodeStatsService {
 			sourceType: block.sourceType,
 			ide: block.ide,
 			userName: block.userName,
+			departmentName: block.departmentName,
+			officeName: block.officeName,
+			teamName: block.teamName,
 			userEmail: block.userEmail,
 			organizationId: block.organizationId,
 			organizationName: block.organizationName,
 			sourceIp: block.sourceIp,
-			workspaceName: block.workspaceName,
-			workspacePath: block.workspacePath,
 			projectKey: block.projectKey,
+			projectName: block.projectName,
+			repoRoot: block.repoRoot,
+			repoRelativePath: block.repoRelativePath,
 			filePath: block.filePath,
 			relativePath: block.relativePath,
 			language: block.language,
@@ -1209,7 +1257,7 @@ export class AiCodeStatsService {
 			ide: this.ide,
 			wrapperName: wrapper.kiloCodeWrapper || undefined,
 			wrapperVersion: wrapper.kiloCodeWrapperVersion || undefined,
-			extensionVersion: Package.version,
+			extensionVersion: AI_CODING_CLIENT_VERSION,
 			machineId: vscode.env.machineId,
 		}
 	}

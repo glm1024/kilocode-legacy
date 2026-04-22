@@ -3,9 +3,9 @@ import * as path from "path"
 import { promisify } from "util"
 import * as vscode from "vscode"
 
-import { Package } from "../../shared/package"
 import { GitWatcher, type GitWatcherEvent } from "../../shared/GitWatcher"
 import { getKiloCodeWrapperProperties } from "../../core/kilocode/wrapper"
+import { AI_CODING_CLIENT_VERSION } from "../ai-code-stats/AiCodingClientVersion"
 import { AiTokenUsageMetadataResolver } from "./AiTokenUsageMetadataResolver"
 import { AiTokenUsageStore } from "./AiTokenUsageStore"
 import { AiTokenUsageUploader } from "./AiTokenUsageUploader"
@@ -21,6 +21,11 @@ import {
 
 const execAsync = promisify(execCallback)
 const EXEC_MAX_BUFFER_BYTES = 4 * 1024 * 1024
+const UNSCOPED_TOKEN_IDE = "unscoped" as const
+const UNSCOPED_TOKEN_PROVIDER = "unscoped"
+const UNSCOPED_TOKEN_MODEL = "unscoped"
+const UNSCOPED_TOKEN_PROJECT_KEY = "unscoped-token-usage"
+const UNSCOPED_TOKEN_PROJECT_NAME = "Unscoped Token Usage"
 
 const detectIde = (): AiTokenUsageIde => {
 	const wrapper = getKiloCodeWrapperProperties()
@@ -41,7 +46,8 @@ const resolveGitRepositoryRoot = async (cwd: string): Promise<string | undefined
 }
 
 export interface AiTokenUsageRequestRecord {
-	workspacePath: string
+	taskId?: string
+	cwd: string
 	provider?: string
 	model?: string
 	inputTokens: number
@@ -94,6 +100,9 @@ export class AiTokenUsageService {
 
 	start(): void {
 		this.started = true
+		void this.trackWorkspaceRepositoriesForCommitUpload().catch((error) => {
+			console.error("[AiTokenUsage] Failed to track workspace repositories:", error)
+		})
 	}
 
 	stop(): void {
@@ -118,30 +127,34 @@ export class AiTokenUsageService {
 		}
 
 		const occurredAt = record.occurredAt ?? Date.now()
-		const workspacePath = normalizePath(path.resolve(record.workspacePath))
-		const workspaceName = path.basename(workspacePath)
 		const settings = await this.getUploadSettings()
-		const metadata = await this.metadataResolver.resolve(workspacePath, settings)
+		const metadata = await this.metadataResolver.resolve(undefined, settings)
 		const userName = normalizeDimensionValue(metadata.userName)
+		const userEmail = metadata.userEmail
+		if (!userEmail) {
+			return
+		}
 		const sourceIp = normalizeDimensionValue(metadata.sourceIp)
-		const projectKey = normalizeDimensionValue(metadata.projectKey, "unknown-project")
-		const provider = normalizeDimensionValue(record.provider)
-		const model = normalizeDimensionValue(record.model)
 		const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"
 
 		await this.store.recordUsage({
+			taskId: record.taskId,
 			occurredAt,
 			timezone,
 			userName,
+			userEmail,
+			departmentName: metadata.departmentName,
+			officeName: metadata.officeName,
+			teamName: metadata.teamName,
 			sourceIp,
-			userKey: buildUserKey(userName, sourceIp),
+			userKey: buildUserKey(userEmail),
 			organizationId: metadata.organizationId,
 			organizationName: metadata.organizationName,
-			workspaceName,
-			projectKey,
-			ide: this.ide,
-			provider,
-			model,
+			projectKey: UNSCOPED_TOKEN_PROJECT_KEY,
+			projectName: UNSCOPED_TOKEN_PROJECT_NAME,
+			ide: UNSCOPED_TOKEN_IDE,
+			provider: UNSCOPED_TOKEN_PROVIDER,
+			model: UNSCOPED_TOKEN_MODEL,
 			requestCount: 1,
 			inputTokens,
 			outputTokens,
@@ -153,10 +166,22 @@ export class AiTokenUsageService {
 		if (!this.started) {
 			return
 		}
+	}
 
-		const repoRoot = await resolveGitRepositoryRoot(workspacePath)
-		if (repoRoot) {
-			await this.ensureWatcher(repoRoot)
+	async trackRepositoryForCommitUpload(repoRoot: string): Promise<void> {
+		const normalizedRepoRoot = normalizePath(path.resolve(repoRoot))
+		if (this.started) {
+			await this.ensureWatcher(normalizedRepoRoot)
+		}
+	}
+
+	private async trackWorkspaceRepositoriesForCommitUpload(): Promise<void> {
+		const workspaceFolders = vscode.workspace.workspaceFolders ?? []
+		for (const folder of workspaceFolders) {
+			const repoRoot = await resolveGitRepositoryRoot(folder.uri.fsPath)
+			if (repoRoot) {
+				await this.ensureWatcher(repoRoot)
+			}
 		}
 	}
 
@@ -213,7 +238,7 @@ export class AiTokenUsageService {
 			ide: this.ide,
 			wrapperName: wrapper.kiloCodeWrapper || undefined,
 			wrapperVersion: wrapper.kiloCodeWrapperVersion || undefined,
-			extensionVersion: Package.version,
+			extensionVersion: AI_CODING_CLIENT_VERSION,
 			machineId: vscode.env.machineId,
 		}
 	}

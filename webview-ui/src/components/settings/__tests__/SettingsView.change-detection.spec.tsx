@@ -132,6 +132,9 @@ vi.mock("../UISettings", () => ({
 // kilocode_change start
 vi.mock("../StatisticsSettings", () => ({
 	StatisticsSettings: () => null,
+	getStatisticsTeamOptions: () => [],
+	getStatisticsIdentityValidationKey: () => undefined,
+	normalizeStatisticsEmail: (value?: string) => value?.trim().toLowerCase() ?? "",
 }))
 // kilocode_change end
 
@@ -216,7 +219,11 @@ describe("SettingsView - Change Detection Fix", () => {
 		reasoningBlockCollapsed: true,
 		aiCodeStatsUploadEnabled: false,
 		aiCodeStatsWebhookUrl: "",
-		aiCodeStatsUserName: "",
+		aiCodeStatsDepartmentName: "云存储研发部",
+		aiCodeStatsOfficeName: "经理室",
+		aiCodeStatsTeamName: "",
+		aiCodeStatsUserName: "Test User",
+		aiCodeStatsUserEmail: "test.user@example.com",
 		...overrides,
 	})
 

@@ -5,6 +5,7 @@ import { execFile as execFileCallback } from "child_process"
 import { promisify } from "util"
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import * as vscode from "vscode"
 
 const {
 	mockGetUserInfo,
@@ -88,12 +89,14 @@ vi.mock("vscode", () => ({
 
 import { AiCodeStatsService } from "../AiCodeStatsService"
 import { hashLineFingerprint } from "../AiCodeLineFingerprint"
-import { CURRENT_AI_CODE_STATS_SEMANTICS_VERSION } from "../types"
+import { CURRENT_AI_CODE_STATS_SEMANTICS_VERSION, type AiCodeCommitCandidateLine } from "../types"
 
 const execFileAsync = promisify(execFileCallback)
 
-const createGitRepo = async (): Promise<string> => {
-	const repoDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-repo-"))
+const createGitRepo = async (parentDir?: string, name?: string): Promise<string> => {
+	const repoDir =
+		parentDir && name ? path.join(parentDir, name) : await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-repo-"))
+	await fs.mkdir(repoDir, { recursive: true })
 	await execFileAsync("git", ["init"], { cwd: repoDir })
 	await fs.mkdir(path.join(repoDir, "src"), { recursive: true })
 	return fs.realpath(repoDir)
@@ -102,6 +105,7 @@ const createGitRepo = async (): Promise<string> => {
 describe("AiCodeStatsService", () => {
 	beforeEach(() => {
 		AiCodeStatsService.disposeInstance()
+		;(vscode.env as any).appName = "Visual Studio Code"
 		mockHasInstance.mockReturnValue(false)
 		mockGetUserInfo.mockReturnValue(undefined)
 		// kilocode_change start
@@ -164,6 +168,30 @@ describe("AiCodeStatsService", () => {
 		})
 	})
 
+	it.each([
+		["PY", "pycharm"],
+		["PC", "pycharm"],
+		["UNKNOWN", "jetbrains"],
+	])("detects JetBrains wrapper product code %s as %s", async (wrapperCode, expectedIde) => {
+		;(vscode.env as any).appName = `wrapper|jetbrains|${wrapperCode}|2025.3`
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const repoDir = await createGitRepo()
+		mockIsGitRepository.mockResolvedValue(true)
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({ enabled: false }))
+
+		await service.recordAgentFileWrite({
+			cwd: repoDir,
+			filePath: path.join(repoDir, "src/product.ts"),
+			relativePath: "src/product.ts",
+			originalContent: "const base = 1\n",
+			newContent: "const base = 1\nconst product = true\n",
+		})
+
+		const pendingLines = await (service as any).store.getPendingLineAttributions(repoDir)
+		expect(pendingLines).toHaveLength(1)
+		expect(pendingLines[0].ide).toBe(expectedIde)
+	})
+
 	it("does not auto upload when only generated events are recorded", async () => {
 		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
 		const repoDir = await createGitRepo()
@@ -188,12 +216,13 @@ describe("AiCodeStatsService", () => {
 
 	it("queues rejected agent suggestions as generated events", async () => {
 		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
-		const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-workspace-"))
+		const repoDir = await createGitRepo()
+		mockIsGitRepository.mockResolvedValue(true)
 		const service = AiCodeStatsService.initialize(tmpDir, async () => ({ enabled: false, userName: "tester" }))
 
 		await service.recordRejectedAgentSuggestion({
-			cwd: workspaceDir,
-			filePath: path.join(workspaceDir, "src/rejected.ts"),
+			cwd: repoDir,
+			filePath: path.join(repoDir, "src/rejected.ts"),
 			relativePath: "src/rejected.ts",
 			originalContent: "const a = 1\n",
 			newContent: "const a = 1\nconst rejected = true\n",
@@ -207,6 +236,8 @@ describe("AiCodeStatsService", () => {
 			sourceType: "agent_insert",
 			metricType: "generated",
 			userName: "tester",
+			repoRoot: repoDir,
+			repoRelativePath: "src/rejected.ts",
 			relativePath: "src/rejected.ts",
 			lineStart: 2,
 			lineEnd: 2,
@@ -217,6 +248,78 @@ describe("AiCodeStatsService", () => {
 	})
 
 	// kilocode_change start
+	it("keeps commit reports separated for two git repos under one parent workspace", async () => {
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-workspace-"))
+		const repoA = await createGitRepo(workspaceDir, "repo-a")
+		const repoB = await createGitRepo(workspaceDir, "repo-b")
+		const remotes = new Map([
+			[repoA, "git@example.com:acme/repo-a.git"],
+			[repoB, "git@example.com:acme/repo-b.git"],
+		])
+		mockIsGitRepository.mockResolvedValue(true)
+		mockGetRemoteUrl.mockImplementation(async (repoRoot: string) => remotes.get(await fs.realpath(repoRoot)))
+		mockGetCurrentBranch.mockResolvedValue("main")
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({ enabled: false }))
+
+		await service.recordAgentFileWrite({
+			cwd: workspaceDir,
+			filePath: path.join(repoA, "src/a.ts"),
+			originalContent: "const a = 1\n",
+			newContent: "const a = 1\nconst aiA = 2\n",
+		})
+		await (service as any).handleCommitCollected({
+			repoRoot: repoA,
+			branch: "main",
+			commitHash: "commit-a",
+			previousCommit: "prev-a",
+			commitOccurredAt: Date.now(),
+			changedFiles: [{ relativePath: "src/a.ts", filePath: path.join(repoA, "src/a.ts"), changedBlocks: [] }],
+		})
+
+		await service.recordAgentFileWrite({
+			cwd: workspaceDir,
+			filePath: path.join(repoB, "src/b.ts"),
+			originalContent: "const b = 1\n",
+			newContent: "const b = 1\nconst aiB = 2\n",
+		})
+		await (service as any).handleCommitCollected({
+			repoRoot: repoB,
+			branch: "main",
+			commitHash: "commit-b",
+			previousCommit: "prev-b",
+			commitOccurredAt: Date.now(),
+			changedFiles: [{ relativePath: "src/b.ts", filePath: path.join(repoB, "src/b.ts"), changedBlocks: [] }],
+		})
+
+		const queuedReports = await (service as any).store.getQueuedReportsForTests()
+		expect(queuedReports).toHaveLength(2)
+		const reportsByCommit = new Map<string, any>(
+			queuedReports.map((queued: any) => [queued.report.commitHash, queued.report]),
+		)
+		const reportA = reportsByCommit.get("commit-a")!
+		const reportB = reportsByCommit.get("commit-b")!
+		expect(reportA).toMatchObject({ repoRoot: repoA, projectName: "repo-a", gitRemoteUrl: remotes.get(repoA) })
+		expect(reportB).toMatchObject({ repoRoot: repoB, projectName: "repo-b", gitRemoteUrl: remotes.get(repoB) })
+		expect(reportA.projectKey).not.toBe(reportB.projectKey)
+		expect(reportA.generatedBlocks[0]).toMatchObject({
+			repoRoot: repoA,
+			repoRelativePath: "src/a.ts",
+			relativePath: "src/a.ts",
+			projectName: "repo-a",
+		})
+		expect(reportB.generatedBlocks[0]).toMatchObject({
+			repoRoot: repoB,
+			repoRelativePath: "src/b.ts",
+			relativePath: "src/b.ts",
+			projectName: "repo-b",
+		})
+		expect(reportA).not.toHaveProperty("workspaceName")
+		expect(reportA).not.toHaveProperty("workspacePath")
+		expect(reportB).not.toHaveProperty("workspaceName")
+		expect(reportB).not.toHaveProperty("workspacePath")
+	})
+
 	it("merges pending generated blocks across repeated writes in the same task context", async () => {
 		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
 		const repoDir = await createGitRepo()
@@ -302,6 +405,7 @@ describe("AiCodeStatsService", () => {
 		const repoDir = await createGitRepo()
 		const service = AiCodeStatsService.initialize(tmpDir, async () => ({
 			webhookUrl: "https://example.com/webhook",
+			userEmail: "tester@example.com",
 		}))
 		const fetchMock = vi.fn().mockResolvedValue(new Response("ok", { status: 200 }))
 		vi.stubGlobal("fetch", fetchMock)
@@ -364,6 +468,7 @@ describe("AiCodeStatsService", () => {
 	})
 
 	it("queues only the generated blocks that belong to the current commit files", async () => {
+		;(vscode.env as any).appName = "wrapper|jetbrains|GO|2025.3"
 		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
 		const repoDir = await createGitRepo()
 		mockIsGitRepository.mockResolvedValue(true)
@@ -411,14 +516,23 @@ describe("AiCodeStatsService", () => {
 
 		const queuedReports = await (service as any).store.getQueuedReportsForTests()
 		expect(queuedReports).toHaveLength(1)
+		expect(queuedReports[0].report.client.ide).toBe("goland")
 		expect(queuedReports[0].report.generatedBlocks).toHaveLength(1)
 		expect(queuedReports[0].report.acceptedBlocks).toHaveLength(1)
 		expect(queuedReports[0].report.generatedBlocks?.[0]).toMatchObject({
+			ide: "goland",
 			relativePath: "src/b.ts",
 			fileSnapshotContent: "const b = 1\nconst aiB = 2\n",
 		})
-		expect(queuedReports[0].report.acceptedBlocks?.[0].relativePath).toBe("src/b.ts")
-		expect(queuedReports[0].report.acceptedBlocks?.[0].fileSnapshotContent).toBe("const b = 1\nconst aiB = 2\n")
+		expect(queuedReports[0].report.acceptedBlocks?.[0]).toMatchObject({
+			ide: "goland",
+			relativePath: "src/b.ts",
+			fileSnapshotContent: "const b = 1\nconst aiB = 2\n",
+		})
+		expect(queuedReports[0].report.candidateLines?.length).toBeGreaterThan(0)
+		expect(
+			queuedReports[0].report.candidateLines?.every((line: AiCodeCommitCandidateLine) => line.ide === "goland"),
+		).toBe(true)
 		expect(queuedReports[0].report.changedFiles).toHaveLength(1)
 		expect(queuedReports[0].report.changedFiles[0]).toMatchObject({
 			relativePath: "src/b.ts",
@@ -1164,6 +1278,10 @@ describe("AiCodeStatsService", () => {
 		const service = AiCodeStatsService.initialize(tmpDir, async () => ({
 			webhookUrl: "https://example.com/webhook",
 			userName: "Configured User",
+			departmentName: "云存储研发部",
+			officeName: "架设处",
+			teamName: "研发一组",
+			userEmail: " Configured.User@Example.COM ",
 		}))
 
 		await service.recordAgentFileWrite({
@@ -1189,7 +1307,10 @@ describe("AiCodeStatsService", () => {
 		const firstBody = JSON.parse(fetchMock.mock.calls[0][1].body as string)
 		expect(firstBody.generatedBlocks[0]).toMatchObject({
 			userName: "Configured User",
-			userEmail: "cloud@example.com",
+			departmentName: "云存储研发部",
+			officeName: "架设处",
+			teamName: "研发一组",
+			userEmail: "configured.user@example.com",
 			organizationId: "org-1",
 			organizationName: "Org 1",
 			sourceIp: expect.any(String),
@@ -1200,7 +1321,10 @@ describe("AiCodeStatsService", () => {
 		})
 		expect(firstBody.acceptedBlocks[0]).toMatchObject({
 			userName: "Configured User",
-			userEmail: "cloud@example.com",
+			departmentName: "云存储研发部",
+			officeName: "架设处",
+			teamName: "研发一组",
+			userEmail: "configured.user@example.com",
 			organizationId: "org-1",
 			organizationName: "Org 1",
 			sourceIp: expect.any(String),
@@ -1210,6 +1334,45 @@ describe("AiCodeStatsService", () => {
 			fileSnapshotContent: "const a = 1\nconst d = 4\n",
 		})
 		expect(firstBody.acceptedBlocks[0].projectKey).toHaveLength(16)
+	})
+
+	it("uses the commit callback branch for commit reports when pending blocks have a stale branch", async () => {
+		mockIsGitRepository.mockResolvedValue(true)
+		mockGetRemoteUrl.mockResolvedValue("https://github.com/example/repo.git")
+		mockGetCurrentBranch.mockResolvedValue("main")
+
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const repoDir = await createGitRepo()
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({
+			webhookUrl: "https://example.com/webhook",
+			userEmail: "tester@example.com",
+		}))
+
+		await service.recordAgentFileWrite({
+			cwd: repoDir,
+			filePath: path.join(repoDir, "src/branch.ts"),
+			relativePath: "src/branch.ts",
+			originalContent: "const a = 1\n",
+			newContent: "const a = 1\nconst branch = true\n",
+		})
+
+		const fetchMock = vi.fn().mockResolvedValue(new Response("ok", { status: 200 }))
+		vi.stubGlobal("fetch", fetchMock)
+
+		await (service as any).handleCommitCollected({
+			repoRoot: repoDir,
+			branch: "codex/add-sql-and-agent",
+			commitHash: "commit-branch",
+			previousCommit: "commit-prev",
+			commitOccurredAt: Date.now(),
+			changedFiles: [],
+		})
+
+		const firstBody = JSON.parse(fetchMock.mock.calls[0][1].body as string)
+		expect(firstBody.gitBranch).toBe("codex/add-sql-and-agent")
+		expect(firstBody.generatedBlocks[0].gitBranch).toBe("codex/add-sql-and-agent")
+		expect(firstBody.acceptedBlocks[0].gitBranch).toBe("codex/add-sql-and-agent")
+		expect(firstBody.candidateLines[0].gitBranch).toBe("codex/add-sql-and-agent")
 	})
 	// kilocode_change end
 })

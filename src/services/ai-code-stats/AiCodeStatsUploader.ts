@@ -6,6 +6,7 @@ import { resolveAiCodeStatsWebhookUrl } from "./AiCodeStatsWebhookUrl"
 import {
 	CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
 	normalizePath,
+	normalizeUserEmail,
 	type AiCodeCommitReport,
 	type AiCodeStatsUploadClient,
 	type AiCodeStatsUploadEnvelope,
@@ -29,6 +30,10 @@ export class AiCodeStatsUploader {
 		context: { client: AiCodeStatsUploadClient; maxEvents?: number },
 	): Promise<AiCodeStatsUploadResult> {
 		if (!settings.webhookUrl?.trim()) {
+			return { uploaded: 0 }
+		}
+		const fallbackUserEmail = normalizeUserEmail(settings.userEmail)
+		if (!fallbackUserEmail) {
 			return { uploaded: 0 }
 		}
 
@@ -60,7 +65,9 @@ export class AiCodeStatsUploader {
 				semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
 				sourceType: "agent_insert",
 				metricType: event.metricType,
-				workspacePath: normalizePath(event.workspacePath),
+				userEmail: normalizeUserEmail(event.userEmail) ?? fallbackUserEmail,
+				repoRoot: event.repoRoot ? normalizePath(event.repoRoot) : undefined,
+				repoRelativePath: event.repoRelativePath ? normalizePath(event.repoRelativePath) : undefined,
 				filePath: normalizePath(event.filePath),
 				relativePath: normalizePath(event.relativePath),
 			})),
@@ -75,6 +82,10 @@ export class AiCodeStatsUploader {
 		if (!settings.webhookUrl?.trim()) {
 			return { uploadedReports: 0, uploadedBlocks: 0 }
 		}
+		const fallbackUserEmail = normalizeUserEmail(settings.userEmail)
+		if (!fallbackUserEmail) {
+			return { uploadedReports: 0, uploadedBlocks: 0 }
+		}
 
 		const webhookUrl = resolveAiCodeStatsWebhookUrl(settings.webhookUrl)
 		const reports = await this.store.getQueuedCommitReports()
@@ -84,7 +95,7 @@ export class AiCodeStatsUploader {
 		for (const queued of reports) {
 			await this.postJson(
 				webhookUrl,
-				this.buildCommitReportPayload(queued.report),
+				this.buildCommitReportPayload(queued.report, fallbackUserEmail),
 				"AI code commit report upload failed",
 			)
 			await this.store.acknowledgeQueuedCommitReport(queued.report.reportId)
@@ -99,7 +110,7 @@ export class AiCodeStatsUploader {
 		return { uploadedReports, uploadedBlocks }
 	}
 
-	private buildCommitReportPayload(report: AiCodeCommitReport): AiCodeCommitReport {
+	private buildCommitReportPayload(report: AiCodeCommitReport, fallbackUserEmail: string): AiCodeCommitReport {
 		return {
 			version: "v2",
 			source: "kilocode-ai-code-stats",
@@ -110,9 +121,8 @@ export class AiCodeStatsUploader {
 			reportGeneratedAt: report.reportGeneratedAt,
 			client: report.client,
 			repoRoot: normalizePath(report.repoRoot),
-			workspaceName: report.workspaceName,
-			workspacePath: normalizePath(report.workspacePath),
 			projectKey: report.projectKey,
+			projectName: report.projectName,
 			gitRemoteUrl: report.gitRemoteUrl,
 			gitBranch: report.gitBranch,
 			commitHash: report.commitHash,
@@ -126,13 +136,17 @@ export class AiCodeStatsUploader {
 				sourceType: block.sourceType,
 				ide: block.ide,
 				userName: block.userName,
-				userEmail: block.userEmail,
+				departmentName: block.departmentName,
+				officeName: block.officeName,
+				teamName: block.teamName,
+				userEmail: normalizeUserEmail(block.userEmail) ?? fallbackUserEmail,
 				organizationId: block.organizationId,
 				organizationName: block.organizationName,
 				sourceIp: block.sourceIp,
-				workspaceName: block.workspaceName,
-				workspacePath: normalizePath(block.workspacePath),
 				projectKey: block.projectKey,
+				projectName: block.projectName,
+				repoRoot: block.repoRoot ? normalizePath(block.repoRoot) : undefined,
+				repoRelativePath: block.repoRelativePath ? normalizePath(block.repoRelativePath) : undefined,
 				filePath: normalizePath(block.filePath),
 				relativePath: normalizePath(block.relativePath),
 				language: block.language,
@@ -153,13 +167,17 @@ export class AiCodeStatsUploader {
 				sourceType: block.sourceType,
 				ide: block.ide,
 				userName: block.userName,
-				userEmail: block.userEmail,
+				departmentName: block.departmentName,
+				officeName: block.officeName,
+				teamName: block.teamName,
+				userEmail: normalizeUserEmail(block.userEmail) ?? fallbackUserEmail,
 				organizationId: block.organizationId,
 				organizationName: block.organizationName,
 				sourceIp: block.sourceIp,
-				workspaceName: block.workspaceName,
-				workspacePath: normalizePath(block.workspacePath),
 				projectKey: block.projectKey,
+				projectName: block.projectName,
+				repoRoot: block.repoRoot ? normalizePath(block.repoRoot) : undefined,
+				repoRelativePath: block.repoRelativePath ? normalizePath(block.repoRelativePath) : undefined,
 				filePath: normalizePath(block.filePath),
 				relativePath: normalizePath(block.relativePath),
 				language: block.language,
@@ -201,13 +219,15 @@ export class AiCodeStatsUploader {
 				sourceType: line.sourceType,
 				ide: line.ide,
 				userName: line.userName,
-				userEmail: line.userEmail,
+				departmentName: line.departmentName,
+				officeName: line.officeName,
+				teamName: line.teamName,
+				userEmail: normalizeUserEmail(line.userEmail) ?? fallbackUserEmail,
 				organizationId: line.organizationId,
 				organizationName: line.organizationName,
 				sourceIp: line.sourceIp,
-				workspaceName: line.workspaceName,
-				workspacePath: normalizePath(line.workspacePath),
 				projectKey: line.projectKey,
+				projectName: line.projectName,
 				filePath: normalizePath(line.filePath),
 				relativePath: normalizePath(line.relativePath),
 				repoRoot: normalizePath(line.repoRoot),

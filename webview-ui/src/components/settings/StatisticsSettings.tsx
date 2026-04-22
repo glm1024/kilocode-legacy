@@ -2,34 +2,286 @@ import { HTMLAttributes } from "react"
 import { VSCodeTextField } from "@vscode/webview-ui-toolkit/react"
 
 import { useAppTranslation } from "@/i18n/TranslationContext"
+import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@src/components/ui"
 
 import { SearchableSetting } from "./SearchableSetting"
 import { Section } from "./Section"
 import { SectionHeader } from "./SectionHeader"
 import { SetCachedStateField } from "./types"
 
+// kilocode_change start
+export interface StatisticsOfficeOption {
+	name: string
+	teams: string[]
+}
+
+export interface StatisticsDepartmentOption {
+	name: string
+	offices: StatisticsOfficeOption[]
+}
+
+export interface StatisticsIdentityFields {
+	departmentName?: string
+	officeName?: string
+	teamName?: string
+	userName?: string
+	userEmail?: string
+}
+
+export type StatisticsIdentityValidationField = "department" | "office" | "team" | "userName" | "userEmail"
+
+const STATISTICS_EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+
+export const normalizeStatisticsEmail = (value?: string): string => value?.trim().toLowerCase() ?? ""
+
+export const STATISTICS_DEPARTMENT_OPTIONS: StatisticsDepartmentOption[] = [
+	{
+		name: "云计算研发部",
+		offices: [
+			{ name: "经理室", teams: [] },
+			{ name: "研发一处", teams: ["经理室", "研发一组", "研发二组", "研发三组", "研发四组", "研发五组"] },
+			{ name: "研发二处", teams: ["经理室", "研发一组", "研发二组", "研发三组"] },
+			{ name: "研发三处", teams: ["经理室", "研发一组", "研发二组", "研发三组"] },
+			{ name: "研发四处", teams: ["经理室", "研发一组", "研发二组", "研发三组"] },
+			{ name: "研发五处", teams: ["经理室", "研发一组", "研发二组", "研发三组", "研发四组", "研发五组"] },
+		],
+	},
+	{
+		name: "云存储研发部",
+		offices: [
+			{ name: "经理室", teams: [] },
+			{ name: "架设处", teams: ["研发一组", "研发二组"] },
+			{ name: "核心软件处", teams: ["研发一组", "研发二组", "研发三组", "研发六组", "研发七组"] },
+			{ name: "研发保障处", teams: ["研发一组", "研发六组"] },
+			{ name: "管理软件处", teams: ["研发二组", "研发三组", "研发四组"] },
+			{ name: "硬件开发处", teams: ["研发二组", "研发四组", "研发六组"] },
+			{ name: "测试验证处", teams: ["测试一组", "测试二组", "测试三组", "测试四组"] },
+			{ name: "服务支持处", teams: [] },
+			{ name: "项目管理处", teams: ["项目管理一组", "项目管理二组"] },
+		],
+	},
+	{
+		name: "产品与方案测试部",
+		offices: [
+			{ name: "经理室", teams: [] },
+			{ name: "产品测试验证处", teams: ["测试一组", "测试二组", "测试三组"] },
+			{ name: "方案与定制化测试处", teams: ["测试一组", "测试二组"] },
+		],
+	},
+]
+
+export const getStatisticsOfficeOptions = (departmentName?: string): StatisticsOfficeOption[] =>
+	STATISTICS_DEPARTMENT_OPTIONS.find((department) => department.name === departmentName)?.offices ?? []
+
+export const getStatisticsTeamOptions = (departmentName?: string, officeName?: string): string[] =>
+	getStatisticsOfficeOptions(departmentName).find((office) => office.name === officeName)?.teams ?? []
+
+export const getStatisticsIdentityValidationKey = ({
+	departmentName,
+	officeName,
+	teamName,
+	userName,
+	userEmail,
+}: StatisticsIdentityFields): string | undefined => {
+	if (!departmentName?.trim()) {
+		return "settings:statistics.validation.departmentRequired"
+	}
+	if (!officeName?.trim()) {
+		return "settings:statistics.validation.officeRequired"
+	}
+	if (getStatisticsTeamOptions(departmentName, officeName).length > 0 && !teamName?.trim()) {
+		return "settings:statistics.validation.teamRequired"
+	}
+	if (!userName?.trim()) {
+		return "settings:statistics.validation.nameRequired"
+	}
+	const normalizedUserEmail = normalizeStatisticsEmail(userEmail)
+	if (!normalizedUserEmail) {
+		return "settings:statistics.validation.emailRequired"
+	}
+	if (!STATISTICS_EMAIL_PATTERN.test(normalizedUserEmail)) {
+		return "settings:statistics.validation.emailInvalid"
+	}
+	return undefined
+}
+// kilocode_change end
+
 type StatisticsSettingsProps = HTMLAttributes<HTMLDivElement> & {
 	aiCodeStatsWebhookUrl?: string
+	// kilocode_change start
+	aiCodeStatsDepartmentName?: string
+	aiCodeStatsOfficeName?: string
+	aiCodeStatsTeamName?: string
+	// kilocode_change end
 	aiCodeStatsUserName?: string
-	setCachedStateField: SetCachedStateField<"aiCodeStatsWebhookUrl" | "aiCodeStatsUserName">
+	aiCodeStatsUserEmail?: string
+	setCachedStateField: SetCachedStateField<
+		| "aiCodeStatsWebhookUrl"
+		| "aiCodeStatsDepartmentName"
+		| "aiCodeStatsOfficeName"
+		| "aiCodeStatsTeamName"
+		| "aiCodeStatsUserName"
+		| "aiCodeStatsUserEmail"
+	>
 	webhookValidationError?: string
+	// kilocode_change start
+	identityValidationError?: string
+	identityValidationErrorField?: StatisticsIdentityValidationField
+	// kilocode_change end
 }
 
 export const StatisticsSettings = ({
 	aiCodeStatsWebhookUrl,
+	// kilocode_change start
+	aiCodeStatsDepartmentName,
+	aiCodeStatsOfficeName,
+	aiCodeStatsTeamName,
+	// kilocode_change end
 	aiCodeStatsUserName,
+	aiCodeStatsUserEmail,
 	setCachedStateField,
 	webhookValidationError,
+	// kilocode_change start
+	identityValidationError,
+	identityValidationErrorField,
+	// kilocode_change end
 	...props
 }: StatisticsSettingsProps) => {
 	const { t } = useAppTranslation()
 	const controlWidthClass = "w-full"
+	// kilocode_change start
+	const officeOptions = getStatisticsOfficeOptions(aiCodeStatsDepartmentName)
+	const teamOptions = getStatisticsTeamOptions(aiCodeStatsDepartmentName, aiCodeStatsOfficeName)
+	const selectedDepartmentName = STATISTICS_DEPARTMENT_OPTIONS.some(
+		(department) => department.name === aiCodeStatsDepartmentName,
+	)
+		? aiCodeStatsDepartmentName
+		: ""
+	const selectedOfficeName = officeOptions.some((office) => office.name === aiCodeStatsOfficeName)
+		? aiCodeStatsOfficeName
+		: ""
+	const selectedTeamName = teamOptions.includes(aiCodeStatsTeamName ?? "") ? aiCodeStatsTeamName : ""
+
+	const handleDepartmentChange = (departmentName: string) => {
+		setCachedStateField("aiCodeStatsDepartmentName", departmentName)
+		setCachedStateField("aiCodeStatsOfficeName", "")
+		setCachedStateField("aiCodeStatsTeamName", "")
+	}
+
+	const handleOfficeChange = (officeName: string) => {
+		setCachedStateField("aiCodeStatsOfficeName", officeName)
+		setCachedStateField("aiCodeStatsTeamName", "")
+	}
+
+	const identityValidationErrorTarget = identityValidationErrorField ?? "userEmail"
+	const renderIdentityValidationError = (field: StatisticsIdentityValidationField) =>
+		identityValidationError && identityValidationErrorTarget === field ? (
+			<div
+				className="text-sm leading-6 text-vscode-errorForeground"
+				role="status"
+				aria-live="polite"
+				data-validation-field={field}
+				data-testid="ai-code-stats-identity-error">
+				{identityValidationError}
+			</div>
+		) : null
+	// kilocode_change end
 
 	return (
 		<div {...props}>
 			<SectionHeader>{t("settings:sections.statistics")}</SectionHeader>
 			<Section>
 				<div className="flex flex-col gap-6">
+					{/* kilocode_change start */}
+					<SearchableSetting
+						settingId="statistics-department-name"
+						section="statistics"
+						label={t("settings:statistics.department.label")}
+						className="flex flex-col gap-2.5">
+						<label className="block font-medium" htmlFor="ai-code-stats-department-name">
+							{t("settings:statistics.department.label")}
+						</label>
+						<Select
+							value={selectedDepartmentName}
+							onValueChange={handleDepartmentChange}
+							data-testid="ai-code-stats-department-name">
+							<SelectTrigger id="ai-code-stats-department-name" className={controlWidthClass}>
+								<SelectValue placeholder={t("settings:statistics.department.placeholder")} />
+							</SelectTrigger>
+							<SelectContent>
+								<SelectGroup>
+									{STATISTICS_DEPARTMENT_OPTIONS.map((department) => (
+										<SelectItem key={department.name} value={department.name}>
+											{department.name}
+										</SelectItem>
+									))}
+								</SelectGroup>
+							</SelectContent>
+						</Select>
+						{renderIdentityValidationError("department")}
+					</SearchableSetting>
+
+					<SearchableSetting
+						settingId="statistics-office-name"
+						section="statistics"
+						label={t("settings:statistics.office.label")}
+						className="flex flex-col gap-2.5">
+						<label className="block font-medium" htmlFor="ai-code-stats-office-name">
+							{t("settings:statistics.office.label")}
+						</label>
+						<Select
+							value={selectedOfficeName}
+							onValueChange={handleOfficeChange}
+							disabled={!selectedDepartmentName}
+							data-testid="ai-code-stats-office-name">
+							<SelectTrigger id="ai-code-stats-office-name" className={controlWidthClass}>
+								<SelectValue placeholder={t("settings:statistics.office.placeholder")} />
+							</SelectTrigger>
+							<SelectContent>
+								<SelectGroup>
+									{officeOptions.map((office) => (
+										<SelectItem key={office.name} value={office.name}>
+											{office.name}
+										</SelectItem>
+									))}
+								</SelectGroup>
+							</SelectContent>
+						</Select>
+						{renderIdentityValidationError("office")}
+					</SearchableSetting>
+
+					{teamOptions.length > 0 && (
+						<SearchableSetting
+							settingId="statistics-team-name"
+							section="statistics"
+							label={t("settings:statistics.team.label")}
+							className="flex flex-col gap-2.5">
+							<label className="block font-medium" htmlFor="ai-code-stats-team-name">
+								{t("settings:statistics.team.label")}
+							</label>
+							<Select
+								value={selectedTeamName}
+								onValueChange={(teamName) => setCachedStateField("aiCodeStatsTeamName", teamName)}
+								disabled={!selectedOfficeName}
+								data-testid="ai-code-stats-team-name">
+								<SelectTrigger id="ai-code-stats-team-name" className={controlWidthClass}>
+									<SelectValue placeholder={t("settings:statistics.team.placeholder")} />
+								</SelectTrigger>
+								<SelectContent>
+									<SelectGroup>
+										{teamOptions.map((team) => (
+											<SelectItem key={team} value={team}>
+												{team}
+											</SelectItem>
+										))}
+									</SelectGroup>
+								</SelectContent>
+							</Select>
+							{renderIdentityValidationError("team")}
+						</SearchableSetting>
+					)}
+					{/* kilocode_change end */}
+
 					<SearchableSetting
 						settingId="statistics-user-name"
 						section="statistics"
@@ -48,11 +300,30 @@ export const StatisticsSettings = ({
 							placeholder={t("settings:statistics.userName.placeholder")}
 							data-testid="ai-code-stats-user-name"
 						/>
-						<div
-							className="text-sm leading-6 text-vscode-descriptionForeground"
-							data-testid="ai-code-stats-user-name-description">
-							{t("settings:statistics.userName.description")}
-						</div>
+						{renderIdentityValidationError("userName")}
+					</SearchableSetting>
+
+					<SearchableSetting
+						settingId="statistics-user-email"
+						section="statistics"
+						label={t("settings:statistics.userEmail.label")}
+						className="flex flex-col gap-2.5">
+						<label className="block font-medium" htmlFor="ai-code-stats-user-email">
+							{t("settings:statistics.userEmail.label")}
+						</label>
+						<VSCodeTextField
+							id="ai-code-stats-user-email"
+							name="aiCodeStatsUserEmail"
+							type="email"
+							inputMode="email"
+							spellCheck={false}
+							className={controlWidthClass}
+							value={aiCodeStatsUserEmail ?? ""}
+							onChange={(e: any) => setCachedStateField("aiCodeStatsUserEmail", e.target.value)}
+							placeholder={t("settings:statistics.userEmail.placeholder")}
+							data-testid="ai-code-stats-user-email"
+						/>
+						{renderIdentityValidationError("userEmail")}
 					</SearchableSetting>
 
 					<SearchableSetting
@@ -66,6 +337,8 @@ export const StatisticsSettings = ({
 						<VSCodeTextField
 							id="ai-code-stats-webhook-url"
 							name="aiCodeStatsWebhookUrl"
+							type="url"
+							inputMode="url"
 							spellCheck={false}
 							className={controlWidthClass}
 							value={aiCodeStatsWebhookUrl ?? ""}

@@ -23,9 +23,8 @@ const buildPendingLine = (overrides: Partial<AiCodePendingLineAttribution> = {})
 		timestamp: overrides.timestamp ?? Date.now(),
 		sourceType: overrides.sourceType ?? "agent_insert",
 		ide: overrides.ide ?? "vscode",
-		workspaceName: overrides.workspaceName ?? "workspace",
-		workspacePath: overrides.workspacePath ?? "/workspace",
 		projectKey: overrides.projectKey ?? "project-key",
+		projectName: overrides.projectName ?? "repo",
 		filePath: overrides.filePath ?? "/repo/src/a.ts",
 		relativePath: overrides.relativePath ?? "src/a.ts",
 		repoRoot: overrides.repoRoot ?? "/repo",
@@ -52,9 +51,8 @@ const buildQueuedReport = (overrides: Partial<AiCodeQueuedCommitReport> = {}): A
 		semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
 		client: { ide: "vscode" },
 		repoRoot: "/repo",
-		workspaceName: "workspace",
-		workspacePath: "/workspace",
 		projectKey: "project-key",
+		projectName: "repo",
 		gitBranch: "feature/stats",
 		commitHash: "commit-1",
 		previousCommitHash: "commit-0",
@@ -182,9 +180,8 @@ describe("AiCodeStatsStore", () => {
 					semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
 					client: { ide: "vscode" },
 					repoRoot: "/repo",
-					workspaceName: "workspace",
-					workspacePath: "/workspace",
 					projectKey: "project-key",
+					projectName: "repo",
 					gitBranch: "feature/stats",
 					commitHash: "commit-1",
 					previousCommitHash: "commit-0",
@@ -197,9 +194,10 @@ describe("AiCodeStatsStore", () => {
 							semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
 							sourceType: "agent_insert",
 							ide: "vscode",
-							workspaceName: "workspace",
-							workspacePath: "/workspace",
 							projectKey: "project-key",
+							projectName: "repo",
+							repoRoot: "/repo",
+							repoRelativePath: "src/a.ts",
 							filePath: "/workspace/src/a.ts",
 							relativePath: "src/a.ts",
 							lineStart: 1,
@@ -216,9 +214,10 @@ describe("AiCodeStatsStore", () => {
 							semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
 							sourceType: "agent_insert",
 							ide: "vscode",
-							workspaceName: "workspace",
-							workspacePath: "/workspace",
 							projectKey: "project-key",
+							projectName: "repo",
+							repoRoot: "/repo",
+							repoRelativePath: "src/a.ts",
 							filePath: "/workspace/src/a.ts",
 							relativePath: "src/a.ts",
 							lineStart: 1,
@@ -238,6 +237,40 @@ describe("AiCodeStatsStore", () => {
 		expect(queuedReports.map((report) => report.report.reportId)).toEqual(["report-rebucket"])
 	})
 
+	it("preserves product-level IDE values on queued commit report candidate lines", async () => {
+		const report = buildQueuedReport()
+		report.report.client = { ide: "goland" }
+		report.report.candidateLines = [
+			{
+				clientLineId: "line-goland",
+				generatedBlockId: "generated-1",
+				baselineEventId: "accepted-1",
+				baselineMetricType: "accepted",
+				sourceTimestamp: new Date("2026-03-11T10:00:00.000Z").getTime(),
+				sourceType: "agent_insert",
+				ide: "goland",
+				projectKey: "project-key",
+				projectName: "repo",
+				filePath: "/workspace/src/a.ts",
+				relativePath: "src/a.ts",
+				repoRoot: "/repo",
+				repoRelativePath: "src/a.ts",
+				lineNumber: 1,
+				rawLine: "const value = 1",
+				blockLineIndex: 1,
+				blockLineCount: 1,
+				lineHash: hashLineFingerprint("const value = 1"),
+				occurrenceIndex: 1,
+			},
+		]
+
+		await store.queueCommitReport(report)
+
+		const queuedReports = await store.getQueuedReportsForTests()
+		expect(queuedReports[0].report.client.ide).toBe("goland")
+		expect(queuedReports[0].report.candidateLines?.[0].ide).toBe("goland")
+	})
+
 	it("does not enqueue client-side committed events", async () => {
 		await store.appendEvent({
 			eventId: "client-committed",
@@ -246,8 +279,10 @@ describe("AiCodeStatsStore", () => {
 			sourceType: "agent_insert",
 			ide: "vscode",
 			metricType: "committed",
-			workspaceName: "workspace",
-			workspacePath: "/workspace",
+			projectKey: "project-key",
+			projectName: "repo",
+			repoRoot: "/repo",
+			repoRelativePath: "src/a.ts",
 			filePath: "/workspace/src/a.ts",
 			relativePath: "src/a.ts",
 			lineStart: 1,
@@ -270,8 +305,8 @@ describe("AiCodeStatsStore", () => {
 				baselineMetricType: "accepted",
 				sourceType: "agent_insert",
 				ide: "vscode",
-				workspaceName: "workspace",
-				workspacePath: "/workspace",
+				projectKey: "project-key",
+				projectName: "repo",
 				filePath: "/workspace/src/a.ts",
 				relativePath: "src/a.ts",
 				repoRoot: "/repo",

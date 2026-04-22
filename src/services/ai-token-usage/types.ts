@@ -1,6 +1,6 @@
-import { normalizePath as normalizeFsPath } from "../ai-code-stats/types"
+import { buildEmailUserKey, normalizePath as normalizeFsPath, normalizeUserEmail } from "../ai-code-stats/types"
 
-export type AiTokenUsageIde = "vscode" | "jetbrains"
+export type AiTokenUsageIde = "vscode" | "jetbrains" | "unscoped"
 export type AiTokenUsageUploadMode = "incremental"
 
 export type AiTokenUsageRange =
@@ -12,7 +12,11 @@ export type AiTokenUsageRange =
 
 export interface AiTokenUsageUploadSettings {
 	webhookUrl?: string
+	departmentName?: string
+	officeName?: string
+	teamName?: string
 	userName?: string
+	userEmail?: string
 }
 
 export interface AiTokenUsageUploadClient {
@@ -24,15 +28,23 @@ export interface AiTokenUsageUploadClient {
 }
 
 export interface AiTokenUsageRecordInput {
+	taskId?: string
 	occurredAt: number
 	timezone: string
 	userName: string
+	userEmail?: string
+	departmentName?: string
+	officeName?: string
+	teamName?: string
 	sourceIp: string
 	userKey: string
 	organizationId?: string
 	organizationName?: string
-	workspaceName: string
 	projectKey: string
+	projectName: string
+	repoRoot?: string
+	gitRemoteUrl?: string
+	gitBranch?: string
 	ide: AiTokenUsageIde
 	provider: string
 	model: string
@@ -76,12 +88,19 @@ export interface AiTokenUsageAggregateUploadRow {
 	dateKey: string
 	timezone: string
 	userName: string
+	userEmail?: string
+	departmentName?: string
+	officeName?: string
+	teamName?: string
 	sourceIp: string
 	userKey: string
 	organizationId?: string
 	organizationName?: string
-	workspaceName: string
 	projectKey: string
+	projectName: string
+	repoRoot?: string
+	gitRemoteUrl?: string
+	gitBranch?: string
 	ide: AiTokenUsageIde
 	provider: string
 	model: string
@@ -119,7 +138,9 @@ export const normalizeDimensionValue = (value?: string, fallback = "unknown"): s
 	return trimmed ? trimmed : fallback
 }
 
-export const buildUserKey = (userName: string, sourceIp: string): string => `${userName}|${sourceIp}`
+export { normalizeUserEmail }
+
+export const buildUserKey = (userEmail: string): string => buildEmailUserKey(userEmail)
 
 export const buildAggregateKey = (
 	dateKey: string,

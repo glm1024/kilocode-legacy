@@ -45,18 +45,41 @@
 		"autoPurge": "自动清理",
 		"agentBehaviour": "智能体行为",
 		"autocomplete": "自动补全",
-		"statistics": "编码分析"
+		"statistics": "数据上报"
 	},
 	"statistics": {
+		"department": {
+			"label": "部门",
+			"placeholder": "请选择部门"
+		},
+		"office": {
+			"label": "处",
+			"placeholder": "请选择处"
+		},
+		"team": {
+			"label": "组",
+			"placeholder": "请选择组"
+		},
 		"userName": {
-			"label": "用户名",
-			"placeholder": "例如：张三…",
-			"description": "请填写真实姓名。"
+			"label": "姓名",
+			"placeholder": "例如：张三…"
+		},
+		"userEmail": {
+			"label": "公司邮箱",
+			"placeholder": "例如：zhangsan@inspur.com"
+		},
+		"validation": {
+			"departmentRequired": "请选择部门。",
+			"officeRequired": "请选择处。",
+			"teamRequired": "请选择组。",
+			"nameRequired": "请填写姓名。",
+			"emailRequired": "请填写公司邮箱。",
+			"emailInvalid": "公司邮箱格式不正确。"
 		},
 		"webhook": {
 			"label": "上报服务器地址",
-			"placeholder": "例如：http://100.7.132.102:8081…",
-			"description": "用于接收 AI 代码统计与 Token 消耗数据。",
+			"placeholder": "例如：http://100.7.132.102:8081",
+			"description": "用于接收 AI 生成代码统计数据。",
 			"test": {
 				"success": "连通测试成功",
 				"failed": "连通测试失败",

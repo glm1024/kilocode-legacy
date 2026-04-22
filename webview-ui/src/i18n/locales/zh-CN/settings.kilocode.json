@@ -1,8 +1,12 @@
 {
 	"statistics": {
 		"userName": {
-			"label": "用户名",
+			"label": "姓名",
 			"placeholder": "例如：张三"
+		},
+		"userEmail": {
+			"label": "公司邮箱",
+			"placeholder": "例如：zhangsan@inspur.com"
 		}
 	}
 }

@@ -6,6 +6,8 @@ import {
 	type AiTokenUsageUploadClient,
 	type AiTokenUsageUploadEnvelope,
 	type AiTokenUsageUploadSettings,
+	buildUserKey,
+	normalizeUserEmail,
 } from "./types"
 
 const DEFAULT_MAX_ROWS_PER_BATCH = 100
@@ -31,11 +33,22 @@ export class AiTokenUsageUploader {
 		if (!settings.webhookUrl?.trim()) {
 			return { uploaded: 0 }
 		}
+		const fallbackUserEmail = normalizeUserEmail(settings.userEmail)
+		if (!fallbackUserEmail) {
+			return { uploaded: 0 }
+		}
 
 		const webhookUrl = resolveAiTokenUsageWebhookUrl(settings.webhookUrl)
 		const maxRowsPerBatch = context.maxRowsPerBatch ?? DEFAULT_MAX_ROWS_PER_BATCH
 		const maxPayloadBytes = context.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES
-		const pendingRows = await this.store.getPendingUploadRows()
+		const pendingRows = (await this.store.getPendingUploadRows()).map((row) => {
+			const userEmail = normalizeUserEmail(row.userEmail) ?? fallbackUserEmail
+			return {
+				...row,
+				userEmail,
+				userKey: buildUserKey(userEmail),
+			}
+		})
 		if (pendingRows.length === 0) {
 			return { uploaded: 0 }
 		}
@@ -119,12 +132,19 @@ export class AiTokenUsageUploader {
 				dateKey: row.dateKey,
 				timezone: row.timezone,
 				userName: row.userName,
+				userEmail: row.userEmail,
+				departmentName: row.departmentName,
+				officeName: row.officeName,
+				teamName: row.teamName,
 				sourceIp: row.sourceIp,
 				userKey: row.userKey,
 				organizationId: row.organizationId,
 				organizationName: row.organizationName,
-				workspaceName: row.workspaceName,
 				projectKey: row.projectKey,
+				projectName: row.projectName,
+				repoRoot: row.repoRoot,
+				gitRemoteUrl: row.gitRemoteUrl,
+				gitBranch: row.gitBranch,
 				ide: row.ide,
 				provider: row.provider,
 				model: row.model,

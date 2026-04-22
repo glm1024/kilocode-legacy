@@ -36,7 +36,14 @@ type SecretStateKey = keyof SecretState
 type RooCodeSettingsKey = keyof RooCodeSettings
 
 const PASS_THROUGH_STATE_KEYS = ["taskHistory"]
-const CONFIG_BACKED_GLOBAL_STATE_KEYS = ["aiCodeStatsWebhookUrl", "aiCodeStatsUserName"] as const
+const CONFIG_BACKED_GLOBAL_STATE_KEYS = [
+	"aiCodeStatsWebhookUrl",
+	"aiCodeStatsDepartmentName",
+	"aiCodeStatsOfficeName",
+	"aiCodeStatsTeamName",
+	"aiCodeStatsUserName",
+	"aiCodeStatsUserEmail",
+] as const
 
 export const isPassThroughStateKey = (key: string) => PASS_THROUGH_STATE_KEYS.includes(key)
 
@@ -46,10 +53,12 @@ const isConfigBackedGlobalStateKey = (key: string): key is ConfigBackedGlobalSta
 	CONFIG_BACKED_GLOBAL_STATE_KEYS.includes(key as ConfigBackedGlobalStateKey)
 
 const normalizeConfigBackedGlobalStateValue = <K extends ConfigBackedGlobalStateKey>(
+	key: K,
 	value: GlobalState[K],
 ): GlobalState[K] => {
 	if (typeof value === "string") {
-		return value.trim() as GlobalState[K]
+		const trimmed = value.trim()
+		return (key === "aiCodeStatsUserEmail" ? trimmed.toLowerCase() : trimmed) as GlobalState[K]
 	}
 	return value
 }
@@ -204,8 +213,14 @@ export class ContextProxy {
 		const configuration = vscode.workspace.getConfiguration(Package.name)
 
 		for (const key of CONFIG_BACKED_GLOBAL_STATE_KEYS) {
-			const configValue = normalizeConfigBackedGlobalStateValue(configuration.get(key) as GlobalState[typeof key])
-			const stateValue = normalizeConfigBackedGlobalStateValue(this.stateCache[key] as GlobalState[typeof key])
+			const configValue = normalizeConfigBackedGlobalStateValue(
+				key,
+				configuration.get(key) as GlobalState[typeof key],
+			)
+			const stateValue = normalizeConfigBackedGlobalStateValue(
+				key,
+				this.stateCache[key] as GlobalState[typeof key],
+			)
 
 			if (hasConfigBackedGlobalStateValue(configValue)) {
 				if (stateValue !== configValue) {
@@ -222,7 +237,7 @@ export class ContextProxy {
 	}
 
 	private async updateConfigBackedGlobalState<K extends ConfigBackedGlobalStateKey>(key: K, value: GlobalState[K]) {
-		const normalizedValue = normalizeConfigBackedGlobalStateValue(value)
+		const normalizedValue = normalizeConfigBackedGlobalStateValue(key, value)
 		this.stateCache[key] = normalizedValue
 
 		await Promise.all([
@@ -272,6 +287,7 @@ export class ContextProxy {
 
 		if (isConfigBackedGlobalStateKey(key)) {
 			const configurationValue = normalizeConfigBackedGlobalStateValue(
+				key,
 				vscode.workspace.getConfiguration(Package.name).get(key) as GlobalState[K],
 			)
 			if (hasConfigBackedGlobalStateValue(configurationValue)) {

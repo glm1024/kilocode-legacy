@@ -751,8 +751,16 @@ export const webviewMessageHandler = async (
 						newValue = value ?? false
 					} else if (key === "aiCodeStatsWebhookUrl") {
 						newValue = typeof value === "string" ? value.trim() : ""
+					} else if (
+						key === "aiCodeStatsDepartmentName" ||
+						key === "aiCodeStatsOfficeName" ||
+						key === "aiCodeStatsTeamName"
+					) {
+						newValue = typeof value === "string" ? value.trim() : ""
 					} else if (key === "aiCodeStatsUserName") {
 						newValue = typeof value === "string" ? value.trim() : ""
+					} else if (key === "aiCodeStatsUserEmail") {
+						newValue = typeof value === "string" ? value.trim().toLowerCase() : ""
 						// kilocode_change end
 					}
 

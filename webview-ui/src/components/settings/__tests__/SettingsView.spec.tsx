@@ -1,11 +1,11 @@
 // pnpm --filter @roo-code/vscode-webview test src/components/settings/__tests__/SettingsView.spec.tsx
 
-import { useState } from "react"
-import { render, screen, fireEvent, waitFor, within } from "@/utils/test-utils"
+import { fireEvent, render, screen, waitFor, within } from "@/utils/test-utils"
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
+import { useState } from "react"
 
-import { vscode } from "@/utils/vscode"
 import { ExtensionStateContextProvider } from "@/context/ExtensionStateContext"
+import { vscode } from "@/utils/vscode"
 
 import SettingsView from "../SettingsView"
 
@@ -35,11 +35,31 @@ vi.mock("../ApiConfigManager", () => ({
 vi.mock("../StatisticsSettings", () => ({
 	StatisticsSettings: ({
 		aiCodeStatsWebhookUrl,
+		aiCodeStatsDepartmentName,
+		aiCodeStatsOfficeName,
+		aiCodeStatsTeamName,
 		aiCodeStatsUserName,
+		aiCodeStatsUserEmail,
 		setCachedStateField,
 		webhookValidationError,
+		identityValidationError,
 	}: any) => (
 		<div data-testid="statistics-settings">
+			<input
+				data-testid="statistics-department-name-input"
+				value={aiCodeStatsDepartmentName ?? ""}
+				onChange={(e) => setCachedStateField("aiCodeStatsDepartmentName", (e.target as HTMLInputElement).value)}
+			/>
+			<input
+				data-testid="statistics-office-name-input"
+				value={aiCodeStatsOfficeName ?? ""}
+				onChange={(e) => setCachedStateField("aiCodeStatsOfficeName", (e.target as HTMLInputElement).value)}
+			/>
+			<input
+				data-testid="statistics-team-name-input"
+				value={aiCodeStatsTeamName ?? ""}
+				onChange={(e) => setCachedStateField("aiCodeStatsTeamName", (e.target as HTMLInputElement).value)}
+			/>
 			<input
 				data-testid="statistics-webhook-url-input"
 				value={aiCodeStatsWebhookUrl ?? ""}
@@ -50,9 +70,19 @@ vi.mock("../StatisticsSettings", () => ({
 				value={aiCodeStatsUserName ?? ""}
 				onChange={(e) => setCachedStateField("aiCodeStatsUserName", (e.target as HTMLInputElement).value)}
 			/>
+			<input
+				data-testid="statistics-user-email-input"
+				value={aiCodeStatsUserEmail ?? ""}
+				onChange={(e) => setCachedStateField("aiCodeStatsUserEmail", (e.target as HTMLInputElement).value)}
+			/>
+			{identityValidationError && <div data-testid="statistics-identity-error">{identityValidationError}</div>}
 			{webhookValidationError && <div data-testid="statistics-webhook-error">{webhookValidationError}</div>}
 		</div>
 	),
+	getStatisticsTeamOptions: (departmentName?: string, officeName?: string) =>
+		departmentName === "云存储研发部" && officeName === "架设处" ? ["研发一组", "研发二组"] : [],
+	getStatisticsIdentityValidationKey: () => undefined,
+	normalizeStatisticsEmail: (value?: string) => value?.trim().toLowerCase() ?? "",
 }))
 // kilocode_change end
 
@@ -285,6 +315,11 @@ const mockPostMessage = (state: any) => {
 				ttsSpeed: 1,
 				soundEnabled: false,
 				soundVolume: 0.5,
+				aiCodeStatsDepartmentName: "云存储研发部",
+				aiCodeStatsOfficeName: "架设处",
+				aiCodeStatsTeamName: "研发一组",
+				aiCodeStatsUserName: "Test User",
+				aiCodeStatsUserEmail: "test.user@example.com",
 				...state,
 			},
 		},
@@ -638,7 +673,7 @@ describe("SettingsView - Allowed Commands", () => {
 		})
 
 		// kilocode_change start
-		it("renders coding analysis tab in the second position", () => {
+		it("renders data upload tab in the second position", () => {
 			renderSettingsView()
 
 			const providersTab = screen.getByTestId("tab-providers")
@@ -761,6 +796,21 @@ describe("SettingsView - Statistics Webhook Save Validation", () => {
 		vi.clearAllMocks()
 	})
 
+	const completeWebhookTestIfRequested = () => {
+		if (getPostMessageCallsByType("testAiCodeStatsWebhook").length === 0) {
+			return
+		}
+
+		window.postMessage(
+			{
+				type: "aiCodeStatsWebhookTestResult",
+				success: true,
+				text: "",
+			},
+			"*",
+		)
+	}
+
 	it("tests changed non-empty webhook before save and continues when test succeeds", async () => {
 		const { activateTab } = renderSettingsView({
 			aiCodeStatsWebhookUrl: "https://old.example.com/webhook",
@@ -838,10 +888,14 @@ describe("SettingsView - Statistics Webhook Save Validation", () => {
 		})
 		activateTab("statistics")
 
+		fireEvent.change(screen.getByTestId("statistics-webhook-url-input"), {
+			target: { value: "https://old.example.com/webhook" },
+		})
 		fireEvent.change(screen.getByTestId("statistics-user-name-input"), {
 			target: { value: "  Team Nine  " },
 		})
 		fireEvent.click(screen.getByTestId("save-button"))
+		completeWebhookTestIfRequested()
 
 		await waitFor(() => {
 			expect(getPostMessageCallsByType("updateSettings").length).toBeGreaterThan(0)
@@ -851,6 +905,30 @@ describe("SettingsView - Statistics Webhook Save Validation", () => {
 		expect(updateSettings.updatedSettings.aiCodeStatsUserName).toBe("Team Nine")
 	})
 
+	it("normalizes the company email during save", async () => {
+		const { activateTab } = renderSettingsView({
+			aiCodeStatsWebhookUrl: "https://old.example.com/webhook",
+			aiCodeStatsUserEmail: "old@example.com",
+		})
+		activateTab("statistics")
+
+		fireEvent.change(screen.getByTestId("statistics-webhook-url-input"), {
+			target: { value: "https://old.example.com/webhook" },
+		})
+		fireEvent.change(screen.getByTestId("statistics-user-email-input"), {
+			target: { value: "  Alice.Zhang@Example.COM  " },
+		})
+		fireEvent.click(screen.getByTestId("save-button"))
+		completeWebhookTestIfRequested()
+
+		await waitFor(() => {
+			expect(getPostMessageCallsByType("updateSettings").length).toBeGreaterThan(0)
+		})
+
+		const updateSettings = getPostMessageCallsByType("updateSettings").at(-1)
+		expect(updateSettings.updatedSettings.aiCodeStatsUserEmail).toBe("alice.zhang@example.com")
+	})
+
 	it("keeps the saved user name visible before extension state round-trips back", async () => {
 		const { activateTab } = renderSettingsView({
 			aiCodeStatsWebhookUrl: "https://old.example.com/webhook",
@@ -858,10 +936,14 @@ describe("SettingsView - Statistics Webhook Save Validation", () => {
 		})
 		activateTab("statistics")
 
+		fireEvent.change(screen.getByTestId("statistics-webhook-url-input"), {
+			target: { value: "https://old.example.com/webhook" },
+		})
 		fireEvent.change(screen.getByTestId("statistics-user-name-input"), {
 			target: { value: "Team Nine" },
 		})
 		fireEvent.click(screen.getByTestId("save-button"))
+		completeWebhookTestIfRequested()
 
 		await waitFor(() => {
 			expect(getPostMessageCallsByType("updateSettings").length).toBeGreaterThan(0)
@@ -996,7 +1078,7 @@ describe("SettingsView - Statistics Webhook Save Validation", () => {
 		expect(getPostMessageCallsByType("updateSettings")).toHaveLength(0)
 	})
 
-	it("skips webhook test when normalized url is empty", () => {
+	it("blocks save when normalized url is empty", () => {
 		const { activateTab } = renderSettingsView({
 			aiCodeStatsWebhookUrl: "https://old.example.com/webhook",
 			aiCodeStatsUserName: "Old Name",
@@ -1009,7 +1091,9 @@ describe("SettingsView - Statistics Webhook Save Validation", () => {
 		fireEvent.click(screen.getByTestId("save-button"))
 
 		expect(getPostMessageCallsByType("testAiCodeStatsWebhook")).toHaveLength(0)
-		const updateSettings = getPostMessageCallsByType("updateSettings").at(-1)
-		expect(updateSettings.updatedSettings.aiCodeStatsWebhookUrl).toBe("")
+		expect(screen.getByTestId("statistics-webhook-error")).toHaveTextContent(
+			"settings:statistics.webhook.test.required",
+		)
+		expect(getPostMessageCallsByType("updateSettings")).toHaveLength(0)
 	})
 })

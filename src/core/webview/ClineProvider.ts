@@ -396,7 +396,11 @@ export class ClineProvider
 			const aiCodeStatsService = AiCodeStatsService.initialize(globalStoragePath, async () => ({
 				webhookUrl: this.getPersistedAiCodeStatsSetting("aiCodeStatsWebhookUrl"),
 				// kilocode_change start
+				departmentName: this.getPersistedAiCodeStatsSetting("aiCodeStatsDepartmentName"),
+				officeName: this.getPersistedAiCodeStatsSetting("aiCodeStatsOfficeName"),
+				teamName: this.getPersistedAiCodeStatsSetting("aiCodeStatsTeamName"),
 				userName: this.getPersistedAiCodeStatsSetting("aiCodeStatsUserName"),
+				userEmail: this.getPersistedAiCodeStatsSetting("aiCodeStatsUserEmail"),
 				// kilocode_change end
 			}))
 			aiCodeStatsService.start()
@@ -413,7 +417,11 @@ export class ClineProvider
 			const globalStoragePath = this.contextProxy.globalStorageUri.fsPath
 			const aiTokenUsageService = AiTokenUsageService.initialize(globalStoragePath, async () => ({
 				webhookUrl: this.getPersistedAiCodeStatsSetting("aiCodeStatsWebhookUrl"),
+				departmentName: this.getPersistedAiCodeStatsSetting("aiCodeStatsDepartmentName"),
+				officeName: this.getPersistedAiCodeStatsSetting("aiCodeStatsOfficeName"),
+				teamName: this.getPersistedAiCodeStatsSetting("aiCodeStatsTeamName"),
 				userName: this.getPersistedAiCodeStatsSetting("aiCodeStatsUserName"),
+				userEmail: this.getPersistedAiCodeStatsSetting("aiCodeStatsUserEmail"),
 			}))
 			aiTokenUsageService.start()
 			this.log("AI token usage service initialized")
@@ -424,18 +432,31 @@ export class ClineProvider
 		}
 	}
 
-	private getPersistedAiCodeStatsSetting(key: "aiCodeStatsWebhookUrl" | "aiCodeStatsUserName"): string {
+	private getPersistedAiCodeStatsSetting(
+		key:
+			| "aiCodeStatsWebhookUrl"
+			| "aiCodeStatsDepartmentName"
+			| "aiCodeStatsOfficeName"
+			| "aiCodeStatsTeamName"
+			| "aiCodeStatsUserName"
+			| "aiCodeStatsUserEmail",
+	): string {
 		const configuration = vscode.workspace.getConfiguration(Package.name)
 		const inspectedValue = configuration.inspect?.(key)
 		const configuredValue =
 			inspectedValue?.workspaceFolderValue ?? inspectedValue?.workspaceValue ?? inspectedValue?.globalValue
 
 		if (typeof configuredValue === "string") {
-			return configuredValue.trim()
+			const trimmed = configuredValue.trim()
+			return key === "aiCodeStatsUserEmail" ? trimmed.toLowerCase() : trimmed
 		}
 
 		const stateValue = this.context.globalState.get<string>(key)
-		return typeof stateValue === "string" ? stateValue.trim() : ""
+		if (typeof stateValue !== "string") {
+			return ""
+		}
+		const trimmed = stateValue.trim()
+		return key === "aiCodeStatsUserEmail" ? trimmed.toLowerCase() : trimmed
 	}
 	// kilocode_change end
 
@@ -2380,7 +2401,11 @@ export class ClineProvider
 			yoloGatekeeperApiConfigId, // kilocode_change: AI gatekeeper for YOLO mode
 			selectedMicrophoneDevice, // kilocode_change: Selected microphone device for STT
 			aiCodeStatsWebhookUrl,
+			aiCodeStatsDepartmentName,
+			aiCodeStatsOfficeName,
+			aiCodeStatsTeamName,
 			aiCodeStatsUserName,
+			aiCodeStatsUserEmail,
 			isBrowserSessionActive,
 		} = await this.getState()
 
@@ -2599,7 +2624,11 @@ export class ClineProvider
 			includeCurrentCost: includeCurrentCost ?? true,
 			maxGitStatusFiles: maxGitStatusFiles ?? 0,
 			aiCodeStatsWebhookUrl,
+			aiCodeStatsDepartmentName,
+			aiCodeStatsOfficeName,
+			aiCodeStatsTeamName,
 			aiCodeStatsUserName,
+			aiCodeStatsUserEmail,
 			taskSyncEnabled,
 			remoteControlEnabled,
 			imageGenerationProvider,
@@ -2667,7 +2696,11 @@ export class ClineProvider
 	> {
 		const stateValues = this.contextProxy.getValues()
 		const aiCodeStatsWebhookUrl = this.getPersistedAiCodeStatsSetting("aiCodeStatsWebhookUrl")
+		const aiCodeStatsDepartmentName = this.getPersistedAiCodeStatsSetting("aiCodeStatsDepartmentName")
+		const aiCodeStatsOfficeName = this.getPersistedAiCodeStatsSetting("aiCodeStatsOfficeName")
+		const aiCodeStatsTeamName = this.getPersistedAiCodeStatsSetting("aiCodeStatsTeamName")
 		const aiCodeStatsUserName = this.getPersistedAiCodeStatsSetting("aiCodeStatsUserName")
+		const aiCodeStatsUserEmail = this.getPersistedAiCodeStatsSetting("aiCodeStatsUserEmail")
 		const customModes = await this.customModesManager.getCustomModes()
 
 		// Determine apiProvider with the same logic as before.
@@ -2842,8 +2875,12 @@ export class ClineProvider
 			autoPurgeLastRunTimestamp: stateValues.autoPurgeLastRunTimestamp,
 			aiCodeStatsUploadEnabled: stateValues.aiCodeStatsUploadEnabled ?? false,
 			aiCodeStatsWebhookUrl,
-			// kilocode_change start - AI code stats user name
+			// kilocode_change start - AI code stats identity
+			aiCodeStatsDepartmentName,
+			aiCodeStatsOfficeName,
+			aiCodeStatsTeamName,
 			aiCodeStatsUserName,
+			aiCodeStatsUserEmail,
 			// kilocode_change end
 			selectedMicrophoneDevice: stateValues.selectedMicrophoneDevice, // kilocode_change: Selected microphone device for STT
 			// kilocode_change end

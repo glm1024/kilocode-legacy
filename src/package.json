@@ -548,10 +548,30 @@
 					"default": "",
 					"description": "%settings.customStoragePath.description%"
 				},
+				"kilo-code.aiCodeStatsDepartmentName": {
+					"type": "string",
+					"default": "",
+					"description": "%settings.aiCodeStatsDepartmentName.description%"
+				},
+				"kilo-code.aiCodeStatsOfficeName": {
+					"type": "string",
+					"default": "",
+					"description": "%settings.aiCodeStatsOfficeName.description%"
+				},
+				"kilo-code.aiCodeStatsTeamName": {
+					"type": "string",
+					"default": "",
+					"description": "%settings.aiCodeStatsTeamName.description%"
+				},
 				"kilo-code.aiCodeStatsUserName": {
 					"type": "string",
 					"default": "",
 					"description": "%settings.aiCodeStatsUserName.description%"
+				},
+				"kilo-code.aiCodeStatsUserEmail": {
+					"type": "string",
+					"default": "",
+					"description": "%settings.aiCodeStatsUserEmail.description%"
 				},
 				"kilo-code.aiCodeStatsWebhookUrl": {
 					"type": "string",

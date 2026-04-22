@@ -51,12 +51,19 @@ export class AiTokenUsageStore {
 			if (existing) {
 				existing.timezone = record.timezone
 				existing.userName = record.userName
+				existing.userEmail = record.userEmail
+				existing.departmentName = record.departmentName
+				existing.officeName = record.officeName
+				existing.teamName = record.teamName
 				existing.sourceIp = record.sourceIp
 				existing.userKey = record.userKey
 				existing.organizationId = record.organizationId
 				existing.organizationName = record.organizationName
-				existing.workspaceName = record.workspaceName
 				existing.projectKey = record.projectKey
+				existing.projectName = record.projectName
+				existing.repoRoot = record.repoRoot
+				existing.gitRemoteUrl = record.gitRemoteUrl
+				existing.gitBranch = record.gitBranch
 				existing.ide = record.ide
 				existing.provider = record.provider
 				existing.model = record.model

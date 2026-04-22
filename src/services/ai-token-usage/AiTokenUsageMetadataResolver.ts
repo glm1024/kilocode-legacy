@@ -4,16 +4,22 @@ import { CloudService } from "@roo-code/cloud"
 
 import { getCurrentBranch, getRemoteUrl, isGitRepository } from "../code-index/managed/git-utils"
 import { AiCodeStatsLocalIdentityResolver } from "../ai-code-stats/AiCodeStatsLocalIdentityResolver"
-import { normalizePath, type AiTokenUsageUploadSettings } from "./types"
+import { normalizePath, normalizeUserEmail, type AiTokenUsageUploadSettings } from "./types"
 
 interface AiTokenUsageGitMetadata {
 	gitRemoteUrl?: string
 	gitBranch?: string
 	projectKey: string
+	projectName: string
+	repoRoot?: string
 }
 
 export interface AiTokenUsageResolvedMetadata extends AiTokenUsageGitMetadata {
 	userName?: string
+	departmentName?: string
+	officeName?: string
+	teamName?: string
+	userEmail?: string
 	organizationId?: string
 	organizationName?: string
 	sourceIp?: string
@@ -24,10 +30,14 @@ export class AiTokenUsageMetadataResolver {
 
 	constructor(private readonly localIdentityResolver = new AiCodeStatsLocalIdentityResolver()) {}
 
-	async resolve(workspacePath: string, settings: AiTokenUsageUploadSettings): Promise<AiTokenUsageResolvedMetadata> {
-		const normalizedWorkspacePath = normalizePath(path.resolve(workspacePath))
+	async resolve(
+		repoRoot: string | undefined,
+		settings: AiTokenUsageUploadSettings,
+	): Promise<AiTokenUsageResolvedMetadata> {
 		const identity = this.resolveIdentity(settings)
-		const gitMetadata = await this.resolveGitMetadata(normalizedWorkspacePath)
+		const gitMetadata = repoRoot
+			? await this.resolveGitMetadata(normalizePath(path.resolve(repoRoot)))
+			: this.unknownProjectMetadata()
 		return {
 			...identity,
 			...gitMetadata,
@@ -42,47 +52,82 @@ export class AiTokenUsageMetadataResolver {
 		const cloudUserInfo = CloudService.hasInstance() ? CloudService.instance.getUserInfo() : undefined
 		return {
 			userName,
+			departmentName: settings.departmentName?.trim() || undefined,
+			officeName: settings.officeName?.trim() || undefined,
+			teamName: settings.teamName?.trim() || undefined,
+			userEmail: normalizeUserEmail(settings.userEmail),
 			organizationId: cloudUserInfo?.organizationId,
 			organizationName: cloudUserInfo?.organizationName,
 			sourceIp,
 		}
 	}
 
-	private async resolveGitMetadata(workspacePath: string): Promise<AiTokenUsageGitMetadata> {
-		const cached = this.gitMetadataCache.get(workspacePath)
+	private async resolveGitMetadata(repoRoot: string): Promise<AiTokenUsageGitMetadata> {
+		const cached = this.gitMetadataCache.get(repoRoot)
 		if (cached) {
 			return cached
 		}
 
-		const pending = this.loadGitMetadata(workspacePath)
-		this.gitMetadataCache.set(workspacePath, pending)
+		const pending = this.loadGitMetadata(repoRoot)
+		this.gitMetadataCache.set(repoRoot, pending)
 		return pending
 	}
 
-	private async loadGitMetadata(workspacePath: string): Promise<AiTokenUsageGitMetadata> {
-		const fallbackProjectKey = this.buildProjectKey(workspacePath)
+	private async loadGitMetadata(repoRoot: string): Promise<AiTokenUsageGitMetadata> {
+		const fallbackProjectKey = this.buildProjectKey(repoRoot)
 		try {
-			const inGitRepository = await isGitRepository(workspacePath)
+			const inGitRepository = await isGitRepository(repoRoot)
 			if (!inGitRepository) {
-				return { projectKey: fallbackProjectKey }
+				return {
+					projectKey: fallbackProjectKey,
+					projectName: this.buildProjectName(undefined, repoRoot),
+					repoRoot,
+				}
 			}
 
 			const [gitRemoteUrl, gitBranch] = await Promise.all([
-				getRemoteUrl(workspacePath).catch(() => undefined),
-				getCurrentBranch(workspacePath).catch(() => undefined),
+				getRemoteUrl(repoRoot).catch(() => undefined),
+				getCurrentBranch(repoRoot).catch(() => undefined),
 			])
 
 			return {
 				gitRemoteUrl,
 				gitBranch,
-				projectKey: this.buildProjectKey(gitRemoteUrl || workspacePath),
+				projectKey: this.buildProjectKey(gitRemoteUrl || repoRoot),
+				projectName: this.buildProjectName(gitRemoteUrl, repoRoot),
+				repoRoot,
 			}
 		} catch {
-			return { projectKey: fallbackProjectKey }
+			return {
+				projectKey: fallbackProjectKey,
+				projectName: this.buildProjectName(undefined, repoRoot),
+				repoRoot,
+			}
+		}
+	}
+
+	private unknownProjectMetadata(): AiTokenUsageGitMetadata {
+		return {
+			projectKey: "unknown-project",
+			projectName: "unknown-project",
 		}
 	}
 
 	private buildProjectKey(seed: string): string {
 		return crypto.createHash("sha256").update(normalizePath(seed)).digest("hex").slice(0, 16)
+	}
+
+	private buildProjectName(gitRemoteUrl: string | undefined, repoRoot: string): string {
+		const remoteName = gitRemoteUrl
+			?.trim()
+			.replace(/[\\/]+$/, "")
+			.split(/[\\/:]/)
+			.pop()
+			?.replace(/\.git$/i, "")
+			.trim()
+		if (remoteName) {
+			return remoteName
+		}
+		return path.basename(normalizePath(repoRoot)) || "unknown-project"
 	}
 }

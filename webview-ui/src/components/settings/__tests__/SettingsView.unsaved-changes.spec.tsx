@@ -129,6 +129,9 @@ vi.mock("../UISettings", () => ({
 // kilocode_change start
 vi.mock("../StatisticsSettings", () => ({
 	StatisticsSettings: vi.fn(() => <div>StatisticsSettings</div>),
+	getStatisticsTeamOptions: () => [],
+	getStatisticsIdentityValidationKey: () => undefined,
+	normalizeStatisticsEmail: (value?: string) => value?.trim().toLowerCase() ?? "",
 }))
 // kilocode_change end
 vi.mock("../SectionHeader", () => ({
@@ -221,7 +224,11 @@ describe("SettingsView - Unsaved Changes Detection", () => {
 		reasoningBlockCollapsed: true,
 		aiCodeStatsUploadEnabled: false,
 		aiCodeStatsWebhookUrl: "",
-		aiCodeStatsUserName: "",
+		aiCodeStatsDepartmentName: "云存储研发部",
+		aiCodeStatsOfficeName: "经理室",
+		aiCodeStatsTeamName: "",
+		aiCodeStatsUserName: "Test User",
+		aiCodeStatsUserEmail: "test.user@example.com",
 	}
 
 	beforeEach(() => {

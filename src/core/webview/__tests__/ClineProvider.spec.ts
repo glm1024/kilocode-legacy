@@ -859,6 +859,9 @@ describe("ClineProvider", () => {
 			if (key === "aiCodeStatsUserName") {
 				return { globalValue: "  Alice Zhang  " }
 			}
+			if (key === "aiCodeStatsUserEmail") {
+				return { globalValue: "  Alice.Zhang@Example.COM  " }
+			}
 			return undefined
 		})
 		;(mockContext.globalState.get as any).mockImplementation((key: string) => {
@@ -868,6 +871,9 @@ describe("ClineProvider", () => {
 			if (key === "aiCodeStatsUserName") {
 				return "Old Name"
 			}
+			if (key === "aiCodeStatsUserEmail") {
+				return "old@example.com"
+			}
 			return undefined
 		})
 
@@ -875,6 +881,7 @@ describe("ClineProvider", () => {
 
 		expect(state.aiCodeStatsWebhookUrl).toBe("https://stats.example.com/upload")
 		expect(state.aiCodeStatsUserName).toBe("Alice Zhang")
+		expect(state.aiCodeStatsUserEmail).toBe("alice.zhang@example.com")
 	})
 
 	test("getStateToPostToWebview includes persisted VS Code settings for AI code stats fields", async () => {
@@ -885,6 +892,9 @@ describe("ClineProvider", () => {
 			if (key === "aiCodeStatsUserName") {
 				return { globalValue: "  glm  " }
 			}
+			if (key === "aiCodeStatsUserEmail") {
+				return { globalValue: "  GLM@example.com  " }
+			}
 			return undefined
 		})
 		;(mockContext.globalState.get as any).mockImplementation((key: string) => {
@@ -894,6 +904,9 @@ describe("ClineProvider", () => {
 			if (key === "aiCodeStatsUserName") {
 				return ""
 			}
+			if (key === "aiCodeStatsUserEmail") {
+				return ""
+			}
 			return undefined
 		})
 
@@ -901,6 +914,7 @@ describe("ClineProvider", () => {
 
 		expect(state.aiCodeStatsWebhookUrl).toBe("http://localhost:8081")
 		expect(state.aiCodeStatsUserName).toBe("glm")
+		expect(state.aiCodeStatsUserEmail).toBe("glm@example.com")
 	})
 
 	test("handles writeDelayMs message", async () => {
@@ -923,16 +937,19 @@ describe("ClineProvider", () => {
 			updatedSettings: {
 				aiCodeStatsWebhookUrl: "  https://stats.example.com/upload  ",
 				aiCodeStatsUserName: "  Alice Zhang  ",
+				aiCodeStatsUserEmail: "  Alice.Zhang@Example.COM  ",
 			},
 		})
 
 		expect(updateGlobalStateSpy).toHaveBeenCalledWith("aiCodeStatsWebhookUrl", "https://stats.example.com/upload")
 		expect(updateGlobalStateSpy).toHaveBeenCalledWith("aiCodeStatsUserName", "Alice Zhang")
+		expect(updateGlobalStateSpy).toHaveBeenCalledWith("aiCodeStatsUserEmail", "alice.zhang@example.com")
 		expect(mockContext.globalState.update).toHaveBeenCalledWith(
 			"aiCodeStatsWebhookUrl",
 			"https://stats.example.com/upload",
 		)
 		expect(mockContext.globalState.update).toHaveBeenCalledWith("aiCodeStatsUserName", "Alice Zhang")
+		expect(mockContext.globalState.update).toHaveBeenCalledWith("aiCodeStatsUserEmail", "alice.zhang@example.com")
 		expect(mockWorkspaceConfigurationUpdate).toHaveBeenCalledWith(
 			"aiCodeStatsWebhookUrl",
 			"https://stats.example.com/upload",
@@ -941,6 +958,11 @@ describe("ClineProvider", () => {
 		expect(mockWorkspaceConfigurationUpdate).toHaveBeenCalledWith(
 			"aiCodeStatsUserName",
 			"Alice Zhang",
+			vscode.ConfigurationTarget.Global,
+		)
+		expect(mockWorkspaceConfigurationUpdate).toHaveBeenCalledWith(
+			"aiCodeStatsUserEmail",
+			"alice.zhang@example.com",
 			vscode.ConfigurationTarget.Global,
 		)
 		expect(mockPostMessage).toHaveBeenCalled()

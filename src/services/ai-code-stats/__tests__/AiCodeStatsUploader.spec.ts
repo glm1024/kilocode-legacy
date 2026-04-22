@@ -24,9 +24,8 @@ const buildCommitReport = (overrides: Partial<AiCodeCommitReport> = {}): AiCodeC
 	reportGeneratedAt: overrides.reportGeneratedAt ?? Date.now(),
 	client: overrides.client ?? { ide: "vscode", machineId: "machine-1" },
 	repoRoot: overrides.repoRoot ?? "/workspace/project",
-	workspaceName: overrides.workspaceName ?? "project",
-	workspacePath: overrides.workspacePath ?? "/workspace/project",
 	projectKey: overrides.projectKey ?? "project-key",
+	projectName: overrides.projectName ?? "repo",
 	gitRemoteUrl: overrides.gitRemoteUrl ?? "https://github.com/example/repo.git",
 	gitBranch: overrides.gitBranch ?? "feature/stats",
 	commitHash: overrides.commitHash ?? "commit-1",
@@ -40,9 +39,10 @@ const buildCommitReport = (overrides: Partial<AiCodeCommitReport> = {}): AiCodeC
 			semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
 			sourceType: "agent_insert",
 			ide: "vscode",
-			workspaceName: "project",
-			workspacePath: "/workspace/project",
 			projectKey: "project-key",
+			projectName: "repo",
+			repoRoot: "/workspace/project",
+			repoRelativePath: "src/a.ts",
 			filePath: "/workspace/project/src/a.ts",
 			relativePath: "src/a.ts",
 			language: "typescript",
@@ -121,9 +121,10 @@ describe("AiCodeStatsUploader", () => {
 							timestamp: Date.now(),
 							sourceType: "agent_insert",
 							ide: "vscode",
-							workspaceName: "project",
-							workspacePath: "/workspace/project",
 							projectKey: "project-key",
+							projectName: "repo",
+							repoRoot: "/workspace/project",
+							repoRelativePath: "src/b.ts",
 							filePath: "/workspace/project/src/b.ts",
 							relativePath: "src/b.ts",
 							language: "typescript",
@@ -144,16 +145,22 @@ describe("AiCodeStatsUploader", () => {
 		const fetchMock = vi.fn().mockResolvedValue(new Response("ok", { status: 200 }))
 		vi.stubGlobal("fetch", fetchMock)
 
-		const result = await uploader.uploadQueuedReports({ enabled: true, webhookUrl: "https://example.com/webhook" })
+		const result = await uploader.uploadQueuedReports({
+			enabled: true,
+			webhookUrl: "https://example.com/webhook",
+			userEmail: "current.user@example.com",
+		})
 
 		expect(result).toEqual({ uploadedReports: 2, uploadedBlocks: 2 })
 		expect(fetchMock.mock.calls).toHaveLength(2)
 		const firstBody = JSON.parse(fetchMock.mock.calls[0][1].body as string)
 		expect(firstBody.reportId).toBe("report-1")
 		expect(firstBody.acceptedBlocks[0].fileSnapshotContent).toBe("const a = 1\n")
+		expect(firstBody.acceptedBlocks[0].userEmail).toBe("current.user@example.com")
 		const secondBody = JSON.parse(fetchMock.mock.calls[1][1].body as string)
 		expect(secondBody.reportId).toBe("report-2")
 		expect(secondBody.generatedBlocks[0].fileSnapshotContent).toBe("const b = 2\n")
+		expect(secondBody.generatedBlocks[0].userEmail).toBe("current.user@example.com")
 		expect(secondBody.changedFiles[0]).toMatchObject({
 			relativePath: "src/a.ts",
 			filePath: "/workspace/project/src/a.ts",
@@ -176,10 +183,12 @@ describe("AiCodeStatsUploader", () => {
 			timestamp: Date.now(),
 			semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
 			sourceType: "agent_insert",
-			ide: "vscode",
+			ide: "goland",
 			metricType: "generated",
-			workspaceName: "project",
-			workspacePath: "/workspace/project",
+			projectKey: "project-key",
+			projectName: "repo",
+			repoRoot: "/workspace/project",
+			repoRelativePath: "src/rejected.ts",
 			filePath: "/workspace/project/src/rejected.ts",
 			relativePath: "src/rejected.ts",
 			lineStart: 2,
@@ -193,21 +202,26 @@ describe("AiCodeStatsUploader", () => {
 		vi.stubGlobal("fetch", fetchMock)
 
 		const result = await uploader.upload(
-			{ enabled: true, webhookUrl: "https://example.com/webhook" },
-			{ client: { ide: "vscode", machineId: "machine-1" } },
+			{ enabled: true, webhookUrl: "https://example.com/webhook", userEmail: "current.user@example.com" },
+			{ client: { ide: "goland", machineId: "machine-1" } },
 		)
 
 		expect(result).toEqual({ uploaded: 1 })
 		expect(fetchMock.mock.calls).toHaveLength(1)
 		const body = JSON.parse(fetchMock.mock.calls[0][1].body as string)
 		expect(body.mode).toBe("incremental")
+		expect(body.client.ide).toBe("goland")
 		expect(body.events).toHaveLength(1)
 		expect(body.events[0]).toMatchObject({
 			eventId: "event-1",
+			ide: "goland",
 			sourceType: "agent_insert",
 			metricType: "generated",
+			userEmail: "current.user@example.com",
 			relativePath: "src/rejected.ts",
 		})
+		expect(body.events[0]).not.toHaveProperty("workspaceName")
+		expect(body.events[0]).not.toHaveProperty("workspacePath")
 		expect(await store.getPendingEvents()).toHaveLength(0)
 	})
 
@@ -219,8 +233,10 @@ describe("AiCodeStatsUploader", () => {
 			sourceType: "agent_insert",
 			ide: "vscode",
 			metricType: "committed",
-			workspaceName: "project",
-			workspacePath: "/workspace/project",
+			projectKey: "project-key",
+			projectName: "repo",
+			repoRoot: "/workspace/project",
+			repoRelativePath: "src/a.ts",
 			filePath: "/workspace/project/src/a.ts",
 			relativePath: "src/a.ts",
 			lineStart: 1,
@@ -233,7 +249,7 @@ describe("AiCodeStatsUploader", () => {
 		vi.stubGlobal("fetch", fetchMock)
 
 		const result = await uploader.upload(
-			{ enabled: true, webhookUrl: "https://example.com/webhook" },
+			{ enabled: true, webhookUrl: "https://example.com/webhook", userEmail: "current.user@example.com" },
 			{ client: { ide: "vscode", machineId: "machine-1" } },
 		)
 
@@ -259,13 +275,18 @@ describe("AiCodeStatsUploader", () => {
 		vi.stubGlobal("fetch", fetchMock)
 
 		await expect(
-			uploader.uploadQueuedReports({ enabled: true, webhookUrl: "https://example.com/webhook" }),
+			uploader.uploadQueuedReports({
+				enabled: true,
+				webhookUrl: "https://example.com/webhook",
+				userEmail: "current.user@example.com",
+			}),
 		).rejects.toThrow()
 		expect(await store.getQueuedReportsForTests()).toHaveLength(1)
 
 		const retryResult = await uploader.uploadQueuedReports({
 			enabled: true,
 			webhookUrl: "https://example.com/webhook",
+			userEmail: "current.user@example.com",
 		})
 		expect(retryResult).toEqual({ uploadedReports: 1, uploadedBlocks: 1 })
 		expect(await store.getQueuedReportsForTests()).toHaveLength(0)

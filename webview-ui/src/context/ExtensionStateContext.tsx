@@ -68,7 +68,11 @@ export interface ExtensionStateContextType extends ExtensionState {
 	setAutoPurgeLastRunTimestamp: (value: number) => void
 	// kilocode_change end
 	setAiCodeStatsWebhookUrl: (value: string) => void
+	setAiCodeStatsDepartmentName: (value: string) => void
+	setAiCodeStatsOfficeName: (value: string) => void
+	setAiCodeStatsTeamName: (value: string) => void
 	setAiCodeStatsUserName: (value: string) => void
+	setAiCodeStatsUserEmail: (value: string) => void
 	didHydrateState: boolean
 	showWelcome: boolean
 	theme: any
@@ -364,7 +368,11 @@ export const ExtensionStateContextProvider: React.FC<{ children: React.ReactNode
 		autoPurgeLastRunTimestamp: undefined,
 		aiCodeStatsUploadEnabled: false,
 		aiCodeStatsWebhookUrl: "",
+		aiCodeStatsDepartmentName: "",
+		aiCodeStatsOfficeName: "",
+		aiCodeStatsTeamName: "",
 		aiCodeStatsUserName: "",
+		aiCodeStatsUserEmail: "",
 		// kilocode_change end
 		openRouterImageGenerationSelectedModel: "",
 		includeCurrentTime: true,
@@ -756,7 +764,12 @@ export const ExtensionStateContextProvider: React.FC<{ children: React.ReactNode
 		setAutoPurgeLastRunTimestamp: (value) =>
 			setState((prevState) => ({ ...prevState, autoPurgeLastRunTimestamp: value })),
 		setAiCodeStatsWebhookUrl: (value) => setState((prevState) => ({ ...prevState, aiCodeStatsWebhookUrl: value })),
+		setAiCodeStatsDepartmentName: (value) =>
+			setState((prevState) => ({ ...prevState, aiCodeStatsDepartmentName: value })),
+		setAiCodeStatsOfficeName: (value) => setState((prevState) => ({ ...prevState, aiCodeStatsOfficeName: value })),
+		setAiCodeStatsTeamName: (value) => setState((prevState) => ({ ...prevState, aiCodeStatsTeamName: value })),
 		setAiCodeStatsUserName: (value) => setState((prevState) => ({ ...prevState, aiCodeStatsUserName: value })),
+		setAiCodeStatsUserEmail: (value) => setState((prevState) => ({ ...prevState, aiCodeStatsUserEmail: value })),
 		// kilocode_change end
 		includeTaskHistoryInEnhance,
 		setIncludeTaskHistoryInEnhance,

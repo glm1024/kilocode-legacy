@@ -1,5 +1,5 @@
 export type AiCodeSourceType = "agent_insert"
-export type AiCodeIde = "vscode" | "jetbrains"
+export type AiCodeIde = string
 export type AiCodeMetricType = "generated" | "accepted"
 export type AiCodeUploadMode = "incremental"
 export type AiCodeGeneratedBlockUploadStatus = "pending" | "queued" | "uploaded"
@@ -13,13 +13,17 @@ export interface AiCodeStatsEvent {
 	ide: AiCodeIde
 	metricType: AiCodeMetricType
 	userName?: string
+	departmentName?: string
+	officeName?: string
+	teamName?: string
 	userEmail?: string
 	organizationId?: string
 	organizationName?: string
 	sourceIp?: string
-	workspaceName: string
-	workspacePath: string
 	projectKey?: string
+	projectName?: string
+	repoRoot?: string
+	repoRelativePath?: string
 	filePath: string
 	relativePath: string
 	language?: string
@@ -44,13 +48,17 @@ export interface AiCodeGeneratedBlock {
 	sourceType: AiCodeSourceType
 	ide: AiCodeIde
 	userName?: string
+	departmentName?: string
+	officeName?: string
+	teamName?: string
 	userEmail?: string
 	organizationId?: string
 	organizationName?: string
 	sourceIp?: string
-	workspaceName: string
-	workspacePath: string
 	projectKey?: string
+	projectName?: string
+	repoRoot?: string
+	repoRelativePath?: string
 	filePath: string
 	relativePath: string
 	language?: string
@@ -66,8 +74,6 @@ export interface AiCodeGeneratedBlock {
 
 export interface AiCodeGeneratedBlockState extends AiCodeGeneratedBlock {
 	stateId: string
-	repoRoot?: string
-	repoRelativePath?: string
 	originEventId?: string
 	originTimestamp?: number
 	originLineStart?: number
@@ -94,13 +100,15 @@ export interface AiCodeCommitCandidateLine {
 	sourceType: AiCodeSourceType
 	ide: AiCodeIde
 	userName?: string
+	departmentName?: string
+	officeName?: string
+	teamName?: string
 	userEmail?: string
 	organizationId?: string
 	organizationName?: string
 	sourceIp?: string
-	workspaceName: string
-	workspacePath: string
 	projectKey?: string
+	projectName?: string
 	filePath: string
 	relativePath: string
 	repoRoot: string
@@ -152,9 +160,8 @@ export interface AiCodeCommitReport {
 	reportGeneratedAt: number
 	client: AiCodeStatsUploadClient
 	repoRoot: string
-	workspaceName: string
-	workspacePath: string
 	projectKey?: string
+	projectName?: string
 	gitRemoteUrl?: string
 	gitBranch?: string
 	commitHash: string
@@ -195,7 +202,11 @@ export interface AiCodeStatsUploadSettings {
 	enabled?: boolean
 	webhookUrl?: string
 	// kilocode_change start
+	departmentName?: string
+	officeName?: string
+	teamName?: string
 	userName?: string
+	userEmail?: string
 	// kilocode_change end
 }
 
@@ -257,13 +268,15 @@ export interface AiCodePendingLineAttribution {
 	ide: AiCodeIde
 	// kilocode_change start
 	userName?: string
+	departmentName?: string
+	officeName?: string
+	teamName?: string
 	userEmail?: string
 	organizationId?: string
 	organizationName?: string
 	sourceIp?: string
-	workspaceName: string
-	workspacePath: string
 	projectKey?: string
+	projectName?: string
 	filePath: string
 	relativePath: string
 	repoRoot: string
@@ -293,3 +306,10 @@ export const toLocalDateKey = (timestamp: number): string => {
 }
 
 export const normalizePath = (value: string): string => value.replace(/\\/g, "/")
+
+export const normalizeUserEmail = (value?: string): string | undefined => {
+	const normalized = value?.trim().toLowerCase()
+	return normalized ? normalized : undefined
+}
+
+export const buildEmailUserKey = (userEmail: string): string => `email:${normalizeUserEmail(userEmail) ?? ""}`

@@ -277,15 +277,15 @@ describe("ContextProxy", () => {
 		})
 
 		it("should mirror config-backed global state keys into VS Code user settings", async () => {
-			await proxy.setValue("aiCodeStatsUserName", "  Team Nine  ")
+			await proxy.setValue("aiCodeStatsUserEmail", "  Alice.Zhang@Example.COM  ")
 
-			expect(mockGlobalState.update).toHaveBeenCalledWith("aiCodeStatsUserName", "Team Nine")
+			expect(mockGlobalState.update).toHaveBeenCalledWith("aiCodeStatsUserEmail", "alice.zhang@example.com")
 			expect(mockConfiguration.update).toHaveBeenCalledWith(
-				"aiCodeStatsUserName",
-				"Team Nine",
+				"aiCodeStatsUserEmail",
+				"alice.zhang@example.com",
 				vscode.ConfigurationTarget.Global,
 			)
-			expect(proxy.getGlobalState("aiCodeStatsUserName")).toBe("Team Nine")
+			expect(proxy.getGlobalState("aiCodeStatsUserEmail")).toBe("alice.zhang@example.com")
 		})
 	})
 
@@ -552,6 +552,9 @@ describe("ContextProxy", () => {
 				if (key === "aiCodeStatsUserName") {
 					return " Alice Zhang "
 				}
+				if (key === "aiCodeStatsUserEmail") {
+					return " Alice.Zhang@Example.COM "
+				}
 				return undefined
 			})
 
@@ -563,10 +566,12 @@ describe("ContextProxy", () => {
 				"https://stats.example.com/upload",
 			)
 			expect(mockGlobalState.update).toHaveBeenCalledWith("aiCodeStatsUserName", "Alice Zhang")
+			expect(mockGlobalState.update).toHaveBeenCalledWith("aiCodeStatsUserEmail", "alice.zhang@example.com")
 			expect(proxyWithConfigBackedState.getGlobalState("aiCodeStatsWebhookUrl")).toBe(
 				"https://stats.example.com/upload",
 			)
 			expect(proxyWithConfigBackedState.getGlobalState("aiCodeStatsUserName")).toBe("Alice Zhang")
+			expect(proxyWithConfigBackedState.getGlobalState("aiCodeStatsUserEmail")).toBe("alice.zhang@example.com")
 		})
 
 		it("should backfill existing AI code stats global state into VS Code user settings", async () => {
@@ -577,6 +582,9 @@ describe("ContextProxy", () => {
 				}
 				if (key === "aiCodeStatsUserName") {
 					return " Alice Zhang "
+				}
+				if (key === "aiCodeStatsUserEmail") {
+					return " Alice.Zhang@Example.COM "
 				}
 				return undefined
 			})
@@ -593,6 +601,11 @@ describe("ContextProxy", () => {
 			expect(mockConfiguration.update).toHaveBeenCalledWith(
 				"aiCodeStatsUserName",
 				"Alice Zhang",
+				vscode.ConfigurationTarget.Global,
+			)
+			expect(mockConfiguration.update).toHaveBeenCalledWith(
+				"aiCodeStatsUserEmail",
+				"alice.zhang@example.com",
 				vscode.ConfigurationTarget.Global,
 			)
 		})

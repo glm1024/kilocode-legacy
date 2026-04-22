@@ -563,7 +563,11 @@ export type ExtensionState = Pick<
 	// kilocode_change start
 	| "aiCodeStatsUploadEnabled"
 	| "aiCodeStatsWebhookUrl"
+	| "aiCodeStatsDepartmentName"
+	| "aiCodeStatsOfficeName"
+	| "aiCodeStatsTeamName"
 	| "aiCodeStatsUserName"
+	| "aiCodeStatsUserEmail"
 	// kilocode_change end
 	| "condensingApiConfigId"
 	| "customCondensingPrompt"

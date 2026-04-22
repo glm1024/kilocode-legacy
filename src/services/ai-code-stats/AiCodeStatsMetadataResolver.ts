@@ -8,16 +8,27 @@ import { CloudService } from "@roo-code/cloud"
 import { languageForFilepath } from "../autocomplete/continuedev/core/autocomplete/constants/AutocompleteLanguageInfo"
 import { getCurrentBranch, getRemoteUrl, isGitRepository } from "../code-index/managed/git-utils"
 import { AiCodeStatsLocalIdentityResolver } from "./AiCodeStatsLocalIdentityResolver"
-import { normalizePath, type AiCodeStatsUploadSettings } from "./types"
+import { normalizePath, normalizeUserEmail, type AiCodeStatsUploadSettings } from "./types"
 
 interface AiCodeStatsGitMetadata {
 	gitRemoteUrl?: string
 	gitBranch?: string
 	projectKey: string
+	projectName: string
+}
+
+interface AiCodeStatsStableGitMetadata {
+	gitRemoteUrl?: string
+	projectKey: string
+	projectName: string
+	inGitRepository: boolean
 }
 
 export interface AiCodeStatsResolvedMetadata extends AiCodeStatsGitMetadata {
 	userName?: string
+	departmentName?: string
+	officeName?: string
+	teamName?: string
 	userEmail?: string
 	organizationId?: string
 	organizationName?: string
@@ -40,17 +51,17 @@ const normalizeLanguage = (value?: string): string | undefined => {
 }
 
 export class AiCodeStatsMetadataResolver {
-	private readonly gitMetadataCache = new Map<string, Promise<AiCodeStatsGitMetadata>>()
+	private readonly stableGitMetadataCache = new Map<string, Promise<AiCodeStatsStableGitMetadata>>()
 	constructor(private readonly localIdentityResolver = new AiCodeStatsLocalIdentityResolver()) {}
 
 	async resolve(
-		workspacePath: string,
+		repoRoot: string,
 		filePath: string,
 		settings: AiCodeStatsUploadSettings,
 	): Promise<AiCodeStatsResolvedMetadata> {
 		const identity = this.resolveIdentity(settings)
 		const language = this.resolveLanguage(filePath)
-		const gitMetadata = await this.resolveGitMetadata(workspacePath)
+		const gitMetadata = await this.resolveGitMetadata(repoRoot)
 
 		return {
 			...identity,
@@ -68,7 +79,10 @@ export class AiCodeStatsMetadataResolver {
 
 		return {
 			userName,
-			userEmail: cloudUserInfo?.email,
+			departmentName: settings.departmentName?.trim() || undefined,
+			officeName: settings.officeName?.trim() || undefined,
+			teamName: settings.teamName?.trim() || undefined,
+			userEmail: normalizeUserEmail(settings.userEmail),
 			organizationId: cloudUserInfo?.organizationId,
 			organizationName: cloudUserInfo?.organizationName,
 			sourceIp,
@@ -92,48 +106,85 @@ export class AiCodeStatsMetadataResolver {
 		return normalizeLanguage(languageForFilepath(filePath).name)
 	}
 
-	private async resolveGitMetadata(workspacePath: string): Promise<AiCodeStatsGitMetadata> {
-		const normalizedWorkspacePath = normalizePath(path.resolve(workspacePath))
-		const cached = this.gitMetadataCache.get(normalizedWorkspacePath)
+	private async resolveGitMetadata(repoRoot: string): Promise<AiCodeStatsGitMetadata> {
+		const normalizedRepoRoot = normalizePath(path.resolve(repoRoot))
+		const cached = this.stableGitMetadataCache.get(normalizedRepoRoot)
 		if (cached) {
-			return cached
+			return this.attachCurrentBranch(normalizedRepoRoot, await cached)
 		}
 
-		const pending = this.loadGitMetadata(normalizedWorkspacePath)
-		this.gitMetadataCache.set(normalizedWorkspacePath, pending)
+		const pending = this.loadStableGitMetadata(normalizedRepoRoot)
+		this.stableGitMetadataCache.set(normalizedRepoRoot, pending)
 
-		return pending
+		return this.attachCurrentBranch(normalizedRepoRoot, await pending)
 	}
 
-	private async loadGitMetadata(workspacePath: string): Promise<AiCodeStatsGitMetadata> {
-		const fallbackProjectKey = this.buildProjectKey(workspacePath)
+	private async loadStableGitMetadata(repoRoot: string): Promise<AiCodeStatsStableGitMetadata> {
+		const fallbackProjectKey = this.buildProjectKey(repoRoot)
 
 		try {
-			const inGitRepository = await isGitRepository(workspacePath)
+			const inGitRepository = await isGitRepository(repoRoot)
 			if (!inGitRepository) {
 				return {
 					projectKey: fallbackProjectKey,
+					projectName: this.buildProjectName(undefined, repoRoot),
+					inGitRepository: false,
 				}
 			}
 
-			const [gitRemoteUrl, gitBranch] = await Promise.all([
-				getRemoteUrl(workspacePath).catch(() => undefined),
-				getCurrentBranch(workspacePath).catch(() => undefined),
-			])
+			const gitRemoteUrl = await getRemoteUrl(repoRoot).catch(() => undefined)
 
 			return {
 				gitRemoteUrl,
-				gitBranch,
-				projectKey: this.buildProjectKey(gitRemoteUrl || workspacePath),
+				projectKey: this.buildProjectKey(gitRemoteUrl || repoRoot),
+				projectName: this.buildProjectName(gitRemoteUrl, repoRoot),
+				inGitRepository: true,
 			}
 		} catch {
 			return {
 				projectKey: fallbackProjectKey,
+				projectName: this.buildProjectName(undefined, repoRoot),
+				inGitRepository: false,
 			}
+		}
+	}
+
+	private async attachCurrentBranch(
+		repoRoot: string,
+		metadata: AiCodeStatsStableGitMetadata,
+	): Promise<AiCodeStatsGitMetadata> {
+		if (!metadata.inGitRepository) {
+			return {
+				gitRemoteUrl: metadata.gitRemoteUrl,
+				projectKey: metadata.projectKey,
+				projectName: metadata.projectName,
+			}
+		}
+
+		const gitBranch = await getCurrentBranch(repoRoot).catch(() => undefined)
+		return {
+			gitRemoteUrl: metadata.gitRemoteUrl,
+			gitBranch,
+			projectKey: metadata.projectKey,
+			projectName: metadata.projectName,
 		}
 	}
 
 	private buildProjectKey(seed: string): string {
 		return crypto.createHash("sha256").update(normalizePath(seed)).digest("hex").slice(0, 16)
+	}
+
+	private buildProjectName(gitRemoteUrl: string | undefined, repoRoot: string): string {
+		const remoteName = gitRemoteUrl
+			?.trim()
+			.replace(/[\\/]+$/, "")
+			.split(/[\\/:]/)
+			.pop()
+			?.replace(/\.git$/i, "")
+			.trim()
+		if (remoteName) {
+			return remoteName
+		}
+		return path.basename(normalizePath(repoRoot)) || "unknown-project"
 	}
 }

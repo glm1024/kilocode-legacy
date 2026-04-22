@@ -3495,7 +3495,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 								if (aiTokenUsageService) {
 									try {
 										await aiTokenUsageService.recordRequestUsage({
-											workspacePath: this.cwd,
+											taskId: this.taskId,
+											cwd: this.cwd,
 											provider: inferenceProvider ?? this.apiConfiguration.apiProvider,
 											model: cachedModelId,
 											inputTokens: costResult.totalInputTokens,

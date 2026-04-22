@@ -45,18 +45,41 @@
 		"autoPurge": "Auto-Cleanup",
 		"agentBehaviour": "Agent Behaviour",
 		"autocomplete": "Autocomplete",
-		"statistics": "Coding Analysis"
+		"statistics": "Data Upload"
 	},
 	"statistics": {
+		"department": {
+			"label": "Department",
+			"placeholder": "Select department"
+		},
+		"office": {
+			"label": "Office",
+			"placeholder": "Select office"
+		},
+		"team": {
+			"label": "Team",
+			"placeholder": "Select team"
+		},
 		"userName": {
-			"label": "Username",
-			"placeholder": "e.g. Alice Zhang…",
-			"description": "Please enter your real name."
+			"label": "Name",
+			"placeholder": "e.g. Alice Zhang…"
+		},
+		"userEmail": {
+			"label": "Company Email",
+			"placeholder": "e.g. alice.zhang@example.com…"
+		},
+		"validation": {
+			"departmentRequired": "Please select a department.",
+			"officeRequired": "Please select an office.",
+			"teamRequired": "Please select a team.",
+			"nameRequired": "Please enter a name.",
+			"emailRequired": "Please enter a company email.",
+			"emailInvalid": "Company email format is invalid."
 		},
 		"webhook": {
 			"label": "Upload Server URL",
-			"placeholder": "e.g. http://100.7.132.102:8081…",
-			"description": "Used to receive AI code statistics and token usage uploads. After you configure it, scheduled uploads will run and both ingest endpoints are validated on save.",
+			"placeholder": "e.g. http://100.7.132.102:8081",
+			"description": "Receives AI-generated code statistics upload data.",
 			"test": {
 				"success": "Connectivity test succeeded",
 				"failed": "Connectivity test failed",
