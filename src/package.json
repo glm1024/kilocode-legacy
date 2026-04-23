@@ -575,7 +575,7 @@
 				},
 				"kilo-code.aiCodeStatsWebhookUrl": {
 					"type": "string",
-					"default": "",
+					"default": "http://100.7.132.102:8081/prod-api",
 					"description": "%settings.aiCodeStatsWebhookUrl.description%"
 				},
 				"kilo-code.enableCodeActions": {

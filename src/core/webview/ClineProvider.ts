@@ -80,6 +80,7 @@ import { SessionManager } from "../../shared/kilocode/cli-sessions/core/SessionM
 import { SkillsManager } from "../../services/skills/SkillsManager"
 // kilocode_change start
 import { AiCodeStatsService } from "../../services/ai-code-stats"
+import { DEFAULT_AI_CODE_STATS_WEBHOOK_URL } from "../../services/ai-code-stats/AiCodeStatsWebhookUrl"
 import { AiTokenUsageService } from "../../services/ai-token-usage"
 // kilocode_change end
 
@@ -453,9 +454,12 @@ export class ClineProvider
 
 		const stateValue = this.context.globalState.get<string>(key)
 		if (typeof stateValue !== "string") {
-			return ""
+			return key === "aiCodeStatsWebhookUrl" ? DEFAULT_AI_CODE_STATS_WEBHOOK_URL : ""
 		}
 		const trimmed = stateValue.trim()
+		if (!trimmed && key === "aiCodeStatsWebhookUrl") {
+			return DEFAULT_AI_CODE_STATS_WEBHOOK_URL
+		}
 		return key === "aiCodeStatsUserEmail" ? trimmed.toLowerCase() : trimmed
 	}
 	// kilocode_change end

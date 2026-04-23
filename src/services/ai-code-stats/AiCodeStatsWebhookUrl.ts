@@ -1,4 +1,5 @@
 export const AI_CODE_STATS_INGEST_PATH = "/api/v1/ingest/ai-code-stats"
+export const DEFAULT_AI_CODE_STATS_WEBHOOK_URL = "http://100.7.132.102:8081/prod-api"
 const AI_TOKEN_USAGE_INGEST_PATH = "/api/v1/ingest/ai-token-usage"
 
 export class InvalidAiCodeStatsWebhookUrlError extends Error {

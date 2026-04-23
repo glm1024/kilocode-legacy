@@ -78,7 +78,7 @@
 		},
 		"webhook": {
 			"label": "Upload Server URL",
-			"placeholder": "e.g. http://100.7.132.102:8081",
+			"placeholder": "e.g. http://100.7.132.102:8081/prod-api",
 			"description": "Receives AI-generated code statistics upload data.",
 			"test": {
 				"success": "Connectivity test succeeded",
