@@ -1,5 +1,11 @@
 # kilo-code
 
+## 5.14.0
+
+### Minor Changes
+
+- [#125](https://github.com/Kilo-Org/kilocode-legacy/pull/125) [`5eb9271`](https://github.com/Kilo-Org/kilocode-legacy/commit/5eb9271b89a09d893c1812ba0ecc640b1a567938) Thanks [@kilo-code-bot](https://github.com/apps/kilo-code-bot)! - Add support for Kimi K2.6 on Moonshot and Fireworks providers
+
 ## 5.13.0
 
 ### Minor Changes

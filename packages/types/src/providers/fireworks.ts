@@ -2,6 +2,7 @@ import type { ModelInfo } from "../model.js"
 
 export type FireworksModelId =
 	| "accounts/fireworks/models/kimi-k2p5"
+	| "accounts/fireworks/models/kimi-k2p6"
 	| "accounts/fireworks/models/kimi-k2-instruct"
 	| "accounts/fireworks/models/kimi-k2-instruct-0905"
 	| "accounts/fireworks/models/kimi-k2-thinking"
@@ -60,6 +61,17 @@ export const fireworksModels = {
 		outputPrice: 3,
 		cacheReadsPrice: 0.1,
 		displayName: "Kimi K2.5",
+	},
+	"accounts/fireworks/models/kimi-k2p6": {
+		maxTokens: 256000,
+		contextWindow: 262144,
+		supportsImages: true,
+		supportsPromptCache: true,
+		supportsNativeTools: true,
+		inputPrice: 0.95,
+		outputPrice: 4.0,
+		cacheReadsPrice: 0.16,
+		displayName: "Kimi K2.6",
 	},
 	"accounts/fireworks/models/kimi-k2-thinking": {
 		maxTokens: 16000,

@@ -260,6 +260,18 @@ describe("FireworksHandler", () => {
 		expect(model.info).toEqual(expect.objectContaining(fireworksModels[testModelId]))
 	})
 
+	it("should return Kimi K2.6 model with correct configuration", () => {
+		const testModelId: FireworksModelId = "accounts/fireworks/models/kimi-k2p6"
+		const handlerWithModel = new FireworksHandler({
+			apiModelId: testModelId,
+			fireworksApiKey: "test-fireworks-api-key",
+		})
+		const model = handlerWithModel.getModel()
+		expect(model.id).toBe(testModelId)
+		// Keep this test aligned with the shared model registry.
+		expect(model.info).toEqual(expect.objectContaining(fireworksModels[testModelId]))
+	})
+
 	it("completePrompt method should return text from Fireworks API", async () => {
 		const expectedResponse = "This is a test response from Fireworks"
 		mockCreate.mockResolvedValueOnce({ choices: [{ message: { content: expectedResponse } }] })

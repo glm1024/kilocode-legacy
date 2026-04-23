@@ -132,6 +132,19 @@ describe("MoonshotHandler", () => {
 			expect(model.info.supportsImages).toBe(true)
 		})
 
+		it("should expose native tools for kimi-k2.6", () => {
+			const strictHandler = new MoonshotHandler({
+				...mockOptions,
+				apiModelId: "kimi-k2.6",
+			})
+			const model = strictHandler.getModel()
+			const strictModelInfo = model.info as { supportsNativeTools?: boolean; defaultToolProtocol?: string }
+
+			expect(strictModelInfo.supportsNativeTools).toBe(true)
+			expect(strictModelInfo.defaultToolProtocol).toBe("native")
+			expect(model.info.supportsImages).toBe(true)
+		})
+
 		it("should expose image capability for kimi-for-coding", () => {
 			const strictHandler = new MoonshotHandler({
 				...mockOptions,
@@ -272,6 +285,43 @@ describe("MoonshotHandler", () => {
 					providerOptions: {
 						moonshot: {
 							prompt_cache_key: "task-cache-1",
+						},
+					},
+				}),
+			)
+		})
+
+		it("should enforce strict thinking temperature/provider options for kimi-k2.6 by default", async () => {
+			const strictHandler = new MoonshotHandler({
+				...mockOptions,
+				apiModelId: "kimi-k2.6",
+				modelTemperature: 0.1,
+			})
+
+			async function* mockFullStream() {
+				yield { type: "text-delta", text: "Test response" }
+			}
+
+			mockStreamText.mockReturnValue({
+				fullStream: mockFullStream(),
+				usage: Promise.resolve({
+					inputTokens: 1,
+					outputTokens: 1,
+					details: {},
+					raw: {},
+				}),
+			})
+
+			for await (const _chunk of strictHandler.createMessage(systemPrompt, messages)) {
+				// Drain stream
+			}
+
+			expect(mockStreamText).toHaveBeenCalledWith(
+				expect.objectContaining({
+					temperature: 1.0,
+					providerOptions: {
+						moonshot: {
+							thinking: { type: "enabled" },
 						},
 					},
 				}),
@@ -448,6 +498,32 @@ describe("MoonshotHandler", () => {
 		})
 
 		// kilocode_change start
+		it("should enforce strict thinking controls for completePrompt on kimi-k2.6", async () => {
+			const strictHandler = new MoonshotHandler({
+				...mockOptions,
+				apiModelId: "kimi-k2.6",
+				enableReasoningEffort: false,
+				modelTemperature: 1.8,
+			})
+
+			mockGenerateText.mockResolvedValue({
+				text: "Test completion",
+			})
+
+			await strictHandler.completePrompt("Test prompt")
+
+			expect(mockGenerateText).toHaveBeenCalledWith(
+				expect.objectContaining({
+					temperature: 0.6,
+					providerOptions: {
+						moonshot: {
+							thinking: { type: "disabled" },
+						},
+					},
+				}),
+			)
+		})
+
 		it("should enforce strict thinking controls for completePrompt on strict Kimi models", async () => {
 			const strictHandler = new MoonshotHandler({
 				...mockOptions,
