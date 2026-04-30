@@ -34,6 +34,7 @@ export interface AiCodeStatsEvent {
 	lineCount: number
 	codeSnippet: string
 	fileSnapshotContent?: string
+	fileSnapshotHash?: string
 	taskId?: string
 	commitHash?: string
 	commitOccurredAt?: number
@@ -69,6 +70,7 @@ export interface AiCodeGeneratedBlock {
 	lineCount: number
 	codeSnippet: string
 	fileSnapshotContent?: string
+	fileSnapshotHash?: string
 	taskId?: string
 }
 
@@ -81,12 +83,14 @@ export interface AiCodeGeneratedBlockState extends AiCodeGeneratedBlock {
 	originLineCount?: number
 	originCodeSnippet?: string
 	originFileSnapshotContent?: string
+	originFileSnapshotHash?: string
 	currentTimestamp?: number
 	currentLineStart?: number
 	currentLineEnd?: number
 	currentLineCount?: number
 	currentCodeSnippet?: string
 	currentFileSnapshotContent?: string
+	currentFileSnapshotHash?: string
 	uploadStatus: AiCodeGeneratedBlockUploadStatus
 	queuedReportId?: string
 }
@@ -146,6 +150,7 @@ export interface AiCodeCommitChangedFile {
 	previousFilePath?: string
 	language?: string
 	committedSnapshotContent?: string
+	committedSnapshotHash?: string
 	changedBlocks: AiCodeCommitChangedBlock[]
 	addedLines?: AiCodeCommitAddedLine[]
 }
@@ -181,11 +186,29 @@ export interface AiCodeQueuedCommitReport {
 
 export type AiCodePendingCommitMetricBlock = AiCodeGeneratedBlock
 
+export interface AiCodeStatsFailedReportUpload {
+	reportId?: string
+	commitHash?: string
+	rawPayloadBytes?: number
+	compressedPayloadBytes?: number
+	encoding?: "gzip" | "identity" | string
+	timeoutMs?: number
+	message: string
+}
+
 export interface AiCodeStatsLastUpload {
 	status: "idle" | "success" | "failed"
 	timestamp?: number
 	message?: string
 	uploadedEvents?: number
+	uploadedReports?: number
+	failedReports?: number
+	failedReportErrors?: AiCodeStatsFailedReportUpload[]
+	eventUploadFailed?: boolean
+	eventUploadError?: string
+	rawPayloadBytes?: number
+	compressedPayloadBytes?: number
+	timeoutMs?: number
 	mode?: AiCodeUploadMode
 	trigger?: "commit"
 }

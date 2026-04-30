@@ -3,6 +3,7 @@ import * as os from "os"
 import * as path from "path"
 import { execFile as execFileCallback } from "child_process"
 import { promisify } from "util"
+import { gunzip as gunzipCallback } from "zlib"
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import * as vscode from "vscode"
@@ -92,6 +93,20 @@ import { hashLineFingerprint } from "../AiCodeLineFingerprint"
 import { CURRENT_AI_CODE_STATS_SEMANTICS_VERSION, type AiCodeCommitCandidateLine } from "../types"
 
 const execFileAsync = promisify(execFileCallback)
+const gunzipAsync = promisify(gunzipCallback)
+
+const parseJsonBody = async (body: BodyInit | null | undefined, headers?: Record<string, string>): Promise<any> => {
+	const buffer =
+		body instanceof Uint8Array
+			? Buffer.from(body)
+			: typeof body === "string"
+				? Buffer.from(body)
+				: Buffer.from(body as ArrayBuffer)
+	if (headers?.["Content-Encoding"] === "gzip") {
+		return JSON.parse((await gunzipAsync(buffer)).toString("utf8"))
+	}
+	return JSON.parse(buffer.toString("utf8"))
+}
 
 const createGitRepo = async (parentDir?: string, name?: string): Promise<string> => {
 	const repoDir =
@@ -1304,8 +1319,12 @@ describe("AiCodeStatsService", () => {
 			changedFiles: [],
 		})
 
-		const firstBody = JSON.parse(fetchMock.mock.calls[0][1].body as string)
-		expect(firstBody.generatedBlocks[0]).toMatchObject({
+		const firstBody = await parseJsonBody(
+			fetchMock.mock.calls[0][1].body as BodyInit,
+			fetchMock.mock.calls[0][1].headers as Record<string, string>,
+		)
+		expect(firstBody.version).toBe("v3")
+		expect(firstBody.defaults).toMatchObject({
 			userName: "Configured User",
 			departmentName: "云存储研发部",
 			officeName: "架设处",
@@ -1314,26 +1333,21 @@ describe("AiCodeStatsService", () => {
 			organizationId: "org-1",
 			organizationName: "Org 1",
 			sourceIp: expect.any(String),
-			language: "typescript",
 			gitRemoteUrl: "https://github.com/example/repo.git",
 			gitBranch: "feature/stats",
-			fileSnapshotContent: "const a = 1\nconst d = 4\n",
+		})
+		expect(firstBody.generatedBlocks[0]).toMatchObject({
+			language: "typescript",
+			fileSnapshotHash: firstBody.snapshots[0].contentHash,
 		})
 		expect(firstBody.acceptedBlocks[0]).toMatchObject({
-			userName: "Configured User",
-			departmentName: "云存储研发部",
-			officeName: "架设处",
-			teamName: "研发一组",
-			userEmail: "configured.user@example.com",
-			organizationId: "org-1",
-			organizationName: "Org 1",
-			sourceIp: expect.any(String),
 			language: "typescript",
-			gitRemoteUrl: "https://github.com/example/repo.git",
-			gitBranch: "feature/stats",
-			fileSnapshotContent: "const a = 1\nconst d = 4\n",
+			fileSnapshotHash: firstBody.snapshots[0].contentHash,
 		})
-		expect(firstBody.acceptedBlocks[0].projectKey).toHaveLength(16)
+		expect(firstBody.generatedBlocks[0].fileSnapshotContent).toBeUndefined()
+		expect(firstBody.acceptedBlocks[0].fileSnapshotContent).toBeUndefined()
+		expect(firstBody.snapshots[0].content).toBe("const a = 1\nconst d = 4\n")
+		expect(firstBody.defaults.projectKey).toHaveLength(16)
 	})
 
 	it("uses the commit callback branch for commit reports when pending blocks have a stale branch", async () => {
@@ -1368,11 +1382,78 @@ describe("AiCodeStatsService", () => {
 			changedFiles: [],
 		})
 
-		const firstBody = JSON.parse(fetchMock.mock.calls[0][1].body as string)
+		const firstBody = await parseJsonBody(
+			fetchMock.mock.calls[0][1].body as BodyInit,
+			fetchMock.mock.calls[0][1].headers as Record<string, string>,
+		)
 		expect(firstBody.gitBranch).toBe("codex/add-sql-and-agent")
-		expect(firstBody.generatedBlocks[0].gitBranch).toBe("codex/add-sql-and-agent")
-		expect(firstBody.acceptedBlocks[0].gitBranch).toBe("codex/add-sql-and-agent")
-		expect(firstBody.candidateLines[0].gitBranch).toBe("codex/add-sql-and-agent")
+		expect(firstBody.defaults.gitBranch).toBe("codex/add-sql-and-agent")
+		expect(firstBody.generatedBlocks[0].gitBranch).toBeUndefined()
+		expect(firstBody.acceptedBlocks[0].gitBranch).toBeUndefined()
+		expect(firstBody.candidateLines[0].gitBranch).toBeUndefined()
+	})
+
+	it("continues uploading standalone events when a queued commit report fails", async () => {
+		mockIsGitRepository.mockResolvedValue(true)
+		mockGetRemoteUrl.mockResolvedValue("https://github.com/example/repo.git")
+		mockGetCurrentBranch.mockResolvedValue("feature/stats")
+
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const repoDir = await createGitRepo()
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({
+			webhookUrl: "https://example.com/webhook",
+			userEmail: "tester@example.com",
+		}))
+
+		await service.recordAgentFileWrite({
+			cwd: repoDir,
+			filePath: path.join(repoDir, "src/partial.ts"),
+			relativePath: "src/partial.ts",
+			originalContent: "const a = 1\n",
+			newContent: "const a = 1\nconst partial = true\n",
+		})
+		await service.recordRejectedAgentSuggestion({
+			cwd: repoDir,
+			filePath: path.join(repoDir, "src/rejected-partial.ts"),
+			relativePath: "src/rejected-partial.ts",
+			originalContent: "const rejected = false\n",
+			newContent: "const rejected = false\nconst rejectedPartial = true\n",
+		})
+
+		const fetchMock = vi
+			.fn()
+			.mockResolvedValueOnce(new Response("bad", { status: 400, statusText: "bad request" }))
+			.mockResolvedValueOnce(new Response("ok", { status: 200 }))
+		vi.stubGlobal("fetch", fetchMock)
+
+		await (service as any).handleCommitCollected({
+			repoRoot: repoDir,
+			branch: "feature/stats",
+			commitHash: "commit-partial-fail",
+			previousCommit: "commit-prev",
+			commitOccurredAt: Date.now(),
+			changedFiles: [],
+		})
+
+		const store = (service as any).store
+		expect(fetchMock.mock.calls).toHaveLength(2)
+		const incrementalBody = JSON.parse(fetchMock.mock.calls[1][1].body as string)
+		expect(incrementalBody.mode).toBe("incremental")
+		expect(incrementalBody.events).toHaveLength(1)
+		expect(await store.getPendingEvents()).toHaveLength(0)
+		expect(await store.getQueuedReportsForTests()).toHaveLength(1)
+		const state = await store.getRawStateForTests()
+		expect(state.lastUpload).toMatchObject({
+			status: "failed",
+			uploadedEvents: 1,
+			uploadedReports: 0,
+			failedReports: 1,
+			eventUploadFailed: false,
+		})
+		expect(state.lastUpload.failedReportErrors?.[0]).toMatchObject({
+			commitHash: "commit-partial-fail",
+			encoding: "identity",
+		})
 	})
 	// kilocode_change end
 })

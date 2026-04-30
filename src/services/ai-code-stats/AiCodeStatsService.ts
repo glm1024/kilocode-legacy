@@ -15,7 +15,11 @@ import { AiCodeStatsMetadataResolver } from "./AiCodeStatsMetadataResolver"
 import { AiTokenUsageService } from "../ai-token-usage/AiTokenUsageService"
 // kilocode_change end
 import { AiCodeStatsStore } from "./AiCodeStatsStore"
-import { AiCodeStatsUploader } from "./AiCodeStatsUploader"
+import {
+	AiCodeStatsUploader,
+	type AiCodeCommitReportUploadResult,
+	type AiCodeStatsUploadResult,
+} from "./AiCodeStatsUploader"
 import {
 	AI_CODE_STATS_RETENTION_DAYS,
 	CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
@@ -1227,13 +1231,51 @@ export class AiCodeStatsService {
 				return
 			}
 
-			const reportUploadResult = await this.uploader.uploadQueuedReports(settings)
-			const eventUploadResult = await this.uploader.upload(settings, { client: this.buildUploadClient() })
+			let reportUploadResult: AiCodeCommitReportUploadResult = {
+				uploadedReports: 0,
+				uploadedBlocks: 0,
+				failedReports: 0,
+				failedReportErrors: [],
+				rawPayloadBytes: 0,
+				compressedPayloadBytes: 0,
+				timeoutMs: 0,
+			}
+			let reportUploadError: string | undefined
+			try {
+				reportUploadResult = await this.uploader.uploadQueuedReports(settings)
+			} catch (error) {
+				reportUploadError = error instanceof Error ? error.message : String(error)
+			}
 
+			let eventUploadResult: AiCodeStatsUploadResult = { uploaded: 0 }
+			let eventUploadError: string | undefined
+			try {
+				eventUploadResult = await this.uploader.upload(settings, { client: this.buildUploadClient() })
+			} catch (error) {
+				eventUploadError = error instanceof Error ? error.message : String(error)
+			}
+
+			const failedReports = reportUploadResult.failedReports + (reportUploadError ? 1 : 0)
+			const failureMessages = [
+				reportUploadError,
+				reportUploadResult.failedReportErrors.length > 0
+					? `${reportUploadResult.failedReportErrors.length} queued commit report(s) failed`
+					: undefined,
+				eventUploadError ? `AI code stats upload failed: ${eventUploadError}` : undefined,
+			].filter((message): message is string => Boolean(message))
 			const lastUpload: AiCodeStatsLastUpload = {
-				status: "success",
+				status: failureMessages.length > 0 ? "failed" : "success",
 				timestamp: Date.now(),
 				uploadedEvents: reportUploadResult.uploadedBlocks + eventUploadResult.uploaded,
+				uploadedReports: reportUploadResult.uploadedReports,
+				failedReports,
+				failedReportErrors: reportUploadResult.failedReportErrors,
+				eventUploadFailed: Boolean(eventUploadError),
+				eventUploadError,
+				message: failureMessages.length > 0 ? failureMessages.join("; ") : undefined,
+				rawPayloadBytes: reportUploadResult.rawPayloadBytes,
+				compressedPayloadBytes: reportUploadResult.compressedPayloadBytes,
+				timeoutMs: reportUploadResult.timeoutMs,
 				mode: "incremental",
 				trigger,
 			}

@@ -271,6 +271,157 @@ describe("AiCodeStatsStore", () => {
 		expect(queuedReports[0].report.candidateLines?.[0].ide).toBe("goland")
 	})
 
+	it("prunes snapshot-store entries that are no longer referenced after queued report ack", async () => {
+		const firstReport = buildQueuedReport({
+			report: {
+				...buildQueuedReport().report,
+				reportId: "report-prune-1",
+				commitHash: "commit-prune-1",
+				acceptedBlocks: [
+					{
+						eventId: "accepted-prune-1",
+						generatedBlockId: "generated-prune-1",
+						timestamp: Date.now(),
+						semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
+						sourceType: "agent_insert",
+						ide: "vscode",
+						projectKey: "project-key",
+						projectName: "repo",
+						repoRoot: "/repo",
+						repoRelativePath: "src/a.ts",
+						filePath: "/repo/src/a.ts",
+						relativePath: "src/a.ts",
+						lineStart: 1,
+						lineEnd: 1,
+						lineCount: 1,
+						codeSnippet: "const a = 1",
+						fileSnapshotContent: "const a = 1\n",
+					},
+				],
+				changedFiles: [],
+			},
+			generatedBlockIds: ["generated-prune-1"],
+		})
+		const secondReport = buildQueuedReport({
+			report: {
+				...buildQueuedReport().report,
+				reportId: "report-prune-2",
+				commitHash: "commit-prune-2",
+				acceptedBlocks: [
+					{
+						eventId: "accepted-prune-2",
+						generatedBlockId: "generated-prune-2",
+						timestamp: Date.now(),
+						semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
+						sourceType: "agent_insert",
+						ide: "vscode",
+						projectKey: "project-key",
+						projectName: "repo",
+						repoRoot: "/repo",
+						repoRelativePath: "src/b.ts",
+						filePath: "/repo/src/b.ts",
+						relativePath: "src/b.ts",
+						lineStart: 1,
+						lineEnd: 1,
+						lineCount: 1,
+						codeSnippet: "const b = 2",
+						fileSnapshotContent: "const b = 2\n",
+					},
+				],
+				changedFiles: [],
+			},
+			generatedBlockIds: ["generated-prune-2"],
+		})
+
+		await store.queueCommitReport(firstReport)
+		await store.queueCommitReport(secondReport)
+		expect(
+			Object.values(await store.getSnapshotsForTests())
+				.map((entry) => entry.content)
+				.sort(),
+		).toEqual(["const a = 1\n", "const b = 2\n"])
+
+		await store.acknowledgeQueuedCommitReport("report-prune-1")
+
+		expect(Object.values(await store.getSnapshotsForTests()).map((entry) => entry.content)).toEqual([
+			"const b = 2\n",
+		])
+	})
+
+	it("compacts old v2 queued reports on load while keeping snapshot content resolvable", async () => {
+		const baseDir = path.join(tmpDir, "ai-code-stats", "v1")
+		await fs.mkdir(baseDir, { recursive: true })
+		await fs.writeFile(
+			path.join(baseDir, "state.json"),
+			JSON.stringify({
+				version: 1,
+				pendingEventIds: [],
+				supersededEventIds: [],
+				repoObservedCommits: {},
+				lastUpload: { status: "idle" },
+			}),
+			"utf8",
+		)
+		await fs.writeFile(
+			path.join(baseDir, "queued-reports.json"),
+			JSON.stringify([
+				buildQueuedReport({
+					report: {
+						...buildQueuedReport().report,
+						reportId: "report-old-v2",
+						commitHash: "commit-old-v2",
+						acceptedBlocks: [
+							{
+								eventId: "accepted-old-v2",
+								generatedBlockId: "generated-old-v2",
+								timestamp: Date.now(),
+								semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
+								sourceType: "agent_insert",
+								ide: "vscode",
+								projectKey: "project-key",
+								projectName: "repo",
+								repoRoot: "/repo",
+								repoRelativePath: "src/old.ts",
+								filePath: "/repo/src/old.ts",
+								relativePath: "src/old.ts",
+								lineStart: 1,
+								lineEnd: 1,
+								lineCount: 1,
+								codeSnippet: "const oldValue = 1",
+								fileSnapshotContent: "const oldValue = 1\n",
+							},
+						],
+						changedFiles: [
+							{
+								relativePath: "src/old.ts",
+								filePath: "/repo/src/old.ts",
+								language: "typescript",
+								committedSnapshotContent: "const oldValue = 1\n",
+								changedBlocks: [],
+							},
+						],
+					},
+					generatedBlockIds: ["generated-old-v2"],
+				}),
+			]),
+			"utf8",
+		)
+
+		const reloadedStore = new AiCodeStatsStore(tmpDir)
+		const queuedReports = await reloadedStore.getQueuedReportsForTests()
+		expect(queuedReports[0].report.acceptedBlocks?.[0].fileSnapshotContent).toBe("const oldValue = 1\n")
+		expect(queuedReports[0].report.changedFiles[0].committedSnapshotContent).toBe("const oldValue = 1\n")
+
+		const persistedQueuedReports = JSON.parse(await fs.readFile(path.join(baseDir, "queued-reports.json"), "utf8"))
+		expect(persistedQueuedReports[0].report.acceptedBlocks[0].fileSnapshotContent).toBeUndefined()
+		expect(persistedQueuedReports[0].report.acceptedBlocks[0].fileSnapshotHash).toEqual(expect.any(String))
+		expect(persistedQueuedReports[0].report.changedFiles[0].committedSnapshotContent).toBeUndefined()
+		expect(persistedQueuedReports[0].report.changedFiles[0].committedSnapshotHash).toEqual(expect.any(String))
+		expect(Object.values(await reloadedStore.getSnapshotsForTests()).map((entry) => entry.content)).toEqual([
+			"const oldValue = 1\n",
+		])
+	})
+
 	it("does not enqueue client-side committed events", async () => {
 		await store.appendEvent({
 			eventId: "client-committed",

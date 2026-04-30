@@ -1,17 +1,27 @@
 // kilocode_change - new file
 
+import { gzip } from "zlib"
+import { promisify } from "util"
+
 import { fetchWithRetries } from "../../shared/http"
+import { buildCompactCommitReportPayload } from "./AiCodeCompactCommitReport"
 import { AiCodeStatsStore } from "./AiCodeStatsStore"
 import { resolveAiCodeStatsWebhookUrl } from "./AiCodeStatsWebhookUrl"
 import {
 	CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
 	normalizePath,
 	normalizeUserEmail,
-	type AiCodeCommitReport,
+	type AiCodeStatsFailedReportUpload,
 	type AiCodeStatsUploadClient,
 	type AiCodeStatsUploadEnvelope,
 	type AiCodeStatsUploadSettings,
 } from "./types"
+
+const gzipAsync = promisify(gzip)
+const COMMIT_REPORT_UPLOAD_MIN_TIMEOUT_MS = 10 * 60 * 1000
+const COMMIT_REPORT_UPLOAD_MAX_TIMEOUT_MS = 60 * 60 * 1000
+const COMMIT_REPORT_UPLOAD_BYTES_PER_SECOND = 64 * 1024
+const COMMIT_REPORT_GZIP_MIN_RAW_BYTES = 1024 * 1024
 
 export interface AiCodeStatsUploadResult {
 	uploaded: number
@@ -20,6 +30,11 @@ export interface AiCodeStatsUploadResult {
 export interface AiCodeCommitReportUploadResult {
 	uploadedReports: number
 	uploadedBlocks: number
+	failedReports: number
+	failedReportErrors: AiCodeStatsFailedReportUpload[]
+	rawPayloadBytes: number
+	compressedPayloadBytes: number
+	timeoutMs: number
 }
 
 export class AiCodeStatsUploader {
@@ -80,24 +95,51 @@ export class AiCodeStatsUploader {
 
 	async uploadQueuedReports(settings: AiCodeStatsUploadSettings): Promise<AiCodeCommitReportUploadResult> {
 		if (!settings.webhookUrl?.trim()) {
-			return { uploadedReports: 0, uploadedBlocks: 0 }
+			return this.emptyCommitReportUploadResult()
 		}
 		const fallbackUserEmail = normalizeUserEmail(settings.userEmail)
 		if (!fallbackUserEmail) {
-			return { uploadedReports: 0, uploadedBlocks: 0 }
+			return this.emptyCommitReportUploadResult()
 		}
 
 		const webhookUrl = resolveAiCodeStatsWebhookUrl(settings.webhookUrl)
 		const reports = await this.store.getQueuedCommitReports()
 		let uploadedReports = 0
 		let uploadedBlocks = 0
+		let rawPayloadBytes = 0
+		let compressedPayloadBytes = 0
+		let timeoutMs = 0
+		const failedReportErrors: AiCodeStatsFailedReportUpload[] = []
 
 		for (const queued of reports) {
-			await this.postJson(
-				webhookUrl,
-				this.buildCommitReportPayload(queued.report, fallbackUserEmail),
-				"AI code commit report upload failed",
-			)
+			const payload = buildCompactCommitReportPayload(queued.report, fallbackUserEmail)
+			const prepared = await this.prepareJsonPayload(payload)
+			rawPayloadBytes += prepared.rawPayloadBytes
+			compressedPayloadBytes += prepared.compressedPayloadBytes
+			timeoutMs = Math.max(timeoutMs, prepared.timeoutMs)
+			try {
+				await this.postPreparedJson(
+					webhookUrl,
+					prepared,
+					{
+						reportId: queued.report.reportId,
+						commitHash: queued.report.commitHash,
+					},
+					"AI code commit report upload failed",
+				)
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error)
+				failedReportErrors.push({
+					reportId: queued.report.reportId,
+					commitHash: queued.report.commitHash,
+					rawPayloadBytes: prepared.rawPayloadBytes,
+					compressedPayloadBytes: prepared.compressedPayloadBytes,
+					encoding: prepared.contentEncoding,
+					timeoutMs: prepared.timeoutMs,
+					message,
+				})
+				continue
+			}
 			await this.store.acknowledgeQueuedCommitReport(queued.report.reportId)
 			uploadedReports += 1
 			const baselineBlockCount =
@@ -107,142 +149,26 @@ export class AiCodeStatsUploader {
 			uploadedBlocks += baselineBlockCount
 		}
 
-		return { uploadedReports, uploadedBlocks }
+		return {
+			uploadedReports,
+			uploadedBlocks,
+			failedReports: failedReportErrors.length,
+			failedReportErrors,
+			rawPayloadBytes,
+			compressedPayloadBytes,
+			timeoutMs,
+		}
 	}
 
-	private buildCommitReportPayload(report: AiCodeCommitReport, fallbackUserEmail: string): AiCodeCommitReport {
+	private emptyCommitReportUploadResult(): AiCodeCommitReportUploadResult {
 		return {
-			version: "v2",
-			source: "kilocode-ai-code-stats",
-			mode: "commit_report",
-			semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
-			attributionInputVersion: report.attributionInputVersion,
-			reportId: report.reportId,
-			reportGeneratedAt: report.reportGeneratedAt,
-			client: report.client,
-			repoRoot: normalizePath(report.repoRoot),
-			projectKey: report.projectKey,
-			projectName: report.projectName,
-			gitRemoteUrl: report.gitRemoteUrl,
-			gitBranch: report.gitBranch,
-			commitHash: report.commitHash,
-			previousCommitHash: report.previousCommitHash,
-			commitOccurredAt: report.commitOccurredAt,
-			acceptedBlocks: (report.acceptedBlocks ?? []).map((block) => ({
-				eventId: block.eventId,
-				generatedBlockId: block.generatedBlockId,
-				timestamp: block.timestamp,
-				semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
-				sourceType: block.sourceType,
-				ide: block.ide,
-				userName: block.userName,
-				departmentName: block.departmentName,
-				officeName: block.officeName,
-				teamName: block.teamName,
-				userEmail: normalizeUserEmail(block.userEmail) ?? fallbackUserEmail,
-				organizationId: block.organizationId,
-				organizationName: block.organizationName,
-				sourceIp: block.sourceIp,
-				projectKey: block.projectKey,
-				projectName: block.projectName,
-				repoRoot: block.repoRoot ? normalizePath(block.repoRoot) : undefined,
-				repoRelativePath: block.repoRelativePath ? normalizePath(block.repoRelativePath) : undefined,
-				filePath: normalizePath(block.filePath),
-				relativePath: normalizePath(block.relativePath),
-				language: block.language,
-				gitRemoteUrl: block.gitRemoteUrl,
-				gitBranch: block.gitBranch,
-				lineStart: block.lineStart,
-				lineEnd: block.lineEnd,
-				lineCount: block.lineCount,
-				codeSnippet: block.codeSnippet,
-				fileSnapshotContent: block.fileSnapshotContent,
-				taskId: block.taskId,
-			})),
-			generatedBlocks: (report.generatedBlocks ?? []).map((block) => ({
-				eventId: block.eventId,
-				generatedBlockId: block.generatedBlockId,
-				timestamp: block.timestamp,
-				semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
-				sourceType: block.sourceType,
-				ide: block.ide,
-				userName: block.userName,
-				departmentName: block.departmentName,
-				officeName: block.officeName,
-				teamName: block.teamName,
-				userEmail: normalizeUserEmail(block.userEmail) ?? fallbackUserEmail,
-				organizationId: block.organizationId,
-				organizationName: block.organizationName,
-				sourceIp: block.sourceIp,
-				projectKey: block.projectKey,
-				projectName: block.projectName,
-				repoRoot: block.repoRoot ? normalizePath(block.repoRoot) : undefined,
-				repoRelativePath: block.repoRelativePath ? normalizePath(block.repoRelativePath) : undefined,
-				filePath: normalizePath(block.filePath),
-				relativePath: normalizePath(block.relativePath),
-				language: block.language,
-				gitRemoteUrl: block.gitRemoteUrl,
-				gitBranch: block.gitBranch,
-				lineStart: block.lineStart,
-				lineEnd: block.lineEnd,
-				lineCount: block.lineCount,
-				codeSnippet: block.codeSnippet,
-				fileSnapshotContent: block.fileSnapshotContent,
-				taskId: block.taskId,
-			})),
-			changedFiles: (report.changedFiles || []).map((file) => ({
-				relativePath: normalizePath(file.relativePath),
-				filePath: normalizePath(file.filePath),
-				previousFilePath: file.previousFilePath ? normalizePath(file.previousFilePath) : undefined,
-				language: file.language,
-				committedSnapshotContent: file.committedSnapshotContent,
-				changedBlocks: (file.changedBlocks || []).map((block) => ({
-					startLine: block.startLine,
-					endLine: block.endLine,
-					lineCount: block.lineCount,
-					codeSnippet: block.codeSnippet,
-					displayOrder: block.displayOrder,
-				})),
-				addedLines: (file.addedLines || []).map((line) => ({
-					addedIndex: line.addedIndex,
-					lineNumber: line.lineNumber,
-					content: line.content,
-					lineHash: line.lineHash,
-				})),
-			})),
-			candidateLines: (report.candidateLines || []).map((line) => ({
-				clientLineId: line.clientLineId,
-				generatedBlockId: line.generatedBlockId,
-				baselineEventId: line.baselineEventId,
-				baselineMetricType: line.baselineMetricType,
-				sourceTimestamp: line.sourceTimestamp,
-				sourceType: line.sourceType,
-				ide: line.ide,
-				userName: line.userName,
-				departmentName: line.departmentName,
-				officeName: line.officeName,
-				teamName: line.teamName,
-				userEmail: normalizeUserEmail(line.userEmail) ?? fallbackUserEmail,
-				organizationId: line.organizationId,
-				organizationName: line.organizationName,
-				sourceIp: line.sourceIp,
-				projectKey: line.projectKey,
-				projectName: line.projectName,
-				filePath: normalizePath(line.filePath),
-				relativePath: normalizePath(line.relativePath),
-				repoRoot: normalizePath(line.repoRoot),
-				repoRelativePath: normalizePath(line.repoRelativePath),
-				language: line.language,
-				gitRemoteUrl: line.gitRemoteUrl,
-				gitBranch: line.gitBranch,
-				taskId: line.taskId,
-				lineNumber: line.lineNumber,
-				rawLine: line.rawLine,
-				blockLineIndex: line.blockLineIndex,
-				blockLineCount: line.blockLineCount,
-				lineHash: line.lineHash,
-				occurrenceIndex: line.occurrenceIndex,
-			})),
+			uploadedReports: 0,
+			uploadedBlocks: 0,
+			failedReports: 0,
+			failedReportErrors: [],
+			rawPayloadBytes: 0,
+			compressedPayloadBytes: 0,
+			timeoutMs: 0,
 		}
 	}
 
@@ -265,5 +191,90 @@ export class AiCodeStatsUploader {
 				}`,
 			)
 		}
+	}
+
+	private async prepareJsonPayload(payload: unknown): Promise<{
+		body: string | Uint8Array
+		contentEncoding: "gzip" | "identity"
+		rawPayloadBytes: number
+		compressedPayloadBytes: number
+		timeoutMs: number
+	}> {
+		const rawJson = JSON.stringify(payload)
+		const raw = Buffer.from(rawJson, "utf8")
+		if (raw.byteLength < COMMIT_REPORT_GZIP_MIN_RAW_BYTES) {
+			return {
+				body: rawJson,
+				contentEncoding: "identity",
+				rawPayloadBytes: raw.byteLength,
+				compressedPayloadBytes: raw.byteLength,
+				timeoutMs: this.computeCommitReportUploadTimeout(raw.byteLength),
+			}
+		}
+		const compressed = await gzipAsync(raw)
+		const timeoutMs = this.computeCommitReportUploadTimeout(compressed.byteLength)
+		return {
+			body: new Uint8Array(compressed),
+			contentEncoding: "gzip",
+			rawPayloadBytes: raw.byteLength,
+			compressedPayloadBytes: compressed.byteLength,
+			timeoutMs,
+		}
+	}
+
+	private async postPreparedJson(
+		webhookUrl: string,
+		prepared: {
+			body: string | Uint8Array
+			contentEncoding: "gzip" | "identity"
+			rawPayloadBytes: number
+			compressedPayloadBytes: number
+			timeoutMs: number
+		},
+		reportIdentity: {
+			reportId: string
+			commitHash: string
+		},
+		errorPrefix: string,
+	): Promise<void> {
+		const headers: Record<string, string> = {
+			"Content-Type": "application/json",
+			"X-Ai-Code-Stats-Wire-Version": "v3",
+			"X-Ai-Code-Stats-Raw-Bytes": String(prepared.rawPayloadBytes),
+			"X-Ai-Code-Stats-Wire-Bytes": String(prepared.compressedPayloadBytes),
+			"X-Ai-Code-Stats-Report-Id": reportIdentity.reportId,
+			"X-Ai-Code-Stats-Commit-Hash": reportIdentity.commitHash,
+		}
+		if (prepared.contentEncoding === "gzip") {
+			headers["Content-Encoding"] = "gzip"
+			headers["X-Ai-Code-Stats-Gzip-Bytes"] = String(prepared.compressedPayloadBytes)
+		}
+		const response = await fetchWithRetries({
+			url: webhookUrl,
+			method: "POST",
+			headers,
+			body: prepared.body,
+			retries: 3,
+			timeout: prepared.timeoutMs,
+			shouldRetry: (res) => res.status >= 500 || res.status === 429,
+		})
+
+		if (!response.ok) {
+			const errorBody = await response.text().catch(() => "")
+			throw new Error(
+				`${errorPrefix} (${response.status} ${response.statusText})${
+					errorBody ? `: ${errorBody.slice(0, 200)}` : ""
+				}`,
+			)
+		}
+	}
+
+	private computeCommitReportUploadTimeout(compressedPayloadBytes: number): number {
+		const sizeBasedTimeout =
+			Math.ceil(compressedPayloadBytes / COMMIT_REPORT_UPLOAD_BYTES_PER_SECOND) * 1000 + 60 * 1000
+		return Math.min(
+			COMMIT_REPORT_UPLOAD_MAX_TIMEOUT_MS,
+			Math.max(COMMIT_REPORT_UPLOAD_MIN_TIMEOUT_MS, sizeBasedTimeout),
+		)
 	}
 }
