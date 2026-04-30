@@ -3,7 +3,7 @@
 import { OpenAiCodexHandler } from "../openai-codex"
 
 describe("OpenAiCodexHandler.getModel", () => {
-	it.each(["gpt-5.1", "gpt-5", "gpt-5.1-codex", "gpt-5-codex", "gpt-5-codex-mini"])(
+	it.each(["gpt-5.5", "gpt-5.1", "gpt-5", "gpt-5.1-codex", "gpt-5-codex", "gpt-5-codex-mini"])(
 		"should return specified model when a valid model id is provided: %s",
 		(apiModelId) => {
 			const handler = new OpenAiCodexHandler({ apiModelId })
@@ -20,7 +20,7 @@ describe("OpenAiCodexHandler.getModel", () => {
 		const handler = new OpenAiCodexHandler({ apiModelId: "not-a-real-model" })
 		const model = handler.getModel()
 
-		expect(model.id).toBe("gpt-5.3-codex")
+		expect(model.id).toBe("gpt-5.5")
 		expect(model.info).toBeDefined()
 	})
 })
