@@ -212,7 +212,7 @@ function compactBlock(
 		taskId: block.taskId,
 	}
 	omitDefaults(normalized, defaults)
-	return dropUndefined(normalized) as AiCodeCompactBlockPayload
+	return dropUndefined(normalized) as unknown as AiCodeCompactBlockPayload
 }
 
 function compactChangedFile(
@@ -247,19 +247,20 @@ function compactCandidateLines(
 			repoRelativePath: normalizePath(line.repoRelativePath),
 		}
 		omitDefaults(normalized, defaults)
-		return dropUndefined(normalized) as AiCodeCompactCandidateLinePayload
+		return dropUndefined(normalized) as unknown as AiCodeCompactCandidateLinePayload
 	})
 	return result.length > 0 ? result : undefined
 }
 
-function omitDefaults(target: Record<string, unknown>, defaults: AiCodeCompactDefaults): void {
+function omitDefaults(target: object, defaults: AiCodeCompactDefaults): void {
+	const mutableTarget = target as Record<string, unknown>
 	for (const [key, value] of Object.entries(defaults)) {
-		if (value !== undefined && target[key] === value) {
-			delete target[key]
+		if (value !== undefined && mutableTarget[key] === value) {
+			delete mutableTarget[key]
 		}
 	}
 }
 
-function dropUndefined<T extends Record<string, unknown>>(value: T): Partial<T> {
+function dropUndefined<T extends object>(value: T): Partial<T> {
 	return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined)) as Partial<T>
 }

@@ -253,7 +253,7 @@ export class AiCodeStatsUploader {
 			url: webhookUrl,
 			method: "POST",
 			headers,
-			body: prepared.body,
+			body: prepared.body as BodyInit,
 			retries: 3,
 			timeout: prepared.timeoutMs,
 			shouldRetry: (res) => res.status >= 500 || res.status === 429,
