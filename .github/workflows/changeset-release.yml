@@ -10,7 +10,7 @@ env:
     REPO_PATH: ${{ github.repository }}
     GIT_REF: main
     NODE_VERSION: 20.20.0
-    PNPM_VERSION: 10.8.1
+    PNPM_VERSION: 10.16.0
 
 jobs:
     # Job 1: Create version bump PR when changesets are merged to main

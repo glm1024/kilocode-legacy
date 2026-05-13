@@ -9,7 +9,7 @@ cd /workspace
 # Ensure pnpm is available and correct version
 echo "📦 Configuring pnpm..."
 corepack enable
-corepack prepare pnpm@10.8.1 --activate
+corepack prepare pnpm@10.16.0 --activate
 
 # Verify pnpm version
 PNPM_VERSION=$(pnpm --version)

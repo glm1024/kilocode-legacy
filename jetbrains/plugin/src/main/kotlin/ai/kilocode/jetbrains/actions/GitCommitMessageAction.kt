@@ -100,7 +100,7 @@ class GitCommitMessageAction : AnAction(I18n.t("kilocode:commitMessage.ui.genera
 
                     indicator.text = I18n.t("kilocode:commitMessage.progress.generating")
                     val result = runBlocking {
-                        CommitMessageService.getInstance(project).generateCommitMessage(project, workspacePath, files.ifEmpty { null })
+                        CommitMessageService.getInstance().generateCommitMessage(project, workspacePath, files.ifEmpty { null })
                     }
 
                     ApplicationManager.getApplication().invokeLater {
@@ -152,7 +152,7 @@ class GitCommitMessageAction : AnAction(I18n.t("kilocode:commitMessage.ui.genera
 
                     indicator.text = I18n.t("kilocode:commitMessage.progress.generating")
                     val result = runBlocking {
-                        CommitMessageService.getInstance(project).generateCommitMessage(project, workspacePath, files.ifEmpty { null })
+                        CommitMessageService.getInstance().generateCommitMessage(project, workspacePath, files.ifEmpty { null })
                     }
 
                     ApplicationManager.getApplication().invokeLater {

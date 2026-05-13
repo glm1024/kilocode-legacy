@@ -35,7 +35,7 @@ RUN --mount=type=cache,id=apt-cache,target=/var/cache/apt \
     libsecret-1-dev
 
 # Install pnpm globally (rarely changes - good for caching)
-RUN npm install -g pnpm@10.8.1
+RUN npm install -g pnpm@10.16.0
 
 # Set environment variables (rarely changes - good for caching)
 ENV NODE_ENV=production \

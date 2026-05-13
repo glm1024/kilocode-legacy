@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y \
   && rm -rf /var/lib/apt/lists/*
 
 # Enable corepack for pnpm (matching package.json version)
-RUN corepack enable && corepack prepare pnpm@10.8.1 --activate
+RUN corepack enable && corepack prepare pnpm@10.16.0 --activate
 
 # Set working directory
 WORKDIR /workspace

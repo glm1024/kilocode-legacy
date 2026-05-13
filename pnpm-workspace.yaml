@@ -6,6 +6,8 @@ packages:
   - jetbrains/host
   - jetbrains/plugin
 
+minimumReleaseAge: 7200 # 5 days
+
 onlyBuiltDependencies:
   - '@tailwindcss/oxide'
   - '@vscode/vsce-sign'

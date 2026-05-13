@@ -5,7 +5,7 @@ End-to-end tests for the Roo Code VSCode extension using the VSCode Extension Te
 ## Prerequisites
 
 - Node.js 20.19.2 (or compatible version 20.x)
-- pnpm 10.8.1+
+- pnpm 10.16.0+
 - OpenRouter API key with available credits
 
 ## Setup
@@ -146,21 +146,18 @@ apps/vscode-e2e/
 ## How Tests Work
 
 1. **Test Runner** ([`runTest.ts`](src/runTest.ts)):
-
     - Downloads VSCode test runtime (cached in `.vscode-test/`)
     - Creates temporary workspace directory
     - Launches VSCode with the extension loaded
     - Runs Mocha test suite
 
 2. **Test Setup** ([`suite/index.ts`](src/suite/index.ts)):
-
     - Activates the extension
     - Configures API with OpenRouter credentials
     - Sets up global `api` object for tests
     - Configures Mocha with 20-minute timeout
 
 3. **Test Execution**:
-
     - Tests use the `RooCodeAPI` to programmatically control the extension
     - Tests can start tasks, send messages, wait for completion, etc.
     - Tests observe events emitted by the extension

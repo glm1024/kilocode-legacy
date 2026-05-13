@@ -1,5 +1,13 @@
 # kilo-code
 
+## 5.16.1
+
+### Patch Changes
+
+- [#143](https://github.com/Kilo-Org/kilocode-legacy/pull/143) [`6b213f5`](https://github.com/Kilo-Org/kilocode-legacy/commit/6b213f59035b99905bc7f2c7f5634be1a664016e) Thanks [@kilo-code-bot](https://github.com/apps/kilo-code-bot)! - Bump diff, dompurify, uuid, and next to address security advisories
+
+- [#140](https://github.com/Kilo-Org/kilocode-legacy/pull/140) [`37013a4`](https://github.com/Kilo-Org/kilocode-legacy/commit/37013a42c59b34c36a00c385b65ef508973e0b05) Thanks [@hdcodedev](https://github.com/hdcodedev)! - fix(jetbrains): use application-scoped commit message service
+
 ## 5.16.0
 
 ### Minor Changes
