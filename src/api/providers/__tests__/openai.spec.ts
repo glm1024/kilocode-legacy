@@ -486,6 +486,106 @@ describe("OpenAiHandler", () => {
 			assertR1ContinuationRequest()
 		})
 
+		it("should automatically use R1 format for Mimo continuation retries", async () => {
+			const mimoRetryMessages: Anthropic.Messages.MessageParam[] = [
+				{
+					role: "user",
+					content: [{ type: "text", text: "<task>Hello</task>" }],
+				},
+				{
+					role: "assistant",
+					content: [
+						{
+							type: "reasoning",
+							text: "The user only greeted me, so I answered directly.",
+						} as any,
+						{
+							type: "text",
+							text: "Hello!",
+						},
+					],
+				},
+				{
+					role: "user",
+					content: [
+						{
+							type: "text",
+							text: "[ERROR] You did not use a tool in your previous response! Please retry with a tool use.",
+						},
+						{
+							type: "text",
+							text: "<environment_details>Context</environment_details>",
+						},
+					],
+				},
+				{
+					role: "assistant",
+					content: [
+						{
+							type: "reasoning",
+							text: "I need to ask a follow-up question using a native tool.",
+						} as any,
+						{
+							type: "tool_use",
+							id: "call_mimo_followup",
+							name: "ask_followup_question",
+							input: {
+								question: "What can I help with?",
+								follow_up: [{ text: "Explain this project" }],
+							},
+						},
+					],
+				},
+				{
+					role: "user",
+					content: [
+						{
+							type: "tool_result",
+							tool_use_id: "call_mimo_followup",
+							content: "<answer>Who are you?</answer>",
+						},
+						{
+							type: "text",
+							text: "<environment_details>Context after answer</environment_details>",
+						},
+					],
+				},
+			]
+
+			const handler = new OpenAiHandler({
+				...mockOptions,
+				openAiModelId: "mimo-v2.5",
+			})
+
+			for await (const _chunk of handler.createMessage(systemPrompt, mimoRetryMessages)) {
+			}
+
+			const requestMessages = mockCreate.mock.calls[0][0].messages
+			expect(requestMessages[1]).toMatchObject({
+				role: "assistant",
+				reasoning_content: "The user only greeted me, so I answered directly.",
+				content: "Hello!",
+			})
+			expect(requestMessages[3]).toMatchObject({
+				role: "assistant",
+				reasoning_content: "I need to ask a follow-up question using a native tool.",
+				tool_calls: [
+					expect.objectContaining({
+						id: "call_mimo_followup",
+						function: expect.objectContaining({
+							name: "ask_followup_question",
+						}),
+					}),
+				],
+			})
+			expect(requestMessages[4]).toEqual({
+				role: "tool",
+				tool_call_id: "call_mimo_followup",
+				content:
+					"<answer>Who are you?</answer>\n\n<environment_details>Context after answer</environment_details>",
+			})
+		})
+
 		it("should include reasoning_effort when reasoning effort is enabled", async () => {
 			const reasoningOptions: ApiHandlerOptions = {
 				...mockOptions,
@@ -737,6 +837,15 @@ describe("OpenAiHandler", () => {
 			})
 
 			expect(deepseekHandler.getModel().info.preserveReasoning).toBe(true)
+		})
+
+		it("should preserve reasoning for Mimo R1-compatible models by default", () => {
+			const mimoHandler = new OpenAiHandler({
+				...mockOptions,
+				openAiModelId: "mimo-v2.5",
+			})
+
+			expect(mimoHandler.getModel().info.preserveReasoning).toBe(true)
 		})
 
 		it("should not preserve reasoning for regular OpenAI-compatible models by default", () => {

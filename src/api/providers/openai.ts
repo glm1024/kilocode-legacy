@@ -88,9 +88,8 @@ export class OpenAiHandler extends BaseProvider implements SingleCompletionHandl
 		const { info: modelInfo, reasoning } = this.getModel()
 		const modelUrl = this.options.openAiBaseUrl ?? ""
 		const modelId = this.options.openAiModelId ?? ""
-		const enabledR1Format = this.options.openAiR1FormatEnabled ?? false
+		const useR1Format = this.shouldUseR1Format(modelId)
 		const isAzureAiInference = this._isAzureAiInference(modelUrl)
-		const deepseekReasoner = modelId.includes("deepseek-reasoner") || enabledR1Format
 		// kilocode_change removed const ark = modelUrl.includes(".volces.com")
 
 		if (modelId.includes("o1") || modelId.includes("o3") || modelId.includes("o4")) {
@@ -106,7 +105,7 @@ export class OpenAiHandler extends BaseProvider implements SingleCompletionHandl
 		if (this.options.openAiStreamingEnabled ?? true) {
 			let convertedMessages
 
-			if (deepseekReasoner) {
+			if (useR1Format) {
 				convertedMessages = convertToR1Format([{ role: "user", content: systemPrompt }, ...messages], {
 					mergeToolResultText: true,
 				})
@@ -158,7 +157,7 @@ export class OpenAiHandler extends BaseProvider implements SingleCompletionHandl
 
 			const requestOptions: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming = {
 				model: modelId,
-				temperature: this.options.modelTemperature ?? (deepseekReasoner ? DEEP_SEEK_DEFAULT_TEMPERATURE : 0),
+				temperature: this.options.modelTemperature ?? (useR1Format ? DEEP_SEEK_DEFAULT_TEMPERATURE : 0),
 				messages: convertedMessages,
 				stream: true as const,
 				...(isGrokXAI ? {} : { stream_options: { include_usage: true } }),
@@ -238,7 +237,7 @@ export class OpenAiHandler extends BaseProvider implements SingleCompletionHandl
 		} else {
 			const requestOptions: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming = {
 				model: modelId,
-				messages: deepseekReasoner
+				messages: useR1Format
 					? convertToR1Format([{ role: "user", content: systemPrompt }, ...messages], {
 							mergeToolResultText: true,
 						})
@@ -317,7 +316,7 @@ export class OpenAiHandler extends BaseProvider implements SingleCompletionHandl
 
 	override getModel() {
 		const id = this.options.openAiModelId ?? ""
-		const shouldPreserveReasoning = this.options.openAiR1FormatEnabled === true || id.includes("deepseek-reasoner")
+		const shouldPreserveReasoning = this.shouldUseR1Format(id)
 		// Ensure OpenAI-compatible models default to supporting native tool calling.
 		// This is required for [`Task.attemptApiRequest()`](src/core/task/Task.ts:3817) to
 		// include tool definitions in the request.
@@ -328,6 +327,15 @@ export class OpenAiHandler extends BaseProvider implements SingleCompletionHandl
 		}
 		const params = getModelParams({ format: "openai", modelId: id, model: info, settings: this.options })
 		return { id, info, ...params }
+	}
+
+	private shouldUseR1Format(modelId: string): boolean {
+		const normalizedModelId = modelId.toLowerCase()
+		return (
+			this.options.openAiR1FormatEnabled === true ||
+			normalizedModelId.includes("deepseek-reasoner") ||
+			normalizedModelId.includes("mimo")
+		)
 	}
 
 	async completePrompt(prompt: string): Promise<string> {
