@@ -42,8 +42,11 @@ export const STATISTICS_DEPARTMENT_OPTIONS: StatisticsDepartmentOption[] = [
 			{ name: "研发一处", teams: ["经理室", "研发一组", "研发二组", "研发三组", "研发四组", "研发五组"] },
 			{ name: "研发二处", teams: ["经理室", "研发一组", "研发二组", "研发三组"] },
 			{ name: "研发三处", teams: ["经理室", "研发一组", "研发二组", "研发三组"] },
-			{ name: "研发四处", teams: ["经理室", "研发一组", "研发二组", "研发三组"] },
-			{ name: "研发五处", teams: ["经理室", "研发一组", "研发二组", "研发三组", "研发四组", "研发五组"] },
+			{
+				name: "研发四处",
+				teams: ["经理室", "研发一组", "研发二组", "研发三组", "研发四组", "研发五组", "研发六组"],
+			},
+			{ name: "研发五处", teams: ["经理室", "研发一组", "研发二组", "研发三组", "研发四组"] },
 		],
 	},
 	{
@@ -58,14 +61,6 @@ export const STATISTICS_DEPARTMENT_OPTIONS: StatisticsDepartmentOption[] = [
 			{ name: "测试验证处", teams: ["测试一组", "测试二组", "测试三组", "测试四组"] },
 			{ name: "服务支持处", teams: [] },
 			{ name: "项目管理处", teams: ["项目管理一组", "项目管理二组"] },
-		],
-	},
-	{
-		name: "产品与方案测试部",
-		offices: [
-			{ name: "经理室", teams: [] },
-			{ name: "产品测试验证处", teams: ["测试一组", "测试二组", "测试三组"] },
-			{ name: "方案与定制化测试处", teams: ["测试一组", "测试二组"] },
 		],
 	},
 ]

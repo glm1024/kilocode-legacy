@@ -1,6 +1,11 @@
 import { fireEvent, render, screen } from "@/utils/test-utils"
 
-import { StatisticsSettings, getStatisticsIdentityValidationKey } from "../StatisticsSettings"
+import {
+	STATISTICS_DEPARTMENT_OPTIONS,
+	StatisticsSettings,
+	getStatisticsIdentityValidationKey,
+	getStatisticsTeamOptions,
+} from "../StatisticsSettings"
 
 vi.mock("@/i18n/TranslationContext", () => ({
 	useAppTranslation: () => ({
@@ -173,6 +178,29 @@ describe("StatisticsSettings", () => {
 			/>,
 		)
 		expect(screen.queryByTestId("ai-code-stats-team-name")).not.toBeInTheDocument()
+	})
+
+	it("uses the configured upload departments and cloud computing teams", () => {
+		expect(STATISTICS_DEPARTMENT_OPTIONS.map((department) => department.name)).toEqual([
+			"云计算研发部",
+			"云存储研发部",
+		])
+		expect(getStatisticsTeamOptions("云计算研发部", "研发四处")).toEqual([
+			"经理室",
+			"研发一组",
+			"研发二组",
+			"研发三组",
+			"研发四组",
+			"研发五组",
+			"研发六组",
+		])
+		expect(getStatisticsTeamOptions("云计算研发部", "研发五处")).toEqual([
+			"经理室",
+			"研发一组",
+			"研发二组",
+			"研发三组",
+			"研发四组",
+		])
 	})
 
 	it("shows inline webhook validation error from save flow", () => {

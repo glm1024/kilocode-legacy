@@ -107,7 +107,9 @@ export class OpenAiHandler extends BaseProvider implements SingleCompletionHandl
 			let convertedMessages
 
 			if (deepseekReasoner) {
-				convertedMessages = convertToR1Format([{ role: "user", content: systemPrompt }, ...messages])
+				convertedMessages = convertToR1Format([{ role: "user", content: systemPrompt }, ...messages], {
+					mergeToolResultText: true,
+				})
 			} else {
 				if (modelInfo.supportsPromptCache) {
 					systemMessage = {
@@ -237,7 +239,9 @@ export class OpenAiHandler extends BaseProvider implements SingleCompletionHandl
 			const requestOptions: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming = {
 				model: modelId,
 				messages: deepseekReasoner
-					? convertToR1Format([{ role: "user", content: systemPrompt }, ...messages])
+					? convertToR1Format([{ role: "user", content: systemPrompt }, ...messages], {
+							mergeToolResultText: true,
+						})
 					: [systemMessage, ...convertToOpenAiMessages(messages)],
 				...(metadata?.tools && { tools: this.convertToolsForOpenAI(metadata.tools) }),
 				...(metadata?.tool_choice && { tool_choice: metadata.tool_choice }),
@@ -263,10 +267,16 @@ export class OpenAiHandler extends BaseProvider implements SingleCompletionHandl
 			// kilocode_change start: reasoning
 			const message = response.choices[0]?.message
 			if (message) {
-				if ("reasoning" in message && typeof message.reasoning === "string") {
+				const reasoningText =
+					"reasoning_content" in message && typeof message.reasoning_content === "string"
+						? message.reasoning_content
+						: "reasoning" in message && typeof message.reasoning === "string"
+							? message.reasoning
+							: undefined
+				if (reasoningText) {
 					yield {
 						type: "reasoning",
-						text: message.reasoning,
+						text: reasoningText,
 					}
 				}
 				if (message.content) {
@@ -307,12 +317,14 @@ export class OpenAiHandler extends BaseProvider implements SingleCompletionHandl
 
 	override getModel() {
 		const id = this.options.openAiModelId ?? ""
+		const shouldPreserveReasoning = this.options.openAiR1FormatEnabled === true || id.includes("deepseek-reasoner")
 		// Ensure OpenAI-compatible models default to supporting native tool calling.
 		// This is required for [`Task.attemptApiRequest()`](src/core/task/Task.ts:3817) to
 		// include tool definitions in the request.
 		const info: ModelInfo = {
 			...NATIVE_TOOL_DEFAULTS,
 			...(this.options.openAiCustomModelInfo ?? openAiModelInfoSaneDefaults),
+			...(shouldPreserveReasoning ? { preserveReasoning: true } : {}),
 		}
 		const params = getModelParams({ format: "openai", modelId: id, model: info, settings: this.options })
 		return { id, info, ...params }

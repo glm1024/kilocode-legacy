@@ -158,6 +158,43 @@ describe("OpenAiHandler", () => {
 			expect(usageChunk?.outputTokens).toBe(5)
 		})
 
+		it("should emit reasoning_content in non-streaming mode", async () => {
+			mockCreate.mockResolvedValueOnce({
+				choices: [
+					{
+						message: {
+							role: "assistant",
+							content: "Done",
+							reasoning_content: "I should answer directly.",
+						},
+						finish_reason: "stop",
+					},
+				],
+				usage: {
+					prompt_tokens: 10,
+					completion_tokens: 5,
+					total_tokens: 15,
+				},
+			})
+
+			const handler = new OpenAiHandler({
+				...mockOptions,
+				openAiStreamingEnabled: false,
+			})
+
+			const chunks: any[] = []
+			for await (const chunk of handler.createMessage(systemPrompt, messages)) {
+				chunks.push(chunk)
+			}
+
+			expect(chunks).toEqual(
+				expect.arrayContaining([
+					{ type: "reasoning", text: "I should answer directly." },
+					{ type: "text", text: "Done" },
+				]),
+			)
+		})
+
 		it("should handle tool calls in non-streaming mode", async () => {
 			mockCreate.mockResolvedValueOnce({
 				choices: [
@@ -351,6 +388,102 @@ describe("OpenAiHandler", () => {
 				name: "fallback_tool",
 				arguments: '{"test":"fallback"}',
 			})
+		})
+
+		it("should preserve R1 reasoning through tool-result continuations for OpenAI-compatible models", async () => {
+			const r1ContinuationMessages: Anthropic.Messages.MessageParam[] = [
+				{
+					role: "user",
+					content: [{ type: "text", text: "<task>Hello</task>" }],
+				},
+				{
+					role: "assistant",
+					content: [
+						{
+							type: "reasoning",
+							text: "The user greeted me, so I should complete the task.",
+						} as any,
+						{
+							type: "tool_use",
+							id: "call_mimo_1",
+							name: "attempt_completion",
+							input: {
+								result: "Hello! I am MiMo-v2.5.",
+							},
+						},
+					],
+				},
+				{
+					role: "user",
+					content: [
+						{
+							type: "tool_result",
+							tool_use_id: "call_mimo_1",
+							content:
+								"The user has provided feedback on the results.\n<feedback>Who are you?</feedback>",
+						},
+						{
+							type: "text",
+							text: "<environment_details>Context</environment_details>",
+						},
+					],
+				},
+			]
+
+			const assertR1ContinuationRequest = () => {
+				const requestMessages = mockCreate.mock.calls[0][0].messages
+
+				expect(requestMessages).toHaveLength(3)
+				expect(requestMessages[0]).toEqual({
+					role: "user",
+					content: `${systemPrompt}\n<task>Hello</task>`,
+				})
+				expect(requestMessages[1]).toMatchObject({
+					role: "assistant",
+					content: null,
+					reasoning_content: "The user greeted me, so I should complete the task.",
+					tool_calls: [
+						{
+							id: "call_mimo_1",
+							type: "function",
+							function: {
+								name: "attempt_completion",
+								arguments: '{"result":"Hello! I am MiMo-v2.5."}',
+							},
+						},
+					],
+				})
+				expect(requestMessages[2]).toEqual({
+					role: "tool",
+					tool_call_id: "call_mimo_1",
+					content:
+						"The user has provided feedback on the results.\n<feedback>Who are you?</feedback>\n\n<environment_details>Context</environment_details>",
+				})
+				expect(requestMessages.slice(2).some((message: any) => message.role === "user")).toBe(false)
+			}
+
+			const streamingHandler = new OpenAiHandler({
+				...mockOptions,
+				openAiModelId: "mimo-v2.5",
+				openAiR1FormatEnabled: true,
+			})
+
+			for await (const _chunk of streamingHandler.createMessage(systemPrompt, r1ContinuationMessages)) {
+			}
+			assertR1ContinuationRequest()
+
+			mockCreate.mockClear()
+
+			const nonStreamingHandler = new OpenAiHandler({
+				...mockOptions,
+				openAiModelId: "mimo-v2.5",
+				openAiR1FormatEnabled: true,
+				openAiStreamingEnabled: false,
+			})
+
+			for await (const _chunk of nonStreamingHandler.createMessage(systemPrompt, r1ContinuationMessages)) {
+			}
+			assertR1ContinuationRequest()
 		})
 
 		it("should include reasoning_effort when reasoning effort is enabled", async () => {
@@ -585,6 +718,31 @@ describe("OpenAiHandler", () => {
 			const model = handlerWithoutModel.getModel()
 			expect(model.id).toBe("")
 			expect(model.info).toBeDefined()
+		})
+
+		it("should preserve reasoning when R1 format is enabled", () => {
+			const r1Handler = new OpenAiHandler({
+				...mockOptions,
+				openAiModelId: "mimo-v2.5",
+				openAiR1FormatEnabled: true,
+			})
+
+			expect(r1Handler.getModel().info.preserveReasoning).toBe(true)
+		})
+
+		it("should preserve reasoning for deepseek-reasoner compatible models", () => {
+			const deepseekHandler = new OpenAiHandler({
+				...mockOptions,
+				openAiModelId: "deepseek-reasoner",
+			})
+
+			expect(deepseekHandler.getModel().info.preserveReasoning).toBe(true)
+		})
+
+		it("should not preserve reasoning for regular OpenAI-compatible models by default", () => {
+			const model = handler.getModel()
+
+			expect(model.info.preserveReasoning).not.toBe(true)
 		})
 	})
 
