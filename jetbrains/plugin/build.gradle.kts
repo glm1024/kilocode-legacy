@@ -170,6 +170,12 @@ tasks {
     buildPlugin {
         dependsOn(prepareSandbox)
 
+        // The release ZIP is post-processed with sandbox resources below, so rerun
+        // this task whenever the release bundle command is invoked.
+        if (ext.get("debugMode") != "idea" && ext.get("debugMode") != "none") {
+            outputs.upToDateWhen { false }
+        }
+
         // Include the jetbrains directory contents from sandbox in the distribution root
         doLast {
             if (ext.get("debugMode") != "idea" && ext.get("debugMode") != "none") {

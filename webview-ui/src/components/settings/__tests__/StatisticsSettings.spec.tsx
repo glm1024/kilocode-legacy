@@ -180,7 +180,7 @@ describe("StatisticsSettings", () => {
 		expect(screen.queryByTestId("ai-code-stats-team-name")).not.toBeInTheDocument()
 	})
 
-	it("uses the configured upload departments and cloud computing teams", () => {
+	it("uses the configured upload departments and team options", () => {
 		expect(STATISTICS_DEPARTMENT_OPTIONS.map((department) => department.name)).toEqual([
 			"云计算研发部",
 			"云存储研发部",
@@ -201,6 +201,34 @@ describe("StatisticsSettings", () => {
 			"研发三组",
 			"研发四组",
 		])
+
+		const cloudStorageTeams = [
+			"研发一组",
+			"研发二组",
+			"研发三组",
+			"研发四组",
+			"研发五组",
+			"研发六组",
+			"研发七组",
+			"研发八组",
+		]
+		const cloudStorageDepartment = STATISTICS_DEPARTMENT_OPTIONS.find(
+			(department) => department.name === "云存储研发部",
+		)
+		const cloudStorageOfficesWithTeams = cloudStorageDepartment?.offices.filter((office) => office.teams.length > 0)
+
+		expect(cloudStorageOfficesWithTeams?.map((office) => office.name)).toEqual([
+			"架设处",
+			"核心软件处",
+			"研发保障处",
+			"管理软件处",
+			"硬件开发处",
+			"测试验证处",
+			"项目管理处",
+		])
+		for (const office of cloudStorageOfficesWithTeams ?? []) {
+			expect(office.teams).toEqual(cloudStorageTeams)
+		}
 	})
 
 	it("shows inline webhook validation error from save flow", () => {

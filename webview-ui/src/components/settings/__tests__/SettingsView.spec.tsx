@@ -80,7 +80,9 @@ vi.mock("../StatisticsSettings", () => ({
 		</div>
 	),
 	getStatisticsTeamOptions: (departmentName?: string, officeName?: string) =>
-		departmentName === "云存储研发部" && officeName === "架设处" ? ["研发一组", "研发二组"] : [],
+		departmentName === "云存储研发部" && officeName === "架设处"
+			? ["研发一组", "研发二组", "研发三组", "研发四组", "研发五组", "研发六组", "研发七组", "研发八组"]
+			: [],
 	getStatisticsIdentityValidationKey: () => undefined,
 	normalizeStatisticsEmail: (value?: string) => value?.trim().toLowerCase() ?? "",
 }))

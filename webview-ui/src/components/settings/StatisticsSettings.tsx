@@ -34,6 +34,17 @@ const STATISTICS_EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 
 export const normalizeStatisticsEmail = (value?: string): string => value?.trim().toLowerCase() ?? ""
 
+const CLOUD_STORAGE_TEAM_OPTIONS = [
+	"研发一组",
+	"研发二组",
+	"研发三组",
+	"研发四组",
+	"研发五组",
+	"研发六组",
+	"研发七组",
+	"研发八组",
+]
+
 export const STATISTICS_DEPARTMENT_OPTIONS: StatisticsDepartmentOption[] = [
 	{
 		name: "云计算研发部",
@@ -53,14 +64,14 @@ export const STATISTICS_DEPARTMENT_OPTIONS: StatisticsDepartmentOption[] = [
 		name: "云存储研发部",
 		offices: [
 			{ name: "经理室", teams: [] },
-			{ name: "架设处", teams: ["研发一组", "研发二组"] },
-			{ name: "核心软件处", teams: ["研发一组", "研发二组", "研发三组", "研发六组", "研发七组"] },
-			{ name: "研发保障处", teams: ["研发一组", "研发六组"] },
-			{ name: "管理软件处", teams: ["研发二组", "研发三组", "研发四组"] },
-			{ name: "硬件开发处", teams: ["研发二组", "研发四组", "研发六组"] },
-			{ name: "测试验证处", teams: ["测试一组", "测试二组", "测试三组", "测试四组"] },
+			{ name: "架设处", teams: CLOUD_STORAGE_TEAM_OPTIONS },
+			{ name: "核心软件处", teams: CLOUD_STORAGE_TEAM_OPTIONS },
+			{ name: "研发保障处", teams: CLOUD_STORAGE_TEAM_OPTIONS },
+			{ name: "管理软件处", teams: CLOUD_STORAGE_TEAM_OPTIONS },
+			{ name: "硬件开发处", teams: CLOUD_STORAGE_TEAM_OPTIONS },
+			{ name: "测试验证处", teams: CLOUD_STORAGE_TEAM_OPTIONS },
 			{ name: "服务支持处", teams: [] },
-			{ name: "项目管理处", teams: ["项目管理一组", "项目管理二组"] },
+			{ name: "项目管理处", teams: CLOUD_STORAGE_TEAM_OPTIONS },
 		],
 	},
 ]
