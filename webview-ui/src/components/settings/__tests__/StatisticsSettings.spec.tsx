@@ -1,4 +1,12 @@
-import { fireEvent, render, screen } from "@/utils/test-utils"
+import { act, fireEvent, render, screen } from "@/utils/test-utils"
+
+const mockPostMessage = vi.hoisted(() => vi.fn())
+
+vi.mock("@/utils/vscode", () => ({
+	vscode: {
+		postMessage: mockPostMessage,
+	},
+}))
 
 import {
 	STATISTICS_DEPARTMENT_OPTIONS,
@@ -308,5 +316,140 @@ describe("StatisticsSettings", () => {
 		expect(screen.queryByTestId("ai-code-stats-range-select")).not.toBeInTheDocument()
 		expect(screen.queryByTestId("ai-code-stats-kpi-grid")).not.toBeInTheDocument()
 		expect(screen.queryByTestId("ai-code-stats-token-panel")).not.toBeInTheDocument()
+	})
+
+	it("does not render commit upload status cards for normal records", () => {
+		render(<StatisticsSettings aiCodeStatsWebhookUrl="" setCachedStateField={vi.fn()} />)
+
+		act(() => {
+			window.dispatchEvent(
+				new MessageEvent("message", {
+					data: {
+						type: "aiCodeStatsCommitUploadRecords",
+						values: {
+							records: [
+								{
+									id: "normal",
+									commitHash: "abcdef123456",
+									repoRoot: "/repo",
+									commitOccurredAt: Date.now(),
+									status: "uploaded",
+								},
+							],
+						},
+					},
+				}),
+			)
+		})
+
+		expect(screen.queryByTestId("commit-upload-status-region")).not.toBeInTheDocument()
+	})
+
+	it("renders unfinished commit upload card without horizontal table layout", () => {
+		render(<StatisticsSettings aiCodeStatsWebhookUrl="" setCachedStateField={vi.fn()} />)
+
+		act(() => {
+			window.dispatchEvent(
+				new MessageEvent("message", {
+					data: {
+						type: "aiCodeStatsCommitUploadRecords",
+						values: {
+							records: [
+								{
+									id: "record-reanalysis",
+									commitHash: "c52d64d58b23513fc042d70b8d184dacaa30080d",
+									repoRoot: "/workspace/ism",
+									repoName: "ism",
+									commitOccurredAt: new Date("2026-05-27T11:27:22+08:00").getTime(),
+									status: "needs_reanalysis",
+									addedLineCount: 7167,
+									lastError: "可能由外部 Git 客户端提交或路径匹配失败导致",
+								},
+							],
+						},
+					},
+				}),
+			)
+		})
+
+		const card = screen.getByTestId("commit-upload-status-card")
+		expect(card).toHaveTextContent("提交上报未完成")
+		expect(card).toHaveTextContent("c52d64d")
+		expect(card).toHaveTextContent("ism")
+		expect(card).toHaveTextContent("+7167 行")
+		expect(card.querySelector("table")).toBeNull()
+
+		fireEvent.click(screen.getByTestId("commit-upload-reanalyze-button"))
+		expect(mockPostMessage).toHaveBeenCalledWith({
+			type: "reanalyzeAiCodeStatsCommitUpload",
+			text: "record-reanalysis",
+		})
+		expect(screen.getByTestId("commit-upload-reanalyze-button")).toHaveTextContent("处理中...")
+	})
+
+	it("renders failed commit upload reason and retry action", () => {
+		render(<StatisticsSettings aiCodeStatsWebhookUrl="" setCachedStateField={vi.fn()} />)
+
+		act(() => {
+			window.dispatchEvent(
+				new MessageEvent("message", {
+					data: {
+						type: "aiCodeStatsCommitUploadRecords",
+						values: {
+							records: [
+								{
+									id: "record-failed",
+									commitHash: "abcdef123456",
+									repoRoot: "/workspace/repo",
+									repoName: "repo",
+									commitOccurredAt: Date.now(),
+									status: "upload_failed",
+									lastError: "连接服务器超时",
+								},
+							],
+						},
+					},
+				}),
+			)
+		})
+
+		expect(screen.getByTestId("commit-upload-status-card")).toHaveTextContent("提交上报失败")
+		expect(screen.getByTestId("commit-upload-status-reason")).toHaveTextContent("连接服务器超时")
+
+		fireEvent.click(screen.getByTestId("commit-upload-retry-button"))
+		expect(mockPostMessage).toHaveBeenCalledWith({
+			type: "retryAiCodeStatsCommitUpload",
+			text: "record-failed",
+		})
+	})
+
+	it("explains fetch failed as an unreachable upload server", () => {
+		render(<StatisticsSettings aiCodeStatsWebhookUrl="" setCachedStateField={vi.fn()} />)
+
+		act(() => {
+			window.dispatchEvent(
+				new MessageEvent("message", {
+					data: {
+						type: "aiCodeStatsCommitUploadRecords",
+						values: {
+							records: [
+								{
+									id: "record-fetch-failed",
+									commitHash: "86f815863e1d915dad88313f378cc0309365e837",
+									repoRoot: "/workspace/babel",
+									repoName: "babel",
+									status: "upload_failed",
+									lastError: "fetch failed",
+								},
+							],
+						},
+					},
+				}),
+			)
+		})
+
+		expect(screen.getByTestId("commit-upload-status-reason")).toHaveTextContent(
+			"无法连接上报服务器，请检查后台服务是否启动、服务器地址是否正确，或网络是否可达。",
+		)
 	})
 })

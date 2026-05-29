@@ -117,6 +117,20 @@ const createGitRepo = async (parentDir?: string, name?: string): Promise<string>
 	return fs.realpath(repoDir)
 }
 
+const commitFile = async (repoDir: string, relativePath: string, content: string, message: string): Promise<string> => {
+	const filePath = path.join(repoDir, relativePath)
+	await fs.mkdir(path.dirname(filePath), { recursive: true })
+	await fs.writeFile(filePath, content, "utf8")
+	await execFileAsync("git", ["add", relativePath], { cwd: repoDir })
+	await execFileAsync(
+		"git",
+		["-c", "user.name=Kilo Test", "-c", "user.email=kilo-test@example.com", "commit", "-m", message],
+		{ cwd: repoDir },
+	)
+	const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: repoDir })
+	return stdout.trim()
+}
+
 describe("AiCodeStatsService", () => {
 	beforeEach(() => {
 		AiCodeStatsService.disposeInstance()
@@ -1454,6 +1468,427 @@ describe("AiCodeStatsService", () => {
 			commitHash: "commit-partial-fail",
 			encoding: "identity",
 		})
+	})
+
+	it("detects an observed uploaded commit missing on the server and replays retained candidates", async () => {
+		mockIsGitRepository.mockResolvedValue(true)
+		mockGetRemoteUrl.mockResolvedValue("https://github.com/example/replay.git")
+		mockGetCurrentBranch.mockResolvedValue("main")
+
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const repoDir = await createGitRepo()
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({
+			webhookUrl: "https://example.com/prod-api",
+			userEmail: "tester@example.com",
+		}))
+
+		const relativePath = "src/replay.ts"
+		const filePath = path.join(repoDir, relativePath)
+		const originalContent = "const base = 1\n"
+		const aiContent = "const base = 1\nconst aiReplay = 2\n"
+		await commitFile(repoDir, relativePath, originalContent, "base")
+		await service.recordAgentFileWrite({
+			cwd: repoDir,
+			filePath,
+			relativePath,
+			originalContent,
+			newContent: aiContent,
+			taskId: "task-replay",
+		})
+		const commitHash = await commitFile(repoDir, relativePath, aiContent, "ai replay")
+
+		let serverStatus: "NOT_RECEIVED" | "RECEIVED" = "NOT_RECEIVED"
+		const uploadedReports: any[] = []
+		const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+			const pathname = new URL(url).pathname
+			if (pathname.endsWith("/commit-status")) {
+				const query = JSON.parse(String(init?.body ?? "{}"))
+				return new Response(
+					JSON.stringify({
+						statuses: query.commits.map((commit: any) => ({
+							commitHash: commit.commitHash,
+							status: serverStatus,
+							receivedAt: serverStatus === "NOT_RECEIVED" ? null : new Date().toISOString(),
+							reportId:
+								serverStatus === "NOT_RECEIVED"
+									? null
+									: (commit.reportId ??
+										uploadedReports.find((report) => report.commitHash === commit.commitHash)
+											?.reportId ??
+										null),
+							message: null,
+						})),
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				)
+			}
+
+			const payload = await parseJsonBody(
+				init?.body as BodyInit,
+				init?.headers as Record<string, string> | undefined,
+			)
+			if (payload.mode === "commit_report") {
+				uploadedReports.push(payload)
+			}
+			return new Response("ok", { status: 200 })
+		})
+		vi.stubGlobal("fetch", fetchMock)
+
+		const facts = await (service as any).commitAttributionService.collectCommitFactsForReplay(
+			repoDir,
+			commitHash,
+			"main",
+		)
+		await (service as any).handleCommitCollected(facts)
+		const store = (service as any).store
+		await store.setRepoObservedCommit(repoDir, commitHash)
+		expect(await store.getQueuedReportsForTests()).toHaveLength(0)
+		expect(uploadedReports).toHaveLength(1)
+
+		const missingRecords = await service.refreshCommitUploadStatus()
+		expect(missingRecords).toHaveLength(1)
+		expect(missingRecords[0]).toMatchObject({
+			commitHash,
+			status: "needs_reanalysis",
+			addedLineCount: 1,
+			changedFileCount: 1,
+		})
+
+		serverStatus = "RECEIVED"
+		const afterReplay = await service.reanalyzeCommitUpload(missingRecords[0].id)
+		expect(afterReplay).toHaveLength(0)
+		const replayReport = uploadedReports.find((report) => String(report.reportId).startsWith("replay-"))
+		expect(replayReport).toBeTruthy()
+		expect(replayReport.commitHash).toBe(commitHash)
+		expect(replayReport.candidateLines?.length).toBeGreaterThan(0)
+		expect(replayReport.generatedBlocks?.length).toBeGreaterThan(0)
+
+		const diagnosticsPath = await service.exportCommitUploadDiagnostics()
+		const diagnostics = await fs.readFile(diagnosticsPath, "utf8")
+		expect(diagnostics).toContain("reanalysis_uploaded")
+		expect(diagnostics).not.toContain("const aiReplay = 2")
+		expect(diagnostics).not.toContain("fileSnapshotContent")
+	})
+
+	it("keeps a replayed commit report retryable when reanalysis upload fails", async () => {
+		mockIsGitRepository.mockResolvedValue(true)
+		mockGetRemoteUrl.mockResolvedValue("https://github.com/example/replay-fail.git")
+		mockGetCurrentBranch.mockResolvedValue("main")
+
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const repoDir = await createGitRepo()
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({
+			webhookUrl: "https://example.com/prod-api",
+			userEmail: "tester@example.com",
+		}))
+
+		const relativePath = "src/replay-fail.ts"
+		const filePath = path.join(repoDir, relativePath)
+		const originalContent = "const base = 1\n"
+		const aiContent = "const base = 1\nconst replayFailAi = true\n"
+		await commitFile(repoDir, relativePath, originalContent, "base")
+		await service.recordAgentFileWrite({
+			cwd: repoDir,
+			filePath,
+			relativePath,
+			originalContent,
+			newContent: aiContent,
+			taskId: "task-replay-fail",
+		})
+		const commitHash = await commitFile(repoDir, relativePath, aiContent, "ai replay fail")
+
+		const uploadedReports: any[] = []
+		let failReplayReports = false
+		const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+			const pathname = new URL(url).pathname
+			if (pathname.endsWith("/commit-status")) {
+				const query = JSON.parse(String(init?.body ?? "{}"))
+				return new Response(
+					JSON.stringify({
+						statuses: query.commits.map((commit: any) => ({
+							commitHash: commit.commitHash,
+							status: "NOT_RECEIVED",
+							receivedAt: null,
+							reportId: null,
+							message: null,
+						})),
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				)
+			}
+
+			const payload = await parseJsonBody(
+				init?.body as BodyInit,
+				init?.headers as Record<string, string> | undefined,
+			)
+			if (payload.mode === "commit_report") {
+				if (failReplayReports && String(payload.reportId).startsWith("replay-")) {
+					return new Response("temporary upload failure", { status: 503, statusText: "Service Unavailable" })
+				}
+				uploadedReports.push(payload)
+			}
+			return new Response("ok", { status: 200 })
+		})
+		vi.stubGlobal("fetch", fetchMock)
+
+		const facts = await (service as any).commitAttributionService.collectCommitFactsForReplay(
+			repoDir,
+			commitHash,
+			"main",
+		)
+		await (service as any).handleCommitCollected(facts)
+		const missingRecords = await service.refreshCommitUploadStatus()
+		expect(missingRecords).toHaveLength(1)
+		expect(missingRecords[0].status).toBe("needs_reanalysis")
+
+		failReplayReports = true
+		const afterReplayFailure = await service.reanalyzeCommitUpload(missingRecords[0].id)
+		expect(afterReplayFailure).toHaveLength(1)
+		expect(afterReplayFailure[0]).toMatchObject({
+			commitHash,
+			status: "upload_failed",
+		})
+		expect(afterReplayFailure[0].reportId).toMatch(/^replay-/)
+		expect(afterReplayFailure[0].lastError).toContain("503")
+		expect(await (service as any).store.getQueuedReportsForTests()).toHaveLength(1)
+
+		const diagnosticsPath = await service.exportCommitUploadDiagnostics(afterReplayFailure[0].id)
+		const diagnostics = await fs.readFile(diagnosticsPath, "utf8")
+		expect(diagnostics).toContain("upload_failed")
+		expect(diagnostics).not.toContain("reanalysis_uploaded")
+	})
+
+	it("keeps failed commit reports retryable and hides them after retry succeeds", async () => {
+		mockIsGitRepository.mockResolvedValue(true)
+		mockGetRemoteUrl.mockResolvedValue("https://github.com/example/retry.git")
+		mockGetCurrentBranch.mockResolvedValue("main")
+
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const repoDir = await createGitRepo()
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({
+			webhookUrl: "https://example.com/prod-api",
+			userEmail: "tester@example.com",
+		}))
+
+		const relativePath = "src/retry.ts"
+		const filePath = path.join(repoDir, relativePath)
+		const originalContent = "const base = 1\n"
+		const aiContent = "const base = 1\nconst retryAi = true\n"
+		await commitFile(repoDir, relativePath, originalContent, "base")
+		await service.recordAgentFileWrite({
+			cwd: repoDir,
+			filePath,
+			relativePath,
+			originalContent,
+			newContent: aiContent,
+			taskId: "task-retry",
+		})
+		const commitHash = await commitFile(repoDir, relativePath, aiContent, "ai retry")
+
+		let failCommitReports = true
+		const uploadedReports: any[] = []
+		const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+			const pathname = new URL(url).pathname
+			if (pathname.endsWith("/commit-status")) {
+				const query = JSON.parse(String(init?.body ?? "{}"))
+				return new Response(
+					JSON.stringify({
+						statuses: query.commits.map((commit: any) => ({
+							commitHash: commit.commitHash,
+							status: "RECEIVED",
+							receivedAt: new Date().toISOString(),
+							reportId:
+								commit.reportId ??
+								uploadedReports.find((report) => report.commitHash === commit.commitHash)?.reportId ??
+								null,
+							message: null,
+						})),
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				)
+			}
+
+			const payload = await parseJsonBody(
+				init?.body as BodyInit,
+				init?.headers as Record<string, string> | undefined,
+			)
+			if (payload.mode === "commit_report") {
+				if (failCommitReports) {
+					return new Response("upload timeout", { status: 504, statusText: "Gateway Timeout" })
+				}
+				uploadedReports.push(payload)
+			}
+			return new Response("ok", { status: 200 })
+		})
+		vi.stubGlobal("fetch", fetchMock)
+
+		const facts = await (service as any).commitAttributionService.collectCommitFactsForReplay(
+			repoDir,
+			commitHash,
+			"main",
+		)
+		await (service as any).handleCommitCollected(facts)
+
+		const store = (service as any).store
+		let visibleRecords = await store.getVisibleCommitUploadRecords()
+		expect(visibleRecords).toHaveLength(1)
+		expect(visibleRecords[0]).toMatchObject({
+			commitHash,
+			status: "upload_failed",
+		})
+		expect(visibleRecords[0].lastError).toContain("504")
+		expect(visibleRecords[0].lastErrorCategory).toBe("timeout")
+		expect(visibleRecords[0].lastUserMessage).toBe("连接上报服务器超时，请检查网络或后台服务状态。")
+		expect(await store.getQueuedReportsForTests()).toHaveLength(1)
+
+		const failedDiagnosticsPath = await service.exportCommitUploadDiagnostics(visibleRecords[0].id)
+		const failedDiagnostics = JSON.parse(await fs.readFile(failedDiagnosticsPath, "utf8"))
+		const uploadFailedEvent = failedDiagnostics.events.find((event: any) => event.type === "upload_failed")
+		expect(uploadFailedEvent?.details).toMatchObject({
+			action: "commit",
+			errorCategory: "timeout",
+			userMessage: "连接上报服务器超时，请检查网络或后台服务状态。",
+			targetProtocol: "https",
+			targetHost: "example.com",
+			targetPath: "/prod-api/api/v1/ingest/ai-code-stats",
+		})
+		expect(uploadFailedEvent?.details.selectedReportId).toBeUndefined()
+
+		failCommitReports = false
+		visibleRecords = await service.retryCommitUpload(visibleRecords[0].id)
+		expect(visibleRecords).toHaveLength(0)
+		expect(await store.getQueuedReportsForTests()).toHaveLength(0)
+		expect(uploadedReports).toHaveLength(1)
+		expect(uploadedReports[0].commitHash).toBe(commitHash)
+	})
+
+	it("retries only the selected failed commit report", async () => {
+		mockIsGitRepository.mockResolvedValue(true)
+		mockGetRemoteUrl.mockResolvedValue("https://github.com/example/retry-selected.git")
+		mockGetCurrentBranch.mockResolvedValue("main")
+
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const repoDir = await createGitRepo()
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({
+			webhookUrl: "https://example.com/prod-api",
+			userEmail: "tester@example.com",
+		}))
+
+		const uploadedReports: any[] = []
+		let failCommitReports = true
+		const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+			const pathname = new URL(url).pathname
+			if (pathname.endsWith("/commit-status")) {
+				const query = JSON.parse(String(init?.body ?? "{}"))
+				return new Response(
+					JSON.stringify({
+						statuses: query.commits.map((commit: any) => {
+							const uploaded = uploadedReports.find((report) => report.commitHash === commit.commitHash)
+							return {
+								commitHash: commit.commitHash,
+								status: uploaded ? "RECEIVED" : "NOT_RECEIVED",
+								receivedAt: uploaded ? new Date().toISOString() : null,
+								reportId: uploaded?.reportId ?? null,
+								message: null,
+							}
+						}),
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				)
+			}
+
+			const payload = await parseJsonBody(
+				init?.body as BodyInit,
+				init?.headers as Record<string, string> | undefined,
+			)
+			if (payload.mode === "commit_report") {
+				if (failCommitReports) {
+					return new Response("backend stopped", { status: 503, statusText: "Service Unavailable" })
+				}
+				uploadedReports.push(payload)
+			}
+			return new Response("ok", { status: 200 })
+		})
+		vi.stubGlobal("fetch", fetchMock)
+
+		const firstPath = "src/retry-selected-one.ts"
+		const firstOriginal = "const base = 1\n"
+		const firstAiContent = "const base = 1\nconst retrySelectedOne = true\n"
+		await commitFile(repoDir, firstPath, firstOriginal, "base one")
+		await service.recordAgentFileWrite({
+			cwd: repoDir,
+			filePath: path.join(repoDir, firstPath),
+			relativePath: firstPath,
+			originalContent: firstOriginal,
+			newContent: firstAiContent,
+			taskId: "task-retry-selected-one",
+		})
+		const firstCommitHash = await commitFile(repoDir, firstPath, firstAiContent, "ai retry selected one")
+		await (service as any).handleCommitCollected(
+			await (service as any).commitAttributionService.collectCommitFactsForReplay(
+				repoDir,
+				firstCommitHash,
+				"main",
+			),
+		)
+
+		const secondPath = "src/retry-selected-two.ts"
+		const secondOriginal = "const base = 2\n"
+		const secondAiContent = "const base = 2\nconst retrySelectedTwo = true\n"
+		await service.recordAgentFileWrite({
+			cwd: repoDir,
+			filePath: path.join(repoDir, secondPath),
+			relativePath: secondPath,
+			originalContent: secondOriginal,
+			newContent: secondAiContent,
+			taskId: "task-retry-selected-two",
+		})
+		const secondCommitHash = await commitFile(repoDir, secondPath, secondAiContent, "ai retry selected two")
+		await (service as any).handleCommitCollected(
+			await (service as any).commitAttributionService.collectCommitFactsForReplay(
+				repoDir,
+				secondCommitHash,
+				"main",
+			),
+		)
+
+		const store = (service as any).store
+		let visibleRecords = await store.getVisibleCommitUploadRecords()
+		expect(visibleRecords).toHaveLength(2)
+		expect(await store.getQueuedReportsForTests()).toHaveLength(2)
+
+		const selectedRecord = visibleRecords.find((record: any) => record.commitHash === secondCommitHash)!
+		failCommitReports = false
+		visibleRecords = await service.retryCommitUpload(selectedRecord.id)
+
+		expect(uploadedReports).toHaveLength(1)
+		expect(uploadedReports[0].commitHash).toBe(secondCommitHash)
+		expect(await store.getQueuedReportsForTests()).toHaveLength(1)
+		expect(visibleRecords).toHaveLength(1)
+		expect(visibleRecords[0].commitHash).toBe(firstCommitHash)
+		expect(visibleRecords[0].status).toBe("upload_failed")
+
+		const diagnosticsPath = await service.exportCommitUploadDiagnostics(selectedRecord.id)
+		const diagnostics = JSON.parse(await fs.readFile(diagnosticsPath, "utf8"))
+		expect(
+			diagnostics.events.some(
+				(event: any) =>
+					event.type === "upload_retry_requested" &&
+					event.reportId === selectedRecord.reportId &&
+					event.details?.action === "retry" &&
+					event.details?.selectedReportId === selectedRecord.reportId,
+			),
+		).toBe(true)
+		expect(
+			diagnostics.events.some(
+				(event: any) =>
+					event.type === "upload_started" &&
+					event.reportId === selectedRecord.reportId &&
+					event.details?.action === "retry" &&
+					event.details?.selectedReportId === selectedRecord.reportId &&
+					event.details?.targetPath === "/prod-api/api/v1/ingest/ai-code-stats",
+			),
+		).toBe(true)
 	})
 	// kilocode_change end
 })

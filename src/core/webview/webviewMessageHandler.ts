@@ -114,6 +114,7 @@ import {
 	InvalidAiCodeStatsWebhookUrlError,
 	resolveAiCodeStatsWebhookUrl,
 } from "../../services/ai-code-stats/AiCodeStatsWebhookUrl"
+import { AiCodeStatsService } from "../../services/ai-code-stats"
 import {
 	InvalidAiTokenUsageWebhookUrlError,
 	resolveAiTokenUsageWebhookUrl,
@@ -2049,6 +2050,58 @@ export const webviewMessageHandler = async (
 					},
 				})
 			}
+			break
+		}
+		case "getAiCodeStatsCommitUploadRecords": {
+			const service = AiCodeStatsService.getInstance()
+			const records = service ? await service.refreshCommitUploadStatus() : []
+			await provider.postMessageToWebview({
+				type: "aiCodeStatsCommitUploadRecords",
+				values: {
+					records,
+				},
+			})
+			break
+		}
+		case "retryAiCodeStatsCommitUpload": {
+			const service = AiCodeStatsService.getInstance()
+			const recordId = typeof message.text === "string" ? message.text : ""
+			const records = service ? await service.retryCommitUpload(recordId) : []
+			await provider.postMessageToWebview({
+				type: "aiCodeStatsCommitUploadRecords",
+				values: {
+					records,
+				},
+			})
+			break
+		}
+		case "reanalyzeAiCodeStatsCommitUpload": {
+			const service = AiCodeStatsService.getInstance()
+			const recordId = typeof message.text === "string" ? message.text : ""
+			const records = service ? await service.reanalyzeCommitUpload(recordId) : []
+			await provider.postMessageToWebview({
+				type: "aiCodeStatsCommitUploadRecords",
+				values: {
+					records,
+				},
+			})
+			break
+		}
+		case "exportAiCodeStatsDiagnostics": {
+			const service = AiCodeStatsService.getInstance()
+			const recordId = typeof message.text === "string" ? message.text : undefined
+			if (service) {
+				const filePath = await service.exportCommitUploadDiagnostics(recordId)
+				await openFile(filePath)
+				await vscode.window.showInformationMessage(`AI 代码提交诊断已导出：${filePath}`)
+			}
+			const records = service ? await service.getVisibleCommitUploadRecords() : []
+			await provider.postMessageToWebview({
+				type: "aiCodeStatsCommitUploadRecords",
+				values: {
+					records,
+				},
+			})
 			break
 		}
 		// kilocode_change end

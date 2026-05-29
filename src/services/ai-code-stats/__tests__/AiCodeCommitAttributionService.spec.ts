@@ -1,6 +1,8 @@
 import * as fs from "fs/promises"
 import * as os from "os"
 import * as path from "path"
+import { execFile as execFileCallback } from "child_process"
+import { promisify } from "util"
 
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
@@ -11,6 +13,8 @@ import {
 import { hashLineFingerprint } from "../AiCodeLineFingerprint"
 import { AiCodeStatsStore } from "../AiCodeStatsStore"
 import type { AiCodePendingLineAttribution } from "../types"
+
+const execFileAsync = promisify(execFileCallback)
 
 class FakeWatcher {
 	private handlers: Array<(event: any) => void> = []
@@ -65,6 +69,24 @@ const buildPendingLine = (overrides: Partial<AiCodePendingLineAttribution> = {})
 		occurrenceIndex: overrides.occurrenceIndex ?? 1,
 	}
 }
+
+const initRealGitRepo = async (): Promise<string> => {
+	const repoDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-commit-attribution-real-"))
+	await execFileAsync("git", ["init"], { cwd: repoDir })
+	await execFileAsync("git", ["config", "user.email", "tester@example.com"], { cwd: repoDir })
+	await execFileAsync("git", ["config", "user.name", "Tester"], { cwd: repoDir })
+	await fs.writeFile(path.join(repoDir, "README.md"), "initial\n", "utf8")
+	await execFileAsync("git", ["add", "README.md"], { cwd: repoDir })
+	await execFileAsync("git", ["commit", "-m", "initial"], { cwd: repoDir })
+	return repoDir
+}
+
+const buildLargeSource = (prefix: string, lineCount: number): string =>
+	Array.from(
+		{ length: lineCount },
+		(_, index) =>
+			`export const ${prefix}${String(index).padStart(5, "0")} = "${prefix}-${String(index).padStart(5, "0")}-${"x".repeat(180)}"`,
+	).join("\n") + "\n"
 
 describe("AiCodeCommitAttributionService", () => {
 	let tmpDir: string
@@ -267,6 +289,32 @@ describe("AiCodeCommitAttributionService", () => {
 		expect(await store.getRepoObservedCommit("/repo")).toBe("head-1")
 		expect(await store.getPendingLineAttributions("/repo")).toHaveLength(1)
 	})
+
+	it("loads large commit diffs per file instead of hitting the old 16MB git buffer", async () => {
+		const repoDir = await initRealGitRepo()
+		await fs.mkdir(path.join(repoDir, "src"), { recursive: true })
+		await fs.writeFile(path.join(repoDir, "src/large-a.ts"), buildLargeSource("a", 42_000), "utf8")
+		await fs.writeFile(path.join(repoDir, "src/large-b.ts"), buildLargeSource("b", 42_000), "utf8")
+		await execFileAsync("git", ["add", "src/large-a.ts", "src/large-b.ts"], { cwd: repoDir })
+		await execFileAsync("git", ["commit", "-m", "large commit"], { cwd: repoDir })
+		const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: repoDir })
+		const commitHash = stdout.trim()
+
+		const service = new AiCodeCommitAttributionService(store, {
+			createWatcher: () => {
+				const watcher = new FakeWatcher()
+				watchers.push(watcher)
+				return watcher
+			},
+			loadCommitFileContent: async () => undefined,
+			getCurrentBranch: async () => "main",
+		})
+
+		const facts = await service.collectCommitFactsForReplay(repoDir, commitHash, "main")
+
+		expect(facts.changedFiles.map((file) => file.relativePath).sort()).toEqual(["src/large-a.ts", "src/large-b.ts"])
+		expect(facts.changedFiles.reduce((total, file) => total + (file.addedLines?.length ?? 0), 0)).toBe(84_000)
+	}, 20_000)
 
 	it("does not upload attribution facts when commit timestamp loading fails", async () => {
 		const onCommitCollected = vi.fn(async (_payload: any) => {})

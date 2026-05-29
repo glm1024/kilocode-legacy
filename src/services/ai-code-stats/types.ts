@@ -186,6 +186,65 @@ export interface AiCodeQueuedCommitReport {
 
 export type AiCodePendingCommitMetricBlock = AiCodeGeneratedBlock
 
+export type AiCodeCommitUploadStatus =
+	| "queued"
+	| "uploaded"
+	| "upload_failed"
+	| "needs_reanalysis"
+	| "reanalysis_failed"
+	| "processing"
+	| "server_processing"
+	| "server_failed"
+
+export interface AiCodeCommitUploadRecord {
+	id: string
+	commitHash: string
+	repoRoot: string
+	gitRemoteUrl?: string
+	gitBranch?: string
+	commitOccurredAt?: number
+	status: AiCodeCommitUploadStatus
+	reportId?: string
+	lastAttemptAt?: number
+	lastError?: string
+	lastErrorCategory?: string
+	lastUserMessage?: string
+	rawPayloadBytes?: number
+	compressedPayloadBytes?: number
+	candidateBlockCount?: number
+	changedFileCount?: number
+	addedLineCount?: number
+	repoName?: string
+	createdAt: number
+	updatedAt: number
+}
+
+export interface AiCodeCommitUploadDiagnosticEvent {
+	timestamp: number
+	type: string
+	commitHash?: string
+	reportId?: string
+	repoRoot?: string
+	status?: string
+	message?: string
+	details?: Record<string, unknown>
+}
+
+export type AiCodeCommitServerStatusValue =
+	| "NOT_RECEIVED"
+	| "RECEIVED"
+	| "ATTRIBUTED"
+	| "PROCESSING"
+	| "ATTRIBUTION_FAILED"
+
+export interface AiCodeCommitServerStatus {
+	commitHash: string
+	status: AiCodeCommitServerStatusValue
+	receivedAt?: string | number | null
+	reportId?: string | null
+	message?: string | null
+}
+
 export interface AiCodeStatsFailedReportUpload {
 	reportId?: string
 	commitHash?: string
@@ -194,6 +253,11 @@ export interface AiCodeStatsFailedReportUpload {
 	encoding?: "gzip" | "identity" | string
 	timeoutMs?: number
 	message: string
+	errorCategory?: string
+	userMessage?: string
+	targetProtocol?: string
+	targetHost?: string
+	targetPath?: string
 }
 
 export interface AiCodeStatsLastUpload {

@@ -13,6 +13,8 @@ import {
 	type AiCodeGeneratedBlock,
 	type AiCodePendingCommitMetricBlock,
 	type AiCodeGeneratedBlockState,
+	type AiCodeCommitUploadDiagnosticEvent,
+	type AiCodeCommitUploadRecord,
 	type AiCodePendingLineAttribution,
 	type AiCodeQueuedCommitReport,
 	type AiCodeStatsEvent,
@@ -24,8 +26,11 @@ const STATE_FILE = "state.json"
 const PENDING_LINES_FILE = "pending-lines.json"
 const GENERATED_BLOCKS_FILE = "generated-blocks.json"
 const QUEUED_REPORTS_FILE = "queued-reports.json"
+const COMMIT_UPLOAD_RECORDS_FILE = "commit-upload-records.json"
+const DIAGNOSTICS_FILE = "diagnostics.jsonl"
 const PENDING_COMMIT_METRIC_BLOCKS_FILE = "pending-commit-metric-blocks.json"
 const SNAPSHOTS_FILE = "snapshot-store.json"
+const MAX_DIAGNOSTIC_BYTES = 2 * 1024 * 1024
 
 interface AiCodeSnapshotStoreEntry {
 	contentHash: string
@@ -54,12 +59,15 @@ export class AiCodeStatsStore {
 	private readonly pendingLinesPath: string
 	private readonly generatedBlocksPath: string
 	private readonly queuedReportsPath: string
+	private readonly commitUploadRecordsPath: string
+	private readonly diagnosticsPath: string
 	private readonly pendingCommitMetricBlocksPath: string
 	private readonly snapshotsPath: string
 	private state: AiCodeStatsPersistedState | null = null
 	private pendingLines: AiCodePendingLineAttribution[] = []
 	private generatedBlocks: AiCodeGeneratedBlockState[] = []
 	private queuedReports: AiCodeQueuedCommitReport[] = []
+	private commitUploadRecords: AiCodeCommitUploadRecord[] = []
 	private pendingCommitMetricBlocks: AiCodePendingCommitMetricBlock[] = []
 	private snapshots: Record<string, AiCodeSnapshotStoreEntry> = {}
 	private snapshotsChanged = false
@@ -73,6 +81,8 @@ export class AiCodeStatsStore {
 		this.pendingLinesPath = path.join(this.baseDir, PENDING_LINES_FILE)
 		this.generatedBlocksPath = path.join(this.baseDir, GENERATED_BLOCKS_FILE)
 		this.queuedReportsPath = path.join(this.baseDir, QUEUED_REPORTS_FILE)
+		this.commitUploadRecordsPath = path.join(this.baseDir, COMMIT_UPLOAD_RECORDS_FILE)
+		this.diagnosticsPath = path.join(this.baseDir, DIAGNOSTICS_FILE)
 		this.pendingCommitMetricBlocksPath = path.join(this.baseDir, PENDING_COMMIT_METRIC_BLOCKS_FILE)
 		this.snapshotsPath = path.join(this.baseDir, SNAPSHOTS_FILE)
 	}
@@ -107,9 +117,30 @@ export class AiCodeStatsStore {
 				(block) => !queuedGeneratedIds.has(block.generatedBlockId),
 			)
 			this.queuedReports.push(normalizedReport)
+			this.upsertCommitUploadRecordInMemory({
+				id: this.buildCommitUploadRecordId(
+					normalizedReport.report.repoRoot,
+					normalizedReport.report.commitHash,
+					normalizedReport.report.reportId,
+				),
+				commitHash: normalizedReport.report.commitHash,
+				repoRoot: normalizePath(path.resolve(normalizedReport.report.repoRoot)),
+				gitRemoteUrl: normalizedReport.report.gitRemoteUrl,
+				gitBranch: normalizedReport.report.gitBranch,
+				commitOccurredAt: normalizedReport.report.commitOccurredAt,
+				status: "queued",
+				reportId: normalizedReport.report.reportId,
+				candidateBlockCount: normalizedReport.generatedBlockIds.length,
+				changedFileCount: normalizedReport.report.changedFiles?.length ?? 0,
+				addedLineCount: (normalizedReport.report.changedFiles ?? []).reduce(
+					(total, file) => total + (file.addedLines?.length ?? 0),
+					0,
+				),
+			})
 			await this.persistGeneratedBlocks()
 			await this.persistPendingCommitMetricBlocks()
 			await this.persistQueuedReports()
+			await this.persistCommitUploadRecords()
 		})
 	}
 
@@ -126,6 +157,164 @@ export class AiCodeStatsStore {
 			.map((report) => this.normalizeQueuedReport(report))
 	}
 
+	async getCommitUploadRecords(): Promise<AiCodeCommitUploadRecord[]> {
+		await this.ensureLoaded()
+		return this.commitUploadRecords
+			.slice()
+			.sort(
+				(left, right) =>
+					(right.commitOccurredAt ?? right.updatedAt) - (left.commitOccurredAt ?? left.updatedAt) ||
+					right.updatedAt - left.updatedAt ||
+					right.id.localeCompare(left.id),
+			)
+			.map((record) => ({ ...record }))
+	}
+
+	async getVisibleCommitUploadRecords(): Promise<AiCodeCommitUploadRecord[]> {
+		const visibleStatuses = new Set([
+			"upload_failed",
+			"needs_reanalysis",
+			"reanalysis_failed",
+			"processing",
+			"server_failed",
+		])
+		return (await this.getCommitUploadRecords()).filter((record) => visibleStatuses.has(record.status))
+	}
+
+	async upsertCommitUploadRecord(
+		record: Partial<AiCodeCommitUploadRecord> & {
+			commitHash: string
+			repoRoot: string
+			status: AiCodeCommitUploadRecord["status"]
+		},
+	): Promise<AiCodeCommitUploadRecord> {
+		let result!: AiCodeCommitUploadRecord
+		await this.enqueue(async () => {
+			await this.ensureLoaded()
+			const normalized = this.normalizeCommitUploadRecord({
+				...record,
+				id: record.id ?? this.buildCommitUploadRecordId(record.repoRoot, record.commitHash, record.reportId),
+			} as AiCodeCommitUploadRecord)
+			const index = this.commitUploadRecords.findIndex((item) => item.id === normalized.id)
+			const now = Date.now()
+			if (index >= 0) {
+				const existing = this.commitUploadRecords[index]
+				result = {
+					...existing,
+					...normalized,
+					createdAt: existing.createdAt || normalized.createdAt || now,
+					updatedAt: now,
+				}
+				this.commitUploadRecords[index] = result
+			} else {
+				result = {
+					...normalized,
+					createdAt: normalized.createdAt || now,
+					updatedAt: now,
+				}
+				this.commitUploadRecords.push(result)
+			}
+			await this.persistCommitUploadRecords()
+		})
+		return { ...result }
+	}
+
+	async markCommitUploadRecordStatus(params: {
+		reportId?: string
+		commitHash: string
+		repoRoot?: string
+		status: AiCodeCommitUploadRecord["status"]
+		lastError?: string
+		lastErrorCategory?: string
+		lastUserMessage?: string
+		rawPayloadBytes?: number
+		compressedPayloadBytes?: number
+	}): Promise<void> {
+		await this.enqueue(async () => {
+			await this.ensureLoaded()
+			const now = Date.now()
+			const target = this.findCommitUploadRecord(params.reportId, params.commitHash, params.repoRoot)
+			if (!target) {
+				if (!params.repoRoot) {
+					return
+				}
+				this.commitUploadRecords.push(
+					this.normalizeCommitUploadRecord({
+						id: this.buildCommitUploadRecordId(params.repoRoot, params.commitHash, params.reportId),
+						repoRoot: params.repoRoot,
+						commitHash: params.commitHash,
+						reportId: params.reportId,
+						status: params.status,
+						lastError: params.lastError,
+						lastErrorCategory: params.lastErrorCategory,
+						lastUserMessage: params.lastUserMessage,
+						rawPayloadBytes: params.rawPayloadBytes,
+						compressedPayloadBytes: params.compressedPayloadBytes,
+						lastAttemptAt: now,
+						createdAt: now,
+						updatedAt: now,
+					}),
+				)
+			} else {
+				target.status = params.status
+				target.lastError = params.lastError
+				target.lastErrorCategory = params.lastErrorCategory
+				target.lastUserMessage = params.lastUserMessage
+				target.rawPayloadBytes = params.rawPayloadBytes ?? target.rawPayloadBytes
+				target.compressedPayloadBytes = params.compressedPayloadBytes ?? target.compressedPayloadBytes
+				target.lastAttemptAt = now
+				target.updatedAt = now
+			}
+			await this.persistCommitUploadRecords()
+		})
+	}
+
+	async appendDiagnosticEvent(event: Omit<AiCodeCommitUploadDiagnosticEvent, "timestamp">): Promise<void> {
+		await fs.mkdir(this.baseDir, { recursive: true })
+		const payload: AiCodeCommitUploadDiagnosticEvent = {
+			timestamp: Date.now(),
+			...event,
+		}
+		await fs.appendFile(this.diagnosticsPath, `${JSON.stringify(payload)}\n`, "utf8")
+		await this.rotateDiagnosticsIfNeeded()
+	}
+
+	async getCommitUploadDiagnostics(recordId?: string): Promise<{
+		records: AiCodeCommitUploadRecord[]
+		events: AiCodeCommitUploadDiagnosticEvent[]
+	}> {
+		await this.ensureLoaded()
+		const targetRecord = recordId ? this.commitUploadRecords.find((record) => record.id === recordId) : undefined
+		const records = targetRecord
+			? [targetRecord]
+			: this.commitUploadRecords.filter((record) =>
+					["upload_failed", "needs_reanalysis", "reanalysis_failed", "processing", "server_failed"].includes(
+						record.status,
+					),
+				)
+		let events: AiCodeCommitUploadDiagnosticEvent[] = []
+		try {
+			const raw = await fs.readFile(this.diagnosticsPath, "utf8")
+			events = raw
+				.split(/\r?\n/)
+				.filter(Boolean)
+				.map((line) => JSON.parse(line) as AiCodeCommitUploadDiagnosticEvent)
+		} catch {
+			events = []
+		}
+		if (targetRecord) {
+			events = events.filter(
+				(event) =>
+					event.commitHash === targetRecord.commitHash ||
+					(Boolean(targetRecord.reportId) && event.reportId === targetRecord.reportId),
+			)
+		}
+		return {
+			records: records.map((record) => ({ ...record })),
+			events: events.map((event) => ({ ...event })),
+		}
+	}
+
 	async acknowledgeQueuedCommitReport(reportId: string): Promise<void> {
 		await this.enqueue(async () => {
 			await this.ensureLoaded()
@@ -135,6 +324,12 @@ export class AiCodeStatsStore {
 			}
 
 			this.queuedReports = this.queuedReports.filter((report) => report.report.reportId !== reportId)
+			const uploadRecord = this.findCommitUploadRecord(reportId, target.report.commitHash, target.report.repoRoot)
+			if (uploadRecord) {
+				uploadRecord.status = "uploaded"
+				uploadRecord.lastError = undefined
+				uploadRecord.updatedAt = Date.now()
+			}
 			const uploadedIds = new Set(target.generatedBlockIds)
 			this.generatedBlocks = this.generatedBlocks.map((block) => {
 				if (!uploadedIds.has(block.generatedBlockId)) {
@@ -157,6 +352,7 @@ export class AiCodeStatsStore {
 			await this.persistGeneratedBlocks()
 			await this.persistPendingLines()
 			await this.persistQueuedReports()
+			await this.persistCommitUploadRecords()
 		})
 	}
 
@@ -478,6 +674,7 @@ export class AiCodeStatsStore {
 			this.pendingLines = []
 			this.generatedBlocks = []
 			this.queuedReports = []
+			this.commitUploadRecords = []
 			this.pendingCommitMetricBlocks = []
 			this.snapshots = {}
 			this.snapshotsChanged = false
@@ -486,6 +683,7 @@ export class AiCodeStatsStore {
 			await this.persistGeneratedBlocks()
 			await this.persistPendingCommitMetricBlocks()
 			await this.persistQueuedReports()
+			await this.persistCommitUploadRecords()
 			await this.persistSnapshots()
 			return
 		}
@@ -554,6 +752,17 @@ export class AiCodeStatsStore {
 		}
 
 		try {
+			const raw = await fs.readFile(this.commitUploadRecordsPath, "utf8")
+			const parsed = JSON.parse(raw)
+			this.commitUploadRecords = Array.isArray(parsed)
+				? parsed.map((record) => this.normalizeCommitUploadRecord(record as AiCodeCommitUploadRecord))
+				: []
+		} catch {
+			this.commitUploadRecords = []
+			await this.persistCommitUploadRecords()
+		}
+
+		try {
 			const raw = await fs.readFile(this.pendingCommitMetricBlocksPath, "utf8")
 			const parsed = JSON.parse(raw)
 			this.pendingCommitMetricBlocks = Array.isArray(parsed)
@@ -579,6 +788,7 @@ export class AiCodeStatsStore {
 		await this.persistGeneratedBlocks()
 		await this.persistPendingCommitMetricBlocks()
 		await this.persistQueuedReports()
+		await this.persistCommitUploadRecords()
 	}
 
 	private async appendUploadEventsToQueue(events: AiCodeStatsEvent[], markPending: boolean): Promise<void> {
@@ -630,6 +840,10 @@ export class AiCodeStatsStore {
 			this.queuedReportsPath,
 			this.queuedReports.map((report) => this.compactQueuedReportForStorage(report)),
 		)
+	}
+
+	private async persistCommitUploadRecords(): Promise<void> {
+		await safeWriteJson(this.commitUploadRecordsPath, this.commitUploadRecords)
 	}
 
 	private async persistSnapshotsIfChanged(): Promise<void> {
@@ -755,6 +969,99 @@ export class AiCodeStatsStore {
 					return rest
 				}),
 			},
+		}
+	}
+
+	private buildCommitUploadRecordId(repoRoot: string, commitHash: string, reportId?: string): string {
+		return `${normalizePath(path.resolve(repoRoot))}::${commitHash.trim()}::${reportId?.trim() || "commit"}`
+	}
+
+	private findCommitUploadRecord(
+		reportId: string | undefined,
+		commitHash: string,
+		repoRoot?: string,
+	): AiCodeCommitUploadRecord | undefined {
+		const normalizedRepoRoot = repoRoot ? normalizePath(path.resolve(repoRoot)) : undefined
+		return this.commitUploadRecords.find(
+			(record) =>
+				record.commitHash === commitHash &&
+				(!reportId || record.reportId === reportId) &&
+				(!normalizedRepoRoot || record.repoRoot === normalizedRepoRoot),
+		)
+	}
+
+	private upsertCommitUploadRecordInMemory(
+		record: Partial<AiCodeCommitUploadRecord> & {
+			commitHash: string
+			repoRoot: string
+			status: AiCodeCommitUploadRecord["status"]
+		},
+	): AiCodeCommitUploadRecord {
+		const now = Date.now()
+		const normalized = this.normalizeCommitUploadRecord({
+			...record,
+			id: record.id ?? this.buildCommitUploadRecordId(record.repoRoot, record.commitHash, record.reportId),
+			createdAt: record.createdAt ?? now,
+			updatedAt: record.updatedAt ?? now,
+		} as AiCodeCommitUploadRecord)
+		const index = this.commitUploadRecords.findIndex((item) => item.id === normalized.id)
+		if (index >= 0) {
+			this.commitUploadRecords[index] = {
+				...this.commitUploadRecords[index],
+				...normalized,
+				createdAt: this.commitUploadRecords[index].createdAt,
+				updatedAt: now,
+			}
+			return this.commitUploadRecords[index]
+		}
+		this.commitUploadRecords.push(normalized)
+		return normalized
+	}
+
+	private normalizeCommitUploadRecord(record: AiCodeCommitUploadRecord): AiCodeCommitUploadRecord {
+		const now = Date.now()
+		const repoRoot = normalizePath(path.resolve(record.repoRoot || ""))
+		const commitHash = typeof record.commitHash === "string" ? record.commitHash.trim() : ""
+		const reportId =
+			typeof record.reportId === "string" && record.reportId.trim() ? record.reportId.trim() : undefined
+		return {
+			id: record.id || this.buildCommitUploadRecordId(repoRoot, commitHash, reportId),
+			commitHash,
+			repoRoot,
+			gitRemoteUrl: record.gitRemoteUrl,
+			gitBranch: record.gitBranch,
+			commitOccurredAt: typeof record.commitOccurredAt === "number" ? record.commitOccurredAt : undefined,
+			status: record.status,
+			reportId,
+			lastAttemptAt: typeof record.lastAttemptAt === "number" ? record.lastAttemptAt : undefined,
+			lastError: record.lastError,
+			lastErrorCategory: record.lastErrorCategory,
+			lastUserMessage: record.lastUserMessage,
+			rawPayloadBytes: typeof record.rawPayloadBytes === "number" ? record.rawPayloadBytes : undefined,
+			compressedPayloadBytes:
+				typeof record.compressedPayloadBytes === "number" ? record.compressedPayloadBytes : undefined,
+			candidateBlockCount:
+				typeof record.candidateBlockCount === "number" ? record.candidateBlockCount : undefined,
+			changedFileCount: typeof record.changedFileCount === "number" ? record.changedFileCount : undefined,
+			addedLineCount: typeof record.addedLineCount === "number" ? record.addedLineCount : undefined,
+			repoName: record.repoName,
+			createdAt: typeof record.createdAt === "number" ? record.createdAt : now,
+			updatedAt: typeof record.updatedAt === "number" ? record.updatedAt : now,
+		}
+	}
+
+	private async rotateDiagnosticsIfNeeded(): Promise<void> {
+		try {
+			const stats = await fs.stat(this.diagnosticsPath)
+			if (stats.size <= MAX_DIAGNOSTIC_BYTES) {
+				return
+			}
+			const raw = await fs.readFile(this.diagnosticsPath, "utf8")
+			const lines = raw.trimEnd().split(/\r?\n/)
+			const retained = lines.slice(Math.max(0, lines.length - 1000)).join("\n")
+			await fs.writeFile(this.diagnosticsPath, retained ? `${retained}\n` : "", "utf8")
+		} catch {
+			// Diagnostic logging should never affect statistics collection.
 		}
 	}
 
@@ -1192,6 +1499,7 @@ export class AiCodeStatsStore {
 			this.pendingLines = []
 			this.generatedBlocks = []
 			this.queuedReports = []
+			this.commitUploadRecords = []
 			this.pendingCommitMetricBlocks = []
 			this.snapshots = {}
 			this.snapshotsChanged = false
@@ -1203,6 +1511,7 @@ export class AiCodeStatsStore {
 			await this.persistGeneratedBlocks()
 			await this.persistPendingCommitMetricBlocks()
 			await this.persistQueuedReports()
+			await this.persistCommitUploadRecords()
 			await this.persistSnapshots()
 		})
 	}

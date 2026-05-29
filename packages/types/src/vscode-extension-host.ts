@@ -234,6 +234,7 @@ export interface ExtensionMessage {
 		| "autoPurgeIncompleteTaskRetentionDays" // kilocode_change
 		| "manualPurge" // kilocode_change
 		| "aiCodeStatsWebhookTestResult" // kilocode_change
+		| "aiCodeStatsCommitUploadRecords" // kilocode_change
 		| "commands"
 		| "insertTextIntoTextarea"
 		| "dismissedUpsells"
@@ -888,6 +889,10 @@ export interface WebviewMessage {
 		| "clearUsageData" // kilocode_change
 		| "getUsageData" // kilocode_change
 		| "testAiCodeStatsWebhook" // kilocode_change
+		| "getAiCodeStatsCommitUploadRecords" // kilocode_change
+		| "retryAiCodeStatsCommitUpload" // kilocode_change
+		| "reanalyzeAiCodeStatsCommitUpload" // kilocode_change
+		| "exportAiCodeStatsDiagnostics" // kilocode_change
 		| "usageDataResponse" // kilocode_change
 		| "showTaskTimeline" // kilocode_change
 		| "sendMessageOnEnter" // kilocode_change

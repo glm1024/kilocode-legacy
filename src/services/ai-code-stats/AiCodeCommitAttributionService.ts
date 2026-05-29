@@ -1,6 +1,6 @@
 // kilocode_change - new file
 
-import { exec as execCallback, execFile as execFileCallback } from "child_process"
+import { exec as execCallback, spawn } from "child_process"
 import * as path from "path"
 import { promisify } from "util"
 
@@ -12,8 +12,9 @@ import { AiCodeStatsStore } from "./AiCodeStatsStore"
 import { normalizePath, type AiCodeCommitChangedFile, type AiCodePendingLineAttribution } from "./types"
 
 const execAsync = promisify(execCallback)
-const execFileAsync = promisify(execFileCallback)
 const EXEC_MAX_BUFFER_BYTES = 16 * 1024 * 1024
+const GIT_STDOUT_LIMIT_BYTES = 128 * 1024 * 1024
+const GIT_FILE_DIFF_STDOUT_LIMIT_BYTES = 32 * 1024 * 1024
 
 interface AiCodeCommitWatcher {
 	onEvent(handler: (event: GitWatcherEvent) => void): void
@@ -42,21 +43,86 @@ export interface AiCodeCommitAttributionServiceOptions {
 
 const defaultCreateWatcher = (repoRoot: string): AiCodeCommitWatcher => new GitWatcher({ cwd: repoRoot })
 
+const runGitStdout = async (repoRoot: string, args: string[], stdoutLimit = GIT_STDOUT_LIMIT_BYTES): Promise<string> =>
+	new Promise((resolve, reject) => {
+		const child = spawn("git", args, { cwd: repoRoot })
+		const stdoutChunks: Buffer[] = []
+		const stderrChunks: Buffer[] = []
+		let stdoutBytes = 0
+		let killedForSize = false
+
+		child.stdout.on("data", (chunk: Buffer) => {
+			stdoutBytes += chunk.byteLength
+			if (stdoutBytes > stdoutLimit) {
+				killedForSize = true
+				child.kill()
+				return
+			}
+			stdoutChunks.push(chunk)
+		})
+		child.stderr.on("data", (chunk: Buffer) => stderrChunks.push(chunk))
+		child.on("error", reject)
+		child.on("close", (code) => {
+			if (killedForSize) {
+				reject(new Error(`git output exceeded ${stdoutLimit} bytes: git ${args.join(" ")}`))
+				return
+			}
+			if (code !== 0) {
+				const stderr = Buffer.concat(stderrChunks).toString("utf8").trim()
+				reject(new Error(`git ${args.join(" ")} failed with code ${code}${stderr ? `: ${stderr}` : ""}`))
+				return
+			}
+			resolve(Buffer.concat(stdoutChunks).toString("utf8"))
+		})
+	})
+
 const splitGitOutputLines = (stdout: string): string[] =>
 	stdout
 		.split(/\r?\n/)
 		.map((line) => line.trim())
 		.filter(Boolean)
 
+const splitGitOutputNul = (stdout: string): string[] =>
+	stdout
+		.split("\0")
+		.map((line) => line.trim())
+		.filter(Boolean)
+
+const listCommitChangedPaths = async (
+	repoRoot: string,
+	previousCommit: string,
+	newCommit: string,
+): Promise<string[]> => {
+	const stdout = previousCommit.trim()
+		? await runGitStdout(
+				repoRoot,
+				["diff", "--name-only", "-z", "--find-renames", previousCommit, newCommit],
+				GIT_STDOUT_LIMIT_BYTES,
+			)
+		: await runGitStdout(
+				repoRoot,
+				["show", "--format=", "--name-only", "-z", "--find-renames", newCommit],
+				GIT_STDOUT_LIMIT_BYTES,
+			)
+	return [...new Set(splitGitOutputNul(stdout).map((filePath) => normalizePath(filePath)))]
+}
+
 const defaultLoadCommitPatch = async (repoRoot: string, previousCommit: string, newCommit: string): Promise<string> => {
-	const command = previousCommit.trim()
-		? `git diff --find-renames --unified=0 ${previousCommit} ${newCommit}`
-		: `git show --format= --find-renames --unified=0 ${newCommit}`
-	const { stdout } = await execAsync(command, {
-		cwd: repoRoot,
-		maxBuffer: EXEC_MAX_BUFFER_BYTES,
-	})
-	return stdout
+	const changedPaths = await listCommitChangedPaths(repoRoot, previousCommit, newCommit)
+	if (changedPaths.length === 0) {
+		return ""
+	}
+	const patchParts: string[] = []
+	for (const changedPath of changedPaths) {
+		const args = previousCommit.trim()
+			? ["diff", "--find-renames", "--unified=0", previousCommit, newCommit, "--", changedPath]
+			: ["show", "--format=", "--find-renames", "--unified=0", newCommit, "--", changedPath]
+		const patchPart = await runGitStdout(repoRoot, args, GIT_FILE_DIFF_STDOUT_LIMIT_BYTES)
+		if (patchPart.trim()) {
+			patchParts.push(patchPart)
+		}
+	}
+	return patchParts.join("\n")
 }
 
 const defaultLoadCommitTimestamp = async (repoRoot: string, commitHash: string): Promise<number> => {
@@ -78,11 +144,7 @@ const defaultLoadCommitFileContent = async (
 	repoRelativePath: string,
 ): Promise<string | undefined> => {
 	try {
-		const { stdout } = await execFileAsync("git", ["show", `${commitHash}:${normalizePath(repoRelativePath)}`], {
-			cwd: repoRoot,
-			maxBuffer: EXEC_MAX_BUFFER_BYTES,
-		})
-		return stdout
+		return await runGitStdout(repoRoot, ["show", `${commitHash}:${normalizePath(repoRelativePath)}`])
 	} catch (error) {
 		console.warn(
 			`[AiCodeCommitAttribution] Failed to load committed file snapshot for ${repoRelativePath} at ${commitHash}:`,
@@ -287,6 +349,16 @@ export class AiCodeCommitAttributionService {
 		await this.ensureWatcher(normalizedRepoRoot)
 	}
 
+	async collectCommitFactsForReplay(
+		repoRoot: string,
+		commitHash: string,
+		branch?: string,
+	): Promise<AiCodeCommitFactsPayload> {
+		const normalizedRepoRoot = normalizePath(path.resolve(repoRoot))
+		const resolvedBranch = branch?.trim() || (await this.getCurrentBranch(normalizedRepoRoot))
+		return this.loadCommitFacts(normalizedRepoRoot, resolvedBranch, commitHash, "")
+	}
+
 	private async ensureWatcher(repoRoot: string): Promise<void> {
 		const normalizedRepoRoot = normalizePath(path.resolve(repoRoot))
 		if (this.watchers.has(normalizedRepoRoot)) {
@@ -469,26 +541,66 @@ export class AiCodeCommitAttributionService {
 			return { processed: false, remainingPendingLines: 0 }
 		}
 
-		let patchContent = ""
+		let facts: AiCodeCommitFactsPayload
 		try {
-			patchContent = await this.loadCommitPatch(repoRoot, previousCommit, commitHash)
+			facts = await this.loadCommitFacts(repoRoot, branch, commitHash, previousCommit)
 		} catch (error) {
-			console.error("[AiCodeCommitAttribution] Failed to load commit patch:", error)
+			console.error("[AiCodeCommitAttribution] Failed to load commit facts:", error)
 			return {
 				processed: false,
 				remainingPendingLines: pendingLines.length,
 			}
 		}
 
-		let commitOccurredAt: number
 		try {
-			commitOccurredAt = await this.getCommitOccurredAt(repoRoot, commitHash)
+			if (this.onCommitCollected) {
+				await this.onCommitCollected(facts)
+			}
 		} catch (error) {
-			console.error("[AiCodeCommitAttribution] Failed to load commit timestamp:", error)
+			console.error("[AiCodeCommitAttribution] Failed to persist commit attribution report:", error)
 			return {
 				processed: false,
 				remainingPendingLines: pendingLines.length,
 			}
+		}
+
+		const remainingPendingLines = await this.store.getPendingLineAttributions(repoRoot)
+		if (remainingPendingLines.length === 0) {
+			await this.cleanupRepo(repoRoot)
+			return {
+				processed: true,
+				remainingPendingLines: 0,
+				commitOccurredAt: facts.commitOccurredAt,
+			}
+		}
+
+		return {
+			processed: true,
+			remainingPendingLines: remainingPendingLines.length,
+			commitOccurredAt: facts.commitOccurredAt,
+		}
+	}
+
+	private async loadCommitFacts(
+		repoRoot: string,
+		branch: string,
+		commitHash: string,
+		previousCommit: string,
+	): Promise<AiCodeCommitFactsPayload> {
+		let patchContent = ""
+		try {
+			patchContent = await this.loadCommitPatch(repoRoot, previousCommit, commitHash)
+		} catch (error) {
+			throw new Error(`Failed to load commit patch: ${error instanceof Error ? error.message : String(error)}`)
+		}
+
+		let commitOccurredAt: number
+		try {
+			commitOccurredAt = await this.getCommitOccurredAt(repoRoot, commitHash)
+		} catch (error) {
+			throw new Error(
+				`Failed to load commit timestamp: ${error instanceof Error ? error.message : String(error)}`,
+			)
 		}
 
 		const changedFiles: AiCodeCommitChangedFile[] = []
@@ -536,39 +648,13 @@ export class AiCodeCommitAttributionService {
 			}
 		}
 
-		try {
-			if (this.onCommitCollected) {
-				await this.onCommitCollected({
-					repoRoot,
-					branch,
-					commitHash,
-					previousCommit,
-					commitOccurredAt,
-					changedFiles,
-				})
-			}
-		} catch (error) {
-			console.error("[AiCodeCommitAttribution] Failed to persist commit attribution report:", error)
-			return {
-				processed: false,
-				remainingPendingLines: pendingLines.length,
-			}
-		}
-
-		const remainingPendingLines = await this.store.getPendingLineAttributions(repoRoot)
-		if (remainingPendingLines.length === 0) {
-			await this.cleanupRepo(repoRoot)
-			return {
-				processed: true,
-				remainingPendingLines: 0,
-				commitOccurredAt,
-			}
-		}
-
 		return {
-			processed: true,
-			remainingPendingLines: remainingPendingLines.length,
+			repoRoot,
+			branch,
+			commitHash,
+			previousCommit,
 			commitOccurredAt,
+			changedFiles,
 		}
 	}
 

@@ -6,11 +6,13 @@ import { promisify } from "util"
 import { fetchWithRetries } from "../../shared/http"
 import { buildCompactCommitReportPayload } from "./AiCodeCompactCommitReport"
 import { AiCodeStatsStore } from "./AiCodeStatsStore"
-import { resolveAiCodeStatsWebhookUrl } from "./AiCodeStatsWebhookUrl"
+import { buildUploadFailureDiagnostics, summarizeUploadTarget } from "./AiCodeStatsUploadDiagnostics"
+import { resolveAiCodeStatsCommitStatusUrl, resolveAiCodeStatsWebhookUrl } from "./AiCodeStatsWebhookUrl"
 import {
 	CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
 	normalizePath,
 	normalizeUserEmail,
+	type AiCodeCommitServerStatus,
 	type AiCodeStatsFailedReportUpload,
 	type AiCodeStatsUploadClient,
 	type AiCodeStatsUploadEnvelope,
@@ -35,6 +37,17 @@ export interface AiCodeCommitReportUploadResult {
 	rawPayloadBytes: number
 	compressedPayloadBytes: number
 	timeoutMs: number
+}
+
+export interface AiCodeCommitServerStatusQuery {
+	userEmail?: string
+	client: AiCodeStatsUploadClient
+	commits: Array<{
+		commitHash: string
+		reportId?: string
+		gitRemoteUrl?: string
+		gitBranch?: string
+	}>
 }
 
 export class AiCodeStatsUploader {
@@ -93,7 +106,10 @@ export class AiCodeStatsUploader {
 		return { uploaded: uploadableEvents.length }
 	}
 
-	async uploadQueuedReports(settings: AiCodeStatsUploadSettings): Promise<AiCodeCommitReportUploadResult> {
+	async uploadQueuedReports(
+		settings: AiCodeStatsUploadSettings,
+		options: { reportId?: string } = {},
+	): Promise<AiCodeCommitReportUploadResult> {
 		if (!settings.webhookUrl?.trim()) {
 			return this.emptyCommitReportUploadResult()
 		}
@@ -103,7 +119,9 @@ export class AiCodeStatsUploader {
 		}
 
 		const webhookUrl = resolveAiCodeStatsWebhookUrl(settings.webhookUrl)
-		const reports = await this.store.getQueuedCommitReports()
+		const reports = (await this.store.getQueuedCommitReports()).filter(
+			(queued) => !options.reportId || queued.report.reportId === options.reportId,
+		)
 		let uploadedReports = 0
 		let uploadedBlocks = 0
 		let rawPayloadBytes = 0
@@ -129,6 +147,7 @@ export class AiCodeStatsUploader {
 				)
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error)
+				const diagnostics = buildUploadFailureDiagnostics(message, webhookUrl)
 				failedReportErrors.push({
 					reportId: queued.report.reportId,
 					commitHash: queued.report.commitHash,
@@ -137,10 +156,25 @@ export class AiCodeStatsUploader {
 					encoding: prepared.contentEncoding,
 					timeoutMs: prepared.timeoutMs,
 					message,
+					...diagnostics,
 				})
 				continue
 			}
 			await this.store.acknowledgeQueuedCommitReport(queued.report.reportId)
+			await this.store.appendDiagnosticEvent({
+				type: "upload_succeeded",
+				commitHash: queued.report.commitHash,
+				reportId: queued.report.reportId,
+				repoRoot: queued.report.repoRoot,
+				status: "uploaded",
+				details: {
+					rawPayloadBytes: prepared.rawPayloadBytes,
+					compressedPayloadBytes: prepared.compressedPayloadBytes,
+					timeoutMs: prepared.timeoutMs,
+					encoding: prepared.contentEncoding,
+					...summarizeUploadTarget(webhookUrl),
+				},
+			})
 			uploadedReports += 1
 			const baselineBlockCount =
 				queued.report.acceptedBlocks && queued.report.acceptedBlocks.length > 0
@@ -158,6 +192,42 @@ export class AiCodeStatsUploader {
 			compressedPayloadBytes,
 			timeoutMs,
 		}
+	}
+
+	async queryCommitStatuses(
+		settings: AiCodeStatsUploadSettings,
+		query: AiCodeCommitServerStatusQuery,
+	): Promise<AiCodeCommitServerStatus[]> {
+		if (!settings.webhookUrl?.trim() || query.commits.length === 0) {
+			return []
+		}
+		const fallbackUserEmail = normalizeUserEmail(settings.userEmail)
+		if (!fallbackUserEmail) {
+			return []
+		}
+		const response = await fetchWithRetries({
+			url: resolveAiCodeStatsCommitStatusUrl(settings.webhookUrl),
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({
+				client: query.client,
+				userEmail: normalizeUserEmail(query.userEmail) ?? fallbackUserEmail,
+				commits: query.commits,
+			}),
+			shouldRetry: (res) => res.status >= 500 || res.status === 429,
+		})
+		if (!response.ok) {
+			const errorBody = await response.text().catch(() => "")
+			throw new Error(
+				`AI code commit status query failed (${response.status} ${response.statusText})${
+					errorBody ? `: ${errorBody.slice(0, 200)}` : ""
+				}`,
+			)
+		}
+		const payload = (await response.json().catch(() => ({}))) as { statuses?: AiCodeCommitServerStatus[] }
+		return Array.isArray(payload.statuses) ? payload.statuses : []
 	}
 
 	private emptyCommitReportUploadResult(): AiCodeCommitReportUploadResult {
