@@ -90,7 +90,15 @@ export async function getBinPath(vscodeAppRoot: string): Promise<string | undefi
 		return (await fileExistsAtPath(fullPath)) ? fullPath : undefined
 	}
 
+	// kilocode_change start
+	const universalBinFolder = `bin/${process.platform}-${process.arch}`
+	// kilocode_change end
+
 	return (
+		// kilocode_change start
+		(await checkPath(`node_modules/@vscode/ripgrep-universal/${universalBinFolder}`)) ||
+		(await checkPath(`node_modules.asar.unpacked/@vscode/ripgrep-universal/${universalBinFolder}`)) ||
+		// kilocode_change end
 		(await checkPath("node_modules/@vscode/ripgrep/bin/")) ||
 		(await checkPath("node_modules/vscode-ripgrep/bin")) ||
 		(await checkPath("node_modules.asar.unpacked/vscode-ripgrep/bin/")) ||

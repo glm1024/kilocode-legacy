@@ -3,7 +3,7 @@
 	"displayName": "%extension.displayName%",
 	"description": "%extension.description%",
 	"publisher": "kilocode",
-	"version": "5.16.1",
+	"version": "5.16.2",
 	"icon": "assets/icons/logo-outline-black.png",
 	"galleryBanner": {
 		"color": "#FFFFFF",
@@ -40,11 +40,11 @@
 		"agent",
 		"agentic",
 		"coding",
-		"coding-agent",
-		"coding-assistant",
+		"coding agent",
+		"coding assistant",
 		"autocomplete",
-		"code-completion",
-		"pair-programming",
+		"code completion",
+		"pair programming",
 		"chat",
 		"terminal",
 		"chatgpt",
@@ -52,7 +52,9 @@
 		"sonnet",
 		"anthropic",
 		"openai",
-		"zoo-code"
+		"zoo code",
+		"opencode",
+		"open code"
 	],
 	"activationEvents": [
 		"onLanguage",

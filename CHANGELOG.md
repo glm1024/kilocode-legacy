@@ -1,5 +1,11 @@
 # kilo-code
 
+## 5.16.2
+
+### Patch Changes
+
+- [#163](https://github.com/Kilo-Org/kilocode-legacy/pull/163) [`ad520ce`](https://github.com/Kilo-Org/kilocode-legacy/commit/ad520cee99fe4b82ae4e3fb3c8227589aca02447) Thanks [@lambertjosh](https://github.com/lambertjosh)! - Fix file search and indexing on newer VS Code versions.
+
 ## 5.16.1
 
 ### Patch Changes
