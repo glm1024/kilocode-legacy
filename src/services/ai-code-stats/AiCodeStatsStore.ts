@@ -171,13 +171,7 @@ export class AiCodeStatsStore {
 	}
 
 	async getVisibleCommitUploadRecords(): Promise<AiCodeCommitUploadRecord[]> {
-		const visibleStatuses = new Set([
-			"upload_failed",
-			"needs_reanalysis",
-			"reanalysis_failed",
-			"processing",
-			"server_failed",
-		])
+		const visibleStatuses = new Set(["upload_failed", "reanalysis_failed", "server_failed"])
 		return (await this.getCommitUploadRecords()).filter((record) => visibleStatuses.has(record.status))
 	}
 
@@ -227,6 +221,10 @@ export class AiCodeStatsStore {
 		lastError?: string
 		lastErrorCategory?: string
 		lastUserMessage?: string
+		autoRetryCount?: number
+		nextAutoRetryAt?: number
+		autoRetryStartedAt?: number
+		autoRetryExhaustedAt?: number
 		rawPayloadBytes?: number
 		compressedPayloadBytes?: number
 	}): Promise<void> {
@@ -248,6 +246,10 @@ export class AiCodeStatsStore {
 						lastError: params.lastError,
 						lastErrorCategory: params.lastErrorCategory,
 						lastUserMessage: params.lastUserMessage,
+						autoRetryCount: params.autoRetryCount,
+						nextAutoRetryAt: params.nextAutoRetryAt,
+						autoRetryStartedAt: params.autoRetryStartedAt,
+						autoRetryExhaustedAt: params.autoRetryExhaustedAt,
 						rawPayloadBytes: params.rawPayloadBytes,
 						compressedPayloadBytes: params.compressedPayloadBytes,
 						lastAttemptAt: now,
@@ -260,6 +262,10 @@ export class AiCodeStatsStore {
 				target.lastError = params.lastError
 				target.lastErrorCategory = params.lastErrorCategory
 				target.lastUserMessage = params.lastUserMessage
+				target.autoRetryCount = params.autoRetryCount ?? target.autoRetryCount
+				target.nextAutoRetryAt = params.nextAutoRetryAt
+				target.autoRetryStartedAt = params.autoRetryStartedAt ?? target.autoRetryStartedAt
+				target.autoRetryExhaustedAt = params.autoRetryExhaustedAt
 				target.rawPayloadBytes = params.rawPayloadBytes ?? target.rawPayloadBytes
 				target.compressedPayloadBytes = params.compressedPayloadBytes ?? target.compressedPayloadBytes
 				target.lastAttemptAt = now
@@ -288,9 +294,7 @@ export class AiCodeStatsStore {
 		const records = targetRecord
 			? [targetRecord]
 			: this.commitUploadRecords.filter((record) =>
-					["upload_failed", "needs_reanalysis", "reanalysis_failed", "processing", "server_failed"].includes(
-						record.status,
-					),
+					["upload_failed", "reanalysis_failed", "server_failed"].includes(record.status),
 				)
 		let events: AiCodeCommitUploadDiagnosticEvent[] = []
 		try {
@@ -1037,6 +1041,11 @@ export class AiCodeStatsStore {
 			lastError: record.lastError,
 			lastErrorCategory: record.lastErrorCategory,
 			lastUserMessage: record.lastUserMessage,
+			autoRetryCount: typeof record.autoRetryCount === "number" ? record.autoRetryCount : undefined,
+			nextAutoRetryAt: typeof record.nextAutoRetryAt === "number" ? record.nextAutoRetryAt : undefined,
+			autoRetryStartedAt: typeof record.autoRetryStartedAt === "number" ? record.autoRetryStartedAt : undefined,
+			autoRetryExhaustedAt:
+				typeof record.autoRetryExhaustedAt === "number" ? record.autoRetryExhaustedAt : undefined,
 			rawPayloadBytes: typeof record.rawPayloadBytes === "number" ? record.rawPayloadBytes : undefined,
 			compressedPayloadBytes:
 				typeof record.compressedPayloadBytes === "number" ? record.compressedPayloadBytes : undefined,

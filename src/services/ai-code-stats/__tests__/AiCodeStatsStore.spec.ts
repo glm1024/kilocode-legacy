@@ -125,6 +125,33 @@ describe("AiCodeStatsStore", () => {
 		expect(state.repoObservedCommits).toEqual({})
 	})
 
+	it("keeps automatic reanalysis records hidden from the visible failure list", async () => {
+		await store.upsertCommitUploadRecord({
+			commitHash: "commit-auto",
+			repoRoot: "/repo",
+			reportId: "replay-auto",
+			status: "auto_reanalysis_pending",
+			autoRetryCount: 1,
+			nextAutoRetryAt: Date.now() + 5 * 60 * 1000,
+		})
+		await store.upsertCommitUploadRecord({
+			commitHash: "commit-visible",
+			repoRoot: "/repo",
+			reportId: "replay-visible",
+			status: "reanalysis_failed",
+		})
+
+		const allRecords = await store.getCommitUploadRecords()
+		expect(allRecords.find((record) => record.commitHash === "commit-auto")).toMatchObject({
+			status: "auto_reanalysis_pending",
+			autoRetryCount: 1,
+			nextAutoRetryAt: expect.any(Number),
+		})
+
+		const visibleRecords = await store.getVisibleCommitUploadRecords()
+		expect(visibleRecords.map((record) => record.commitHash)).toEqual(["commit-visible"])
+	})
+
 	it("discards incompatible persisted state versions and cold starts", async () => {
 		const baseDir = path.join(tmpDir, "ai-code-stats", "v1")
 		await fs.mkdir(baseDir, { recursive: true })

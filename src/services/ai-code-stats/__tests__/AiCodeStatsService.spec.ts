@@ -1057,6 +1057,185 @@ describe("AiCodeStatsService", () => {
 		])
 	})
 
+	it("includes retained uploaded AI blocks in normal commit reports only when added lines match", async () => {
+		mockIsGitRepository.mockResolvedValue(true)
+		mockGetRemoteUrl.mockResolvedValue("https://github.com/example/uploaded-match.git")
+		mockGetCurrentBranch.mockResolvedValue("main")
+
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const repoDir = await createGitRepo()
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({
+			webhookUrl: "https://example.com/prod-api",
+			userEmail: "tester@example.com",
+		}))
+		const uploadedReports: any[] = []
+		const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+			const payload = await parseJsonBody(
+				init?.body as BodyInit,
+				init?.headers as Record<string, string> | undefined,
+			)
+			if (payload.mode === "commit_report") {
+				uploadedReports.push(payload)
+			}
+			return acceptedIngestResponse()
+		})
+		vi.stubGlobal("fetch", fetchMock)
+
+		const relativePath = "src/uploaded-match.ts"
+		const filePath = path.join(repoDir, relativePath)
+		const aiLine = "const uploadedMatch = true"
+		await service.recordAgentFileWrite({
+			cwd: repoDir,
+			filePath,
+			relativePath,
+			originalContent: "const base = 1\n",
+			newContent: `const base = 1\n${aiLine}\n`,
+			taskId: "task-uploaded-match",
+		})
+
+		await (service as any).handleCommitCollected({
+			repoRoot: repoDir,
+			branch: "main",
+			commitHash: "commit-first",
+			previousCommit: "commit-base",
+			commitOccurredAt: Date.now(),
+			changedFiles: [
+				{
+					relativePath,
+					filePath,
+					language: "typescript",
+					addedLines: [
+						{
+							addedIndex: 0,
+							lineNumber: 2,
+							content: aiLine,
+							lineHash: hashLineFingerprint(aiLine),
+						},
+					],
+				},
+			],
+		})
+		expect(uploadedReports).toHaveLength(1)
+		expect((await (service as any).store.getGeneratedBlocksForTests())[0].uploadStatus).toBe("uploaded")
+
+		await (service as any).handleCommitCollected({
+			repoRoot: repoDir,
+			branch: "main",
+			commitHash: "commit-second",
+			previousCommit: "commit-first",
+			commitOccurredAt: Date.now(),
+			changedFiles: [
+				{
+					relativePath,
+					filePath,
+					language: "typescript",
+					addedLines: [
+						{
+							addedIndex: 0,
+							lineNumber: 2,
+							content: aiLine,
+							lineHash: hashLineFingerprint(aiLine),
+						},
+					],
+				},
+			],
+		})
+
+		expect(uploadedReports).toHaveLength(2)
+		const secondReport = uploadedReports[1]
+		expect(secondReport.commitHash).toBe("commit-second")
+		expect(secondReport.generatedBlocks).toHaveLength(1)
+		expect(secondReport.candidateLines).toHaveLength(1)
+		expect(secondReport.candidateLines[0].clientLineId).toContain("commit-second:")
+	})
+
+	it("does not create commit reports for retained uploaded AI blocks when added lines do not match", async () => {
+		mockIsGitRepository.mockResolvedValue(true)
+		mockGetRemoteUrl.mockResolvedValue("https://github.com/example/uploaded-miss.git")
+		mockGetCurrentBranch.mockResolvedValue("main")
+
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const repoDir = await createGitRepo()
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({
+			webhookUrl: "https://example.com/prod-api",
+			userEmail: "tester@example.com",
+		}))
+		const uploadedReports: any[] = []
+		const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+			const payload = await parseJsonBody(
+				init?.body as BodyInit,
+				init?.headers as Record<string, string> | undefined,
+			)
+			if (payload.mode === "commit_report") {
+				uploadedReports.push(payload)
+			}
+			return acceptedIngestResponse()
+		})
+		vi.stubGlobal("fetch", fetchMock)
+
+		const relativePath = "src/uploaded-miss.ts"
+		const filePath = path.join(repoDir, relativePath)
+		const aiLine = "const uploadedMiss = true"
+		await service.recordAgentFileWrite({
+			cwd: repoDir,
+			filePath,
+			relativePath,
+			originalContent: "const base = 1\n",
+			newContent: `const base = 1\n${aiLine}\n`,
+			taskId: "task-uploaded-miss",
+		})
+
+		await (service as any).handleCommitCollected({
+			repoRoot: repoDir,
+			branch: "main",
+			commitHash: "commit-first-miss",
+			previousCommit: "commit-base",
+			commitOccurredAt: Date.now(),
+			changedFiles: [
+				{
+					relativePath,
+					filePath,
+					language: "typescript",
+					addedLines: [
+						{
+							addedIndex: 0,
+							lineNumber: 2,
+							content: aiLine,
+							lineHash: hashLineFingerprint(aiLine),
+						},
+					],
+				},
+			],
+		})
+		expect(uploadedReports).toHaveLength(1)
+
+		await (service as any).handleCommitCollected({
+			repoRoot: repoDir,
+			branch: "main",
+			commitHash: "commit-manual-only",
+			previousCommit: "commit-first-miss",
+			commitOccurredAt: Date.now(),
+			changedFiles: [
+				{
+					relativePath,
+					filePath,
+					language: "typescript",
+					addedLines: [
+						{
+							addedIndex: 0,
+							lineNumber: 3,
+							content: "const manualOnly = true",
+							lineHash: hashLineFingerprint("const manualOnly = true"),
+						},
+					],
+				},
+			],
+		})
+
+		expect(uploadedReports).toHaveLength(1)
+		expect(await service.getVisibleCommitUploadRecords()).toHaveLength(0)
+	})
+
 	it("keeps old-path candidates when commit facts report a rename", async () => {
 		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
 		const repoDir = await createGitRepo()
@@ -1476,7 +1655,7 @@ describe("AiCodeStatsService", () => {
 		})
 	})
 
-	it("detects an observed uploaded commit missing on the server and replays retained candidates", async () => {
+	it("automatically replays retained candidates when an observed uploaded commit is missing on the server", async () => {
 		mockIsGitRepository.mockResolvedValue(true)
 		mockGetRemoteUrl.mockResolvedValue("https://github.com/example/replay.git")
 		mockGetCurrentBranch.mockResolvedValue("main")
@@ -1551,32 +1730,25 @@ describe("AiCodeStatsService", () => {
 		expect(await store.getQueuedReportsForTests()).toHaveLength(0)
 		expect(uploadedReports).toHaveLength(1)
 
-		const missingRecords = await service.refreshCommitUploadStatus()
-		expect(missingRecords).toHaveLength(1)
-		expect(missingRecords[0]).toMatchObject({
-			commitHash,
-			status: "needs_reanalysis",
-			addedLineCount: 1,
-			changedFileCount: 1,
-		})
-
-		serverStatus = "RECEIVED"
-		const afterReplay = await service.reanalyzeCommitUpload(missingRecords[0].id)
-		expect(afterReplay).toHaveLength(0)
+		const visibleRecords = await service.refreshCommitUploadStatus()
+		expect(visibleRecords).toHaveLength(0)
 		const replayReport = uploadedReports.find((report) => String(report.reportId).startsWith("replay-"))
 		expect(replayReport).toBeTruthy()
 		expect(replayReport.commitHash).toBe(commitHash)
 		expect(replayReport.candidateLines?.length).toBeGreaterThan(0)
 		expect(replayReport.generatedBlocks?.length).toBeGreaterThan(0)
 
+		serverStatus = "RECEIVED"
+		expect(await service.refreshCommitUploadStatus()).toHaveLength(0)
+
 		const diagnosticsPath = await service.exportCommitUploadDiagnostics()
 		const diagnostics = await fs.readFile(diagnosticsPath, "utf8")
-		expect(diagnostics).toContain("reanalysis_uploaded")
+		expect(diagnostics).toContain("auto_reanalysis_uploaded")
 		expect(diagnostics).not.toContain("const aiReplay = 2")
 		expect(diagnostics).not.toContain("fileSnapshotContent")
 	})
 
-	it("keeps a replayed commit report retryable when reanalysis upload fails", async () => {
+	it("keeps automatic reanalysis hidden until retry attempts are exhausted", async () => {
 		mockIsGitRepository.mockResolvedValue(true)
 		mockGetRemoteUrl.mockResolvedValue("https://github.com/example/replay-fail.git")
 		mockGetCurrentBranch.mockResolvedValue("main")
@@ -1603,7 +1775,10 @@ describe("AiCodeStatsService", () => {
 		})
 		const commitHash = await commitFile(repoDir, relativePath, aiContent, "ai replay fail")
 
+		let now = new Date("2026-06-05T10:00:00.000Z").getTime()
+		const dateNowSpy = vi.spyOn(Date, "now").mockImplementation(() => now)
 		const uploadedReports: any[] = []
+		let replayUploadAttempts = 0
 		let failReplayReports = false
 		const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
 			const pathname = new URL(url).pathname
@@ -1629,6 +1804,7 @@ describe("AiCodeStatsService", () => {
 			)
 			if (payload.mode === "commit_report") {
 				if (failReplayReports && String(payload.reportId).startsWith("replay-")) {
+					replayUploadAttempts += 1
 					return new Response("temporary upload failure", { status: 503, statusText: "Service Unavailable" })
 				}
 				uploadedReports.push(payload)
@@ -1643,26 +1819,110 @@ describe("AiCodeStatsService", () => {
 			"main",
 		)
 		await (service as any).handleCommitCollected(facts)
-		const missingRecords = await service.refreshCommitUploadStatus()
-		expect(missingRecords).toHaveLength(1)
-		expect(missingRecords[0].status).toBe("needs_reanalysis")
-
 		failReplayReports = true
-		const afterReplayFailure = await service.reanalyzeCommitUpload(missingRecords[0].id)
-		expect(afterReplayFailure).toHaveLength(1)
-		expect(afterReplayFailure[0]).toMatchObject({
-			commitHash,
-			status: "upload_failed",
+
+		let visibleRecords = await service.refreshCommitUploadStatus()
+		expect(visibleRecords).toHaveLength(0)
+		expect(replayUploadAttempts).toBe(3)
+		let autoRecord = (await (service as any).store.getCommitUploadRecords()).find(
+			(record: any) => record.commitHash === commitHash && String(record.reportId).startsWith("replay-"),
+		)
+		expect(autoRecord).toMatchObject({
+			status: "auto_reanalysis_pending",
+			autoRetryCount: 1,
+			nextAutoRetryAt: now + 5 * 60 * 1000,
 		})
-		expect(afterReplayFailure[0].reportId).toMatch(/^replay-/)
-		expect(afterReplayFailure[0].lastError).toContain("503")
+
+		visibleRecords = await service.refreshCommitUploadStatus()
+		expect(visibleRecords).toHaveLength(0)
+		expect(replayUploadAttempts).toBe(3)
+
+		now += 5 * 60 * 1000
+		visibleRecords = await service.refreshCommitUploadStatus()
+		expect(visibleRecords).toHaveLength(0)
+		expect(replayUploadAttempts).toBe(6)
+		autoRecord = (await (service as any).store.getCommitUploadRecords()).find(
+			(record: any) => record.commitHash === commitHash && String(record.reportId).startsWith("replay-"),
+		)
+		expect(autoRecord).toMatchObject({
+			status: "auto_reanalysis_pending",
+			autoRetryCount: 2,
+			nextAutoRetryAt: now + 30 * 60 * 1000,
+		})
+
+		now += 30 * 60 * 1000
+		visibleRecords = await service.refreshCommitUploadStatus()
+		expect(replayUploadAttempts).toBe(9)
+		expect(visibleRecords).toHaveLength(1)
+		expect(visibleRecords[0]).toMatchObject({
+			commitHash,
+			status: "reanalysis_failed",
+			autoRetryCount: 3,
+		})
+		expect(visibleRecords[0].reportId).toMatch(/^replay-/)
+		expect(visibleRecords[0].lastError).toContain("503")
 		expect(await (service as any).store.getQueuedReportsForTests()).toHaveLength(1)
 
-		const diagnosticsPath = await service.exportCommitUploadDiagnostics(afterReplayFailure[0].id)
+		const diagnosticsPath = await service.exportCommitUploadDiagnostics(visibleRecords[0].id)
 		const diagnostics = await fs.readFile(diagnosticsPath, "utf8")
 		expect(diagnostics).toContain("upload_failed")
 		expect(diagnostics).not.toContain("reanalysis_uploaded")
+		dateNowSpy.mockRestore()
 	})
+
+	it.each(["PROCESSING", "RECEIVED", "ATTRIBUTED"])(
+		"hides local commit upload failures when the server reports %s",
+		async (serverStatus) => {
+			mockIsGitRepository.mockResolvedValue(true)
+			mockGetRemoteUrl.mockResolvedValue("https://github.com/example/server-status.git")
+			mockGetCurrentBranch.mockResolvedValue("main")
+
+			const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+			const repoDir = await createGitRepo()
+			const service = AiCodeStatsService.initialize(tmpDir, async () => ({
+				webhookUrl: "https://example.com/prod-api",
+				userEmail: "tester@example.com",
+			}))
+			const relativePath = "src/server-status.ts"
+			const commitHash = await commitFile(repoDir, relativePath, "const serverStatus = true\n", "server status")
+			await (service as any).store.upsertCommitUploadRecord({
+				commitHash,
+				repoRoot: repoDir,
+				reportId: "replay-server-status",
+				status: "reanalysis_failed",
+			})
+
+			const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+				const pathname = new URL(url).pathname
+				if (pathname.endsWith("/commit-status")) {
+					const query = JSON.parse(String(init?.body ?? "{}"))
+					return new Response(
+						JSON.stringify({
+							statuses: query.commits.map((commit: any) => ({
+								commitHash: commit.commitHash,
+								status: serverStatus,
+								receivedAt: new Date().toISOString(),
+								reportId: commit.reportId,
+								message: null,
+							})),
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					)
+				}
+				return acceptedIngestResponse()
+			})
+			vi.stubGlobal("fetch", fetchMock)
+
+			expect(await service.refreshCommitUploadStatus()).toHaveLength(0)
+			const record = (await (service as any).store.getCommitUploadRecords()).find(
+				(item: any) => item.commitHash === commitHash,
+			)
+			expect(record).toMatchObject({
+				status: "uploaded",
+				lastError: undefined,
+			})
+		},
+	)
 
 	it("keeps failed commit reports retryable and hides them after retry succeeds", async () => {
 		mockIsGitRepository.mockResolvedValue(true)

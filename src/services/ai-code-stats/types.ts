@@ -193,6 +193,7 @@ export type AiCodeCommitUploadStatus =
 	| "needs_reanalysis"
 	| "reanalysis_failed"
 	| "processing"
+	| "auto_reanalysis_pending"
 	| "server_processing"
 	| "server_failed"
 
@@ -209,6 +210,10 @@ export interface AiCodeCommitUploadRecord {
 	lastError?: string
 	lastErrorCategory?: string
 	lastUserMessage?: string
+	autoRetryCount?: number
+	nextAutoRetryAt?: number
+	autoRetryStartedAt?: number
+	autoRetryExhaustedAt?: number
 	rawPayloadBytes?: number
 	compressedPayloadBytes?: number
 	candidateBlockCount?: number

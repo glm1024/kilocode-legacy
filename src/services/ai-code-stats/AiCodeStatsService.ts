@@ -54,6 +54,9 @@ const COMMIT_UPLOAD_SCAN_INTERVAL_MS = 5 * 60 * 1000
 const COMMIT_UPLOAD_SCAN_MAX_COMMITS = 50
 const COMMIT_UPLOAD_SCAN_RETENTION_DAYS = 30
 const COMMIT_UPLOAD_SCAN_VISIBLE_LIMIT = 10
+const AUTO_REANALYSIS_MAX_ATTEMPTS = 3
+const AUTO_REANALYSIS_BACKOFF_MS = [0, 5 * 60 * 1000, 30 * 60 * 1000] as const
+const COMMIT_TIMESTAMP_MATCH_SKEW_MS = 2000
 
 const normalizeContentLines = (content: string): string[] => {
 	const normalized = content.replace(/\r\n/g, "\n")
@@ -107,6 +110,12 @@ interface LocalCommitSummary {
 	changedPaths: Set<string>
 	addedLineCount?: number
 	changedFileCount?: number
+}
+
+interface CommitCandidateSelection {
+	changedPathSet: Set<string>
+	addedLineHashesByPath: Map<string, Set<string>>
+	candidateBlocks: AiCodeGeneratedBlockState[]
 }
 
 const JETBRAINS_IDE_BY_WRAPPER_CODE: Record<string, AiCodeIde> = {
@@ -566,9 +575,13 @@ export class AiCodeStatsService {
 		}
 		for (const record of existingRecords) {
 			if (
-				["upload_failed", "needs_reanalysis", "reanalysis_failed", "processing", "server_failed"].includes(
-					record.status,
-				)
+				[
+					"upload_failed",
+					"auto_reanalysis_pending",
+					"reanalysis_failed",
+					"processing",
+					"server_failed",
+				].includes(record.status)
 			) {
 				repoRoots.add(normalizePath(record.repoRoot))
 			}
@@ -678,6 +691,7 @@ export class AiCodeStatsService {
 					summary,
 					serverStatus,
 					hasQueuedReport: queuedCommitKeys.has(`${repoRoot}::${summary.commitHash}`),
+					existingRecord: existingForRepo.find((record) => record.commitHash === summary.commitHash),
 					referenceBlock: blocksForRepo.find((block) => {
 						const repoRelativePath = normalizePath(block.repoRelativePath || block.relativePath || "")
 						return (
@@ -695,37 +709,19 @@ export class AiCodeStatsService {
 		summary: LocalCommitSummary
 		serverStatus: AiCodeCommitServerStatus
 		hasQueuedReport: boolean
+		existingRecord?: AiCodeCommitUploadRecord
 		referenceBlock?: AiCodeGeneratedBlockState
 	}): Promise<void> {
-		const { repoRoot, summary, serverStatus, hasQueuedReport, referenceBlock } = params
+		const { repoRoot, summary, serverStatus, hasQueuedReport, existingRecord, referenceBlock } = params
 		if (serverStatus.status === "NOT_RECEIVED") {
-			if (hasQueuedReport) {
+			if (hasQueuedReport && existingRecord?.status !== "auto_reanalysis_pending") {
 				return
 			}
-			await this.store.upsertCommitUploadRecord({
-				id: this.buildCommitUploadRecordId(repoRoot, summary.commitHash),
-				commitHash: summary.commitHash,
+			await this.runAutomaticCommitReanalysis({
 				repoRoot,
-				gitRemoteUrl: referenceBlock?.gitRemoteUrl,
-				gitBranch: referenceBlock?.gitBranch,
-				commitOccurredAt: summary.commitOccurredAt,
-				status: "needs_reanalysis",
-				lastError: undefined,
-				candidateBlockCount: undefined,
-				changedFileCount: summary.changedFileCount,
-				addedLineCount: summary.addedLineCount,
-				repoName: path.basename(repoRoot),
-			})
-			await this.store.appendDiagnosticEvent({
-				type: "report_skipped",
-				commitHash: summary.commitHash,
-				repoRoot,
-				status: "needs_reanalysis",
-				details: {
-					reason: "server_not_received",
-					addedLineCount: summary.addedLineCount,
-					changedFileCount: summary.changedFileCount,
-				},
+				summary,
+				existingRecord,
+				referenceBlock,
 			})
 			return
 		}
@@ -754,6 +750,194 @@ export class AiCodeStatsService {
 			repoRoot,
 			status: "uploaded",
 			lastError: undefined,
+		})
+	}
+
+	private async runAutomaticCommitReanalysis(params: {
+		repoRoot: string
+		summary: LocalCommitSummary
+		existingRecord?: AiCodeCommitUploadRecord
+		referenceBlock?: AiCodeGeneratedBlockState
+	}): Promise<void> {
+		const { repoRoot, summary, existingRecord, referenceBlock } = params
+		const now = Date.now()
+		const reportId = existingRecord?.reportId?.startsWith("replay-")
+			? existingRecord.reportId
+			: this.buildReplayReportId(repoRoot, summary.commitHash)
+		const currentRetryCount = existingRecord?.autoRetryCount ?? 0
+		if (existingRecord?.status === "reanalysis_failed" && currentRetryCount >= AUTO_REANALYSIS_MAX_ATTEMPTS) {
+			return
+		}
+		if (existingRecord?.nextAutoRetryAt && existingRecord.nextAutoRetryAt > now) {
+			await this.store.appendDiagnosticEvent({
+				type: "auto_reanalysis_deferred",
+				commitHash: summary.commitHash,
+				reportId,
+				repoRoot,
+				status: "auto_reanalysis_pending",
+				details: {
+					nextAutoRetryAt: existingRecord.nextAutoRetryAt,
+					autoRetryCount: currentRetryCount,
+				},
+			})
+			return
+		}
+
+		const attempt = Math.min(currentRetryCount + 1, AUTO_REANALYSIS_MAX_ATTEMPTS)
+		await this.store.upsertCommitUploadRecord({
+			id: this.buildCommitUploadRecordId(repoRoot, summary.commitHash, reportId),
+			commitHash: summary.commitHash,
+			repoRoot,
+			gitRemoteUrl: referenceBlock?.gitRemoteUrl ?? existingRecord?.gitRemoteUrl,
+			gitBranch: referenceBlock?.gitBranch ?? existingRecord?.gitBranch,
+			commitOccurredAt: summary.commitOccurredAt,
+			status: "auto_reanalysis_pending",
+			reportId,
+			lastError: undefined,
+			candidateBlockCount: existingRecord?.candidateBlockCount,
+			changedFileCount: summary.changedFileCount,
+			addedLineCount: summary.addedLineCount,
+			repoName: path.basename(repoRoot),
+			autoRetryCount: attempt,
+			autoRetryStartedAt: existingRecord?.autoRetryStartedAt ?? now,
+			nextAutoRetryAt: undefined,
+			autoRetryExhaustedAt: undefined,
+			lastAttemptAt: now,
+		})
+		await this.store.appendDiagnosticEvent({
+			type: "auto_reanalysis_started",
+			commitHash: summary.commitHash,
+			reportId,
+			repoRoot,
+			status: "auto_reanalysis_pending",
+			details: {
+				autoRetryCount: attempt,
+				addedLineCount: summary.addedLineCount,
+				changedFileCount: summary.changedFileCount,
+			},
+		})
+
+		try {
+			const facts = await this.commitAttributionService.collectCommitFactsForReplay(
+				repoRoot,
+				summary.commitHash,
+				referenceBlock?.gitBranch ?? existingRecord?.gitBranch,
+			)
+			await this.handleCommitCollected(facts, {
+				reportId,
+				includeUploadedBlocks: true,
+				skipImmediateUpload: true,
+			})
+			const queuedReports = await this.store.getQueuedCommitReports()
+			if (!queuedReports.some((queued) => queued.report.reportId === reportId)) {
+				await this.store.markCommitUploadRecordStatus({
+					reportId,
+					commitHash: summary.commitHash,
+					repoRoot,
+					status: "needs_reanalysis",
+					lastError: "本地候选数据不足或提交改动行未命中 AI 代码",
+					autoRetryCount: attempt,
+					autoRetryStartedAt: existingRecord?.autoRetryStartedAt ?? now,
+				})
+				await this.store.appendDiagnosticEvent({
+					type: "auto_reanalysis_skipped",
+					commitHash: summary.commitHash,
+					reportId,
+					repoRoot,
+					status: "needs_reanalysis",
+					details: {
+						reason: "local_candidates_insufficient",
+						addedLineCount: summary.addedLineCount,
+						changedFileCount: summary.changedFileCount,
+					},
+				})
+				return
+			}
+
+			await this.requestCommitTriggeredUpload(reportId, "reanalysis")
+			const stillQueued = (await this.store.getQueuedCommitReports()).some(
+				(queued) => queued.report.reportId === reportId,
+			)
+			if (stillQueued) {
+				const failedRecord = (await this.store.getCommitUploadRecords()).find(
+					(record) => record.reportId === reportId && record.commitHash === summary.commitHash,
+				)
+				await this.scheduleNextAutomaticReanalysisAttempt({
+					repoRoot,
+					commitHash: summary.commitHash,
+					reportId,
+					attempt,
+					lastError: failedRecord?.lastError,
+				})
+				return
+			}
+
+			await this.store.appendDiagnosticEvent({
+				type: "auto_reanalysis_uploaded",
+				commitHash: summary.commitHash,
+				reportId,
+				repoRoot,
+				status: "uploaded",
+				details: {
+					autoRetryCount: attempt,
+				},
+			})
+			await this.confirmSingleCommitStatus(repoRoot, summary.commitHash, reportId)
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error)
+			await this.scheduleNextAutomaticReanalysisAttempt({
+				repoRoot,
+				commitHash: summary.commitHash,
+				reportId,
+				attempt,
+				lastError: message,
+			})
+			await this.store.appendDiagnosticEvent({
+				type: "auto_reanalysis_failed",
+				commitHash: summary.commitHash,
+				reportId,
+				repoRoot,
+				status: "auto_reanalysis_pending",
+				message,
+				details: {
+					autoRetryCount: attempt,
+				},
+			})
+		}
+	}
+
+	private async scheduleNextAutomaticReanalysisAttempt(params: {
+		repoRoot: string
+		commitHash: string
+		reportId: string
+		attempt: number
+		lastError?: string
+	}): Promise<void> {
+		const now = Date.now()
+		if (params.attempt >= AUTO_REANALYSIS_MAX_ATTEMPTS) {
+			await this.store.markCommitUploadRecordStatus({
+				reportId: params.reportId,
+				commitHash: params.commitHash,
+				repoRoot: params.repoRoot,
+				status: "reanalysis_failed",
+				lastError: params.lastError,
+				autoRetryCount: params.attempt,
+				nextAutoRetryAt: undefined,
+				autoRetryExhaustedAt: now,
+			})
+			return
+		}
+		const nextDelayMs =
+			AUTO_REANALYSIS_BACKOFF_MS[params.attempt] ??
+			AUTO_REANALYSIS_BACKOFF_MS[AUTO_REANALYSIS_BACKOFF_MS.length - 1]
+		await this.store.markCommitUploadRecordStatus({
+			reportId: params.reportId,
+			commitHash: params.commitHash,
+			repoRoot: params.repoRoot,
+			status: "auto_reanalysis_pending",
+			lastError: params.lastError,
+			autoRetryCount: params.attempt,
+			nextAutoRetryAt: now + nextDelayMs,
 		})
 	}
 
@@ -892,7 +1076,7 @@ export class AiCodeStatsService {
 
 	private hasRetainedCandidateForCommit(blocks: AiCodeGeneratedBlockState[], summary: LocalCommitSummary): boolean {
 		return blocks.some((block) => {
-			if (summary.commitOccurredAt && block.timestamp > summary.commitOccurredAt) {
+			if (this.isAfterCommitTimestamp(block.timestamp, summary.commitOccurredAt)) {
 				return false
 			}
 			const repoRelativePath = normalizePath(block.repoRelativePath || block.relativePath || "")
@@ -901,6 +1085,14 @@ export class AiCodeStatsService {
 			}
 			return Boolean(repoRelativePath && summary.changedPaths.has(repoRelativePath))
 		})
+	}
+
+	private isAfterCommitTimestamp(timestamp: number | undefined, commitOccurredAt?: number): boolean {
+		return (
+			typeof timestamp === "number" &&
+			typeof commitOccurredAt === "number" &&
+			timestamp > commitOccurredAt + COMMIT_TIMESTAMP_MATCH_SKEW_MS
+		)
 	}
 
 	private async resolveFileContext(
@@ -999,30 +1191,9 @@ export class AiCodeStatsService {
 		payload: AiCodeCommitFactsPayload,
 		options: CommitReportBuildOptions = {},
 	): Promise<void> {
-		const normalizeCommitFilePath = (value: string): string =>
-			path.isAbsolute(value) ? normalizePath(path.relative(payload.repoRoot, value)) : normalizePath(value)
-		const changedPathSet = new Set(
-			(payload.changedFiles || []).flatMap((file) =>
-				[file.relativePath, file.previousFilePath]
-					.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
-					.map((value) => normalizeCommitFilePath(value).replace(/^(\.\.\/)+/, "")),
-			),
-		)
-		const candidateGeneratedBlocks = (
-			options.includeUploadedBlocks
-				? (await this.store.getGeneratedBlockStates()).filter(
-						(block) =>
-							block.repoRoot === payload.repoRoot &&
-							(block.uploadStatus === "pending" || block.uploadStatus === "uploaded"),
-					)
-				: await this.store.getPendingGeneratedBlockStates(payload.repoRoot)
-		).filter((block) => {
-			if (changedPathSet.size === 0) {
-				return true
-			}
-			const repoRelativePath = normalizePath(block.repoRelativePath || block.relativePath || "")
-			return repoRelativePath && changedPathSet.has(repoRelativePath)
-		})
+		const selection = await this.selectCommitCandidateBlocks(payload)
+		const changedPathSet = selection.changedPathSet
+		const candidateGeneratedBlocks = selection.candidateBlocks
 		if (candidateGeneratedBlocks.length === 0 && payload.changedFiles.length === 0) {
 			return
 		}
@@ -1046,6 +1217,8 @@ export class AiCodeStatsService {
 			acceptedBlocks: reportAcceptedBlocks,
 			generatedBlocks: reportBaselineBlocks.generatedBlocks,
 			gitBranch: reportBranch,
+			commitHash: payload.commitHash,
+			addedLineHashesByPath: selection.addedLineHashesByPath,
 		})
 
 		const reportGeneratedAt = Date.now()
@@ -1120,6 +1293,103 @@ export class AiCodeStatsService {
 		}
 	}
 
+	private async selectCommitCandidateBlocks(payload: AiCodeCommitFactsPayload): Promise<CommitCandidateSelection> {
+		const changedPathSet = this.buildCommitChangedPathSet(payload)
+		const addedLineHashesByPath = this.buildAddedLineHashesByPath(payload)
+		const normalizedRepoRoot = normalizePath(payload.repoRoot)
+		const allBlocks = (await this.store.getGeneratedBlockStates()).filter(
+			(block) => block.repoRoot === normalizedRepoRoot || block.repoRoot === payload.repoRoot,
+		)
+		const pendingLines = await this.store.getPendingLineAttributions(payload.repoRoot)
+		const uploadedBlockIdsWithAddedLineMatch = new Set<string>()
+		for (const pendingLine of pendingLines) {
+			if (this.isAfterCommitTimestamp(pendingLine.timestamp, payload.commitOccurredAt)) {
+				continue
+			}
+			const generatedBlockId = normalizeGeneratedBlockId(pendingLine.generatedEventId || pendingLine.blockId)
+			if (!generatedBlockId) {
+				continue
+			}
+			const repoRelativePath = normalizePath(pendingLine.repoRelativePath || pendingLine.relativePath || "")
+			if (!repoRelativePath || !changedPathSet.has(repoRelativePath)) {
+				continue
+			}
+			if (addedLineHashesByPath.get(repoRelativePath)?.has(pendingLine.lineHash)) {
+				uploadedBlockIdsWithAddedLineMatch.add(generatedBlockId)
+			}
+		}
+
+		const candidateBlocks = allBlocks.filter((block) => {
+			if (block.uploadStatus !== "pending" && block.uploadStatus !== "uploaded") {
+				return false
+			}
+			if (this.isAfterCommitTimestamp(block.timestamp, payload.commitOccurredAt)) {
+				return false
+			}
+			const repoRelativePath = normalizePath(block.repoRelativePath || block.relativePath || "")
+			const changedPathMatches =
+				changedPathSet.size === 0 || Boolean(repoRelativePath && changedPathSet.has(repoRelativePath))
+			if (block.uploadStatus === "pending") {
+				return changedPathMatches
+			}
+			if (!repoRelativePath || !changedPathSet.has(repoRelativePath)) {
+				return false
+			}
+			return uploadedBlockIdsWithAddedLineMatch.has(block.generatedBlockId)
+		})
+
+		return {
+			changedPathSet,
+			addedLineHashesByPath,
+			candidateBlocks,
+		}
+	}
+
+	private buildCommitChangedPathSet(payload: AiCodeCommitFactsPayload): Set<string> {
+		return new Set(
+			(payload.changedFiles || []).flatMap((file) => this.resolveChangedFileRepoPaths(payload.repoRoot, file)),
+		)
+	}
+
+	private buildAddedLineHashesByPath(payload: AiCodeCommitFactsPayload): Map<string, Set<string>> {
+		const hashesByPath = new Map<string, Set<string>>()
+		for (const file of payload.changedFiles || []) {
+			const paths = this.resolveChangedFileRepoPaths(payload.repoRoot, file)
+			if (paths.length === 0 || !file.addedLines || file.addedLines.length === 0) {
+				continue
+			}
+			for (const addedLine of file.addedLines) {
+				const lineHash = addedLine.lineHash || hashLineFingerprint(addedLine.content ?? "")
+				if (!lineHash) {
+					continue
+				}
+				for (const repoPath of paths) {
+					const bucket = hashesByPath.get(repoPath) ?? new Set<string>()
+					bucket.add(lineHash)
+					hashesByPath.set(repoPath, bucket)
+				}
+			}
+		}
+		return hashesByPath
+	}
+
+	private resolveChangedFileRepoPaths(
+		repoRoot: string,
+		file: NonNullable<AiCodeCommitFactsPayload["changedFiles"]>[number],
+	): string[] {
+		return [
+			file.relativePath,
+			file.previousFilePath,
+			file.filePath && path.isAbsolute(file.filePath) ? file.filePath : undefined,
+		]
+			.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+			.map((value) =>
+				path.isAbsolute(value) ? normalizePath(path.relative(repoRoot, value)) : normalizePath(value),
+			)
+			.map((value) => value.replace(/^(\.\.\/)+/, ""))
+			.filter(Boolean)
+	}
+
 	private async buildCommitReportCandidateLines(params: {
 		repoRoot: string
 		changedPathSet: Set<string>
@@ -1127,11 +1397,18 @@ export class AiCodeStatsService {
 		acceptedBlocks: AiCodeGeneratedBlock[]
 		generatedBlocks: AiCodeGeneratedBlock[]
 		gitBranch?: string
+		commitHash: string
+		addedLineHashesByPath: Map<string, Set<string>>
 	}): Promise<AiCodeCommitCandidateLine[]> {
 		const pendingBlockIds = new Set(params.pendingGeneratedBlocks.map((block) => block.generatedBlockId))
 		if (pendingBlockIds.size === 0) {
 			return []
 		}
+		const uploadedBlockIds = new Set(
+			params.pendingGeneratedBlocks
+				.filter((block) => block.uploadStatus === "uploaded")
+				.map((block) => block.generatedBlockId),
+		)
 
 		const baselineMetricType = params.acceptedBlocks.length > 0 ? "accepted" : "generated"
 		const baselineBlocks = baselineMetricType === "accepted" ? params.acceptedBlocks : params.generatedBlocks
@@ -1162,12 +1439,18 @@ export class AiCodeStatsService {
 			if (params.changedPathSet.size > 0 && (!repoRelativePath || !params.changedPathSet.has(repoRelativePath))) {
 				continue
 			}
+			if (uploadedBlockIds.has(generatedBlockId)) {
+				const addedHashes = params.addedLineHashesByPath.get(repoRelativePath)
+				if (!addedHashes?.has(pendingLine.lineHash)) {
+					continue
+				}
+			}
 
 			const lineStart = lineStartsByBlockId.get(generatedBlockId)
 			const lineNumber =
 				typeof lineStart === "number" ? lineStart + pendingLine.blockLineIndex - 1 : pendingLine.blockLineIndex
 			candidateLines.push({
-				clientLineId: `${pendingLine.id}:${pendingLine.lineHash}`,
+				clientLineId: `${params.commitHash}:${pendingLine.id}:${pendingLine.lineHash}`,
 				generatedBlockId,
 				baselineEventId:
 					baselineEventIdsByBlockId.get(generatedBlockId) ?? `${generatedBlockId}:${baselineMetricType}`,
@@ -1252,7 +1535,7 @@ export class AiCodeStatsService {
 			const generatedBlockId = normalizeGeneratedBlockId(block.generatedBlockId)
 			const baselineBlocks = generatedBlockId ? (pendingCommitMetricBlocksById.get(generatedBlockId) ?? []) : []
 			if (baselineBlocks.length === 0) {
-				if (!params.includeUploadedBlocks) {
+				if (!params.includeUploadedBlocks && block.uploadStatus !== "uploaded") {
 					throw new Error(
 						`Missing pending commit metric baseline for generated block ${generatedBlockId ?? block.eventId}`,
 					)
