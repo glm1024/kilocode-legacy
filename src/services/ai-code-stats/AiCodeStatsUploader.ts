@@ -253,14 +253,73 @@ export class AiCodeStatsUploader {
 			shouldRetry: (res) => res.status >= 500 || res.status === 429,
 		})
 
+		await this.assertIngestAccepted(response, errorPrefix)
+	}
+
+	private async assertIngestAccepted(response: Response, errorPrefix: string): Promise<void> {
+		const responseBody = await response.text().catch(() => "")
 		if (!response.ok) {
-			const errorBody = await response.text().catch(() => "")
 			throw new Error(
-				`${errorPrefix} (${response.status} ${response.statusText})${
-					errorBody ? `: ${errorBody.slice(0, 200)}` : ""
-				}`,
+				this.buildUploadErrorMessage(errorPrefix, response, this.describeUploadErrorBody(responseBody)),
 			)
 		}
+
+		const trimmedBody = responseBody.trim()
+		let payload: unknown
+		try {
+			payload = trimmedBody ? JSON.parse(trimmedBody) : undefined
+		} catch {
+			throw new Error(
+				this.buildUploadErrorMessage(
+					errorPrefix,
+					response,
+					`response is not valid JSON${trimmedBody ? `: ${trimmedBody.slice(0, 200)}` : ""}`,
+				),
+			)
+		}
+
+		if (!this.isAcceptedIngestResponse(payload)) {
+			throw new Error(
+				this.buildUploadErrorMessage(errorPrefix, response, this.describeRejectedIngestResponse(payload)),
+			)
+		}
+	}
+
+	private isAcceptedIngestResponse(payload: unknown): boolean {
+		return typeof payload === "object" && payload !== null && (payload as { accepted?: unknown }).accepted === true
+	}
+
+	private describeRejectedIngestResponse(payload: unknown): string {
+		if (typeof payload === "object" && payload !== null) {
+			const record = payload as Record<string, unknown>
+			const message = [record.msg, record.message, record.error].find(
+				(value) => typeof value === "string" && value,
+			)
+			if (typeof message === "string") {
+				return message
+			}
+			if ("accepted" in record) {
+				return `response accepted is ${String(record.accepted)}`
+			}
+		}
+		return "response accepted is not true"
+	}
+
+	private describeUploadErrorBody(responseBody: string): string | undefined {
+		const trimmedBody = responseBody.trim()
+		if (!trimmedBody) {
+			return undefined
+		}
+		try {
+			return this.describeRejectedIngestResponse(JSON.parse(trimmedBody))
+		} catch {
+			return trimmedBody
+		}
+	}
+
+	private buildUploadErrorMessage(errorPrefix: string, response: Response, detail?: string): string {
+		const statusText = response.statusText ? ` ${response.statusText}` : ""
+		return `${errorPrefix} (${response.status}${statusText})${detail ? `: ${detail.slice(0, 200)}` : ""}`
 	}
 
 	private async prepareJsonPayload(payload: unknown): Promise<{
@@ -329,14 +388,7 @@ export class AiCodeStatsUploader {
 			shouldRetry: (res) => res.status >= 500 || res.status === 429,
 		})
 
-		if (!response.ok) {
-			const errorBody = await response.text().catch(() => "")
-			throw new Error(
-				`${errorPrefix} (${response.status} ${response.statusText})${
-					errorBody ? `: ${errorBody.slice(0, 200)}` : ""
-				}`,
-			)
-		}
+		await this.assertIngestAccepted(response, errorPrefix)
 	}
 
 	private computeCommitReportUploadTimeout(compressedPayloadBytes: number): number {

@@ -89,4 +89,24 @@ describe("AiTokenUsageStore", () => {
 			totalTokens: 0,
 		})
 	})
+
+	it("keeps dirty rows when uploaded snapshot is older than current local totals", async () => {
+		await recordUsage("2026-03-19T09:00:00.000Z", { input: 40, output: 60 })
+		const [uploadedSnapshot] = await store.getPendingUploadRows()
+
+		await recordUsage("2026-03-19T09:00:05.000Z", { input: 10, output: 5 })
+		await store.markRowsUploaded([uploadedSnapshot], new Date("2026-03-19T09:00:10.000Z").getTime())
+
+		const [pendingAfterStaleAck] = await store.getPendingUploadRows()
+		expect(pendingAfterStaleAck).toMatchObject({
+			requestCount: 2,
+			inputTokens: 50,
+			outputTokens: 65,
+			totalTokens: 115,
+			dirty: true,
+		})
+
+		await store.markRowsUploaded([pendingAfterStaleAck], new Date("2026-03-19T09:00:15.000Z").getTime())
+		expect(await store.getPendingUploadRows()).toHaveLength(0)
+	})
 })

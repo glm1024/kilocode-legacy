@@ -106,16 +106,19 @@ export class AiTokenUsageStore {
 			.map((row) => ({ ...row }))
 	}
 
-	async markRowsUploaded(keys: string[], uploadedAt: number = Date.now()): Promise<void> {
-		if (keys.length === 0) {
+	async markRowsUploaded(uploadedRows: AiTokenUsageAggregateRow[], uploadedAt: number = Date.now()): Promise<void> {
+		if (uploadedRows.length === 0) {
 			return
 		}
 
 		await this.enqueue(async () => {
 			await this.ensureLoaded()
-			for (const key of keys) {
-				const row = this.state!.rows[key]
+			for (const uploadedRow of uploadedRows) {
+				const row = this.state!.rows[uploadedRow.key]
 				if (!row) {
+					continue
+				}
+				if (!this.isSameUploadedSnapshot(row, uploadedRow)) {
 					continue
 				}
 				row.dirty = false
@@ -261,5 +264,18 @@ export class AiTokenUsageStore {
 			return false
 		}
 		return true
+	}
+
+	private isSameUploadedSnapshot(current: AiTokenUsageAggregateRow, uploaded: AiTokenUsageAggregateRow): boolean {
+		return (
+			current.requestCount === uploaded.requestCount &&
+			current.inputTokens === uploaded.inputTokens &&
+			current.outputTokens === uploaded.outputTokens &&
+			current.cacheReadTokens === uploaded.cacheReadTokens &&
+			current.cacheWriteTokens === uploaded.cacheWriteTokens &&
+			current.totalTokens === uploaded.totalTokens &&
+			current.firstOccurredAt === uploaded.firstOccurredAt &&
+			current.lastOccurredAt === uploaded.lastOccurredAt
+		)
 	}
 }

@@ -58,10 +58,7 @@ export class AiTokenUsageUploader {
 		for (const batch of batches) {
 			await this.postEnvelope(webhookUrl, batch, context.client)
 			uploaded += batch.length
-			await this.store.markRowsUploaded(
-				batch.map((row) => row.key),
-				Date.now(),
-			)
+			await this.store.markRowsUploaded(batch, Date.now())
 		}
 
 		return { uploaded }

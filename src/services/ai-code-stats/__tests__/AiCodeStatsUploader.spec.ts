@@ -19,6 +19,18 @@ import {
 
 const gunzipAsync = promisify(gunzip)
 
+const acceptedIngestResponse = (body: Record<string, unknown> = {}): Response =>
+	new Response(JSON.stringify({ accepted: true, kind: "commit_report", ...body }), {
+		status: 200,
+		headers: { "Content-Type": "application/json" },
+	})
+
+const rejectedIngestResponse = (body: Record<string, unknown> = {}): Response =>
+	new Response(JSON.stringify({ accepted: false, code: 500, msg: "business failed", ...body }), {
+		status: 200,
+		headers: { "Content-Type": "application/json" },
+	})
+
 const parseJsonBody = async (body: BodyInit | null | undefined, headers?: Record<string, string>): Promise<any> => {
 	const buffer =
 		body instanceof Uint8Array
@@ -159,7 +171,7 @@ describe("AiCodeStatsUploader", () => {
 			}),
 		)
 
-		const fetchMock = vi.fn().mockResolvedValue(new Response("ok", { status: 200 }))
+		const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(acceptedIngestResponse()))
 		vi.stubGlobal("fetch", fetchMock)
 
 		const result = await uploader.uploadQueuedReports({
@@ -236,7 +248,9 @@ describe("AiCodeStatsUploader", () => {
 		}
 		await store.appendEvent(event)
 
-		const fetchMock = vi.fn().mockResolvedValue(new Response("ok", { status: 200 }))
+		const fetchMock = vi
+			.fn()
+			.mockImplementation(() => Promise.resolve(acceptedIngestResponse({ kind: "envelope" })))
 		vi.stubGlobal("fetch", fetchMock)
 
 		const result = await uploader.upload(
@@ -296,6 +310,74 @@ describe("AiCodeStatsUploader", () => {
 		expect(await store.getPendingEvents()).toHaveLength(0)
 	})
 
+	it("keeps standalone events pending when a 200 response rejects the ingest", async () => {
+		await store.appendEvent({
+			eventId: "event-business-failed",
+			timestamp: Date.now(),
+			semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
+			sourceType: "agent_insert",
+			ide: "vscode",
+			metricType: "generated",
+			projectKey: "project-key",
+			projectName: "repo",
+			repoRoot: "/workspace/project",
+			repoRelativePath: "src/rejected.ts",
+			filePath: "/workspace/project/src/rejected.ts",
+			relativePath: "src/rejected.ts",
+			lineStart: 2,
+			lineEnd: 2,
+			lineCount: 1,
+			codeSnippet: "const rejected = true",
+		})
+
+		const fetchMock = vi
+			.fn()
+			.mockImplementation(() => Promise.resolve(rejectedIngestResponse({ msg: "gzip payload解压失败" })))
+		vi.stubGlobal("fetch", fetchMock)
+
+		await expect(
+			uploader.upload(
+				{ enabled: true, webhookUrl: "https://example.com/webhook", userEmail: "current.user@example.com" },
+				{ client: { ide: "vscode", machineId: "machine-1" } },
+			),
+		).rejects.toThrow("gzip payload解压失败")
+		expect(await store.getPendingEvents()).toHaveLength(1)
+	})
+
+	it("keeps queued commit reports when a 200 response rejects the ingest", async () => {
+		await store.queueCommitReport(
+			buildQueuedReport({
+				report: buildCommitReport({
+					reportId: "report-business-failed",
+					commitHash: "commit-business-failed",
+				}),
+			}),
+		)
+
+		const fetchMock = vi
+			.fn()
+			.mockImplementation(() => Promise.resolve(rejectedIngestResponse({ msg: "gzip payload解压失败" })))
+		vi.stubGlobal("fetch", fetchMock)
+
+		const result = await uploader.uploadQueuedReports({
+			enabled: true,
+			webhookUrl: "https://example.com/webhook",
+			userEmail: "current.user@example.com",
+		})
+
+		expect(result).toMatchObject({
+			uploadedReports: 0,
+			uploadedBlocks: 0,
+			failedReports: 1,
+		})
+		expect(result.failedReportErrors[0]).toMatchObject({
+			reportId: "report-business-failed",
+			commitHash: "commit-business-failed",
+			message: expect.stringContaining("gzip payload解压失败"),
+		})
+		expect(await store.getQueuedReportsForTests()).toHaveLength(1)
+	})
+
 	it("keeps queued commit reports frozen when upload fails and retries them later", async () => {
 		await store.queueCommitReport(
 			buildQueuedReport({
@@ -309,7 +391,7 @@ describe("AiCodeStatsUploader", () => {
 		const fetchMock = vi
 			.fn()
 			.mockResolvedValueOnce(new Response("fail", { status: 400, statusText: "bad request" }))
-			.mockResolvedValueOnce(new Response("ok", { status: 200 }))
+			.mockResolvedValueOnce(acceptedIngestResponse())
 		vi.stubGlobal("fetch", fetchMock)
 
 		const failedResult = await uploader.uploadQueuedReports({
@@ -361,7 +443,7 @@ describe("AiCodeStatsUploader", () => {
 		const fetchMock = vi
 			.fn()
 			.mockResolvedValueOnce(new Response("fail", { status: 400, statusText: "bad request" }))
-			.mockResolvedValueOnce(new Response("ok", { status: 200 }))
+			.mockResolvedValueOnce(acceptedIngestResponse())
 		vi.stubGlobal("fetch", fetchMock)
 
 		const result = await uploader.uploadQueuedReports({
@@ -418,7 +500,7 @@ describe("AiCodeStatsUploader", () => {
 			}),
 		)
 
-		const fetchMock = vi.fn().mockResolvedValue(new Response("ok", { status: 200 }))
+		const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(acceptedIngestResponse()))
 		vi.stubGlobal("fetch", fetchMock)
 
 		await uploader.uploadQueuedReports({

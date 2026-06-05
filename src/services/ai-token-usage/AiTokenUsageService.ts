@@ -26,6 +26,7 @@ const UNSCOPED_TOKEN_PROVIDER = "unscoped"
 const UNSCOPED_TOKEN_MODEL = "unscoped"
 const UNSCOPED_TOKEN_PROJECT_KEY = "unscoped-token-usage"
 const UNSCOPED_TOKEN_PROJECT_NAME = "Unscoped Token Usage"
+const TOKEN_USAGE_UPLOAD_DEBOUNCE_MS = 5_000
 
 const detectIde = (): AiTokenUsageIde => {
 	const wrapper = getKiloCodeWrapperProperties()
@@ -68,6 +69,7 @@ export class AiTokenUsageService {
 	private started = false
 	private isUploading = false
 	private uploadRequestedWhileRunning = false
+	private usageUploadTimer: NodeJS.Timeout | undefined
 
 	private constructor(
 		globalStoragePath: string,
@@ -107,6 +109,7 @@ export class AiTokenUsageService {
 
 	stop(): void {
 		this.started = false
+		this.clearUsageUploadTimer()
 		for (const watcher of this.watchers.values()) {
 			watcher.dispose()
 		}
@@ -166,6 +169,8 @@ export class AiTokenUsageService {
 		if (!this.started) {
 			return
 		}
+
+		this.scheduleUsageTriggeredUpload()
 	}
 
 	async trackRepositoryForCommitUpload(repoRoot: string): Promise<void> {
@@ -205,6 +210,29 @@ export class AiTokenUsageService {
 	}
 
 	private async requestCommitTriggeredUpload(): Promise<void> {
+		this.clearUsageUploadTimer()
+		await this.requestUpload()
+	}
+
+	private scheduleUsageTriggeredUpload(): void {
+		this.clearUsageUploadTimer()
+		this.usageUploadTimer = setTimeout(() => {
+			this.usageUploadTimer = undefined
+			void this.requestUpload().catch((error) => {
+				console.error("[AiTokenUsage] Failed to upload token usage after model request:", error)
+			})
+		}, TOKEN_USAGE_UPLOAD_DEBOUNCE_MS)
+	}
+
+	private clearUsageUploadTimer(): void {
+		if (!this.usageUploadTimer) {
+			return
+		}
+		clearTimeout(this.usageUploadTimer)
+		this.usageUploadTimer = undefined
+	}
+
+	private async requestUpload(): Promise<void> {
 		if (this.isUploading) {
 			this.uploadRequestedWhileRunning = true
 			return

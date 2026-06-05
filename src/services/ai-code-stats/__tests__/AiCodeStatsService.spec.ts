@@ -108,6 +108,12 @@ const parseJsonBody = async (body: BodyInit | null | undefined, headers?: Record
 	return JSON.parse(buffer.toString("utf8"))
 }
 
+const acceptedIngestResponse = (): Response =>
+	new Response(JSON.stringify({ accepted: true, kind: "commit_report" }), {
+		status: 200,
+		headers: { "Content-Type": "application/json" },
+	})
+
 const createGitRepo = async (parentDir?: string, name?: string): Promise<string> => {
 	const repoDir =
 		parentDir && name ? path.join(parentDir, name) : await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-repo-"))
@@ -229,7 +235,7 @@ describe("AiCodeStatsService", () => {
 			webhookUrl: "https://example.com/webhook",
 		}))
 
-		const fetchMock = vi.fn().mockResolvedValue(new Response("ok", { status: 200 }))
+		const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(acceptedIngestResponse()))
 		vi.stubGlobal("fetch", fetchMock)
 
 		await service.recordAgentFileWrite({
@@ -436,7 +442,7 @@ describe("AiCodeStatsService", () => {
 			webhookUrl: "https://example.com/webhook",
 			userEmail: "tester@example.com",
 		}))
-		const fetchMock = vi.fn().mockResolvedValue(new Response("ok", { status: 200 }))
+		const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(acceptedIngestResponse()))
 		vi.stubGlobal("fetch", fetchMock)
 
 		await service.recordAgentFileWrite({
@@ -481,7 +487,7 @@ describe("AiCodeStatsService", () => {
 		const service = AiCodeStatsService.initialize(tmpDir, async () => ({
 			webhookUrl: "https://example.com/webhook",
 		}))
-		const fetchMock = vi.fn().mockResolvedValue(new Response("ok", { status: 200 }))
+		const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(acceptedIngestResponse()))
 		vi.stubGlobal("fetch", fetchMock)
 
 		await (service as any).handleCommitCollected({
@@ -1321,7 +1327,7 @@ describe("AiCodeStatsService", () => {
 			newContent: "const a = 1\nconst d = 4\n",
 		})
 
-		const fetchMock = vi.fn().mockResolvedValue(new Response("ok", { status: 200 }))
+		const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(acceptedIngestResponse()))
 		vi.stubGlobal("fetch", fetchMock)
 
 		await (service as any).handleCommitCollected({
@@ -1384,7 +1390,7 @@ describe("AiCodeStatsService", () => {
 			newContent: "const a = 1\nconst branch = true\n",
 		})
 
-		const fetchMock = vi.fn().mockResolvedValue(new Response("ok", { status: 200 }))
+		const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(acceptedIngestResponse()))
 		vi.stubGlobal("fetch", fetchMock)
 
 		await (service as any).handleCommitCollected({
@@ -1437,7 +1443,7 @@ describe("AiCodeStatsService", () => {
 		const fetchMock = vi
 			.fn()
 			.mockResolvedValueOnce(new Response("bad", { status: 400, statusText: "bad request" }))
-			.mockResolvedValueOnce(new Response("ok", { status: 200 }))
+			.mockResolvedValueOnce(acceptedIngestResponse())
 		vi.stubGlobal("fetch", fetchMock)
 
 		await (service as any).handleCommitCollected({
@@ -1530,7 +1536,7 @@ describe("AiCodeStatsService", () => {
 			if (payload.mode === "commit_report") {
 				uploadedReports.push(payload)
 			}
-			return new Response("ok", { status: 200 })
+			return acceptedIngestResponse()
 		})
 		vi.stubGlobal("fetch", fetchMock)
 
@@ -1627,7 +1633,7 @@ describe("AiCodeStatsService", () => {
 				}
 				uploadedReports.push(payload)
 			}
-			return new Response("ok", { status: 200 })
+			return acceptedIngestResponse()
 		})
 		vi.stubGlobal("fetch", fetchMock)
 
@@ -1718,7 +1724,7 @@ describe("AiCodeStatsService", () => {
 				}
 				uploadedReports.push(payload)
 			}
-			return new Response("ok", { status: 200 })
+			return acceptedIngestResponse()
 		})
 		vi.stubGlobal("fetch", fetchMock)
 
@@ -1807,7 +1813,7 @@ describe("AiCodeStatsService", () => {
 				}
 				uploadedReports.push(payload)
 			}
-			return new Response("ok", { status: 200 })
+			return acceptedIngestResponse()
 		})
 		vi.stubGlobal("fetch", fetchMock)
 
