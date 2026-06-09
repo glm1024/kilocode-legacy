@@ -21,11 +21,6 @@ import {
 
 const execAsync = promisify(execCallback)
 const EXEC_MAX_BUFFER_BYTES = 4 * 1024 * 1024
-const UNSCOPED_TOKEN_IDE = "unscoped" as const
-const UNSCOPED_TOKEN_PROVIDER = "unscoped"
-const UNSCOPED_TOKEN_MODEL = "unscoped"
-const UNSCOPED_TOKEN_PROJECT_KEY = "unscoped-token-usage"
-const UNSCOPED_TOKEN_PROJECT_NAME = "Unscoped Token Usage"
 const TOKEN_USAGE_UPLOAD_DEBOUNCE_MS = 5_000
 
 const detectIde = (): AiTokenUsageIde => {
@@ -131,13 +126,16 @@ export class AiTokenUsageService {
 
 		const occurredAt = record.occurredAt ?? Date.now()
 		const settings = await this.getUploadSettings()
-		const metadata = await this.metadataResolver.resolve(undefined, settings)
+		const repoRoot = (await resolveGitRepositoryRoot(record.cwd)) ?? normalizePath(path.resolve(record.cwd))
+		const metadata = await this.metadataResolver.resolve(repoRoot, settings)
 		const userName = normalizeDimensionValue(metadata.userName)
 		const userEmail = metadata.userEmail
 		if (!userEmail) {
 			return
 		}
 		const sourceIp = normalizeDimensionValue(metadata.sourceIp)
+		const provider = normalizeDimensionValue(record.provider, "unknown")
+		const model = normalizeDimensionValue(record.model, "unknown")
 		const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"
 
 		await this.store.recordUsage({
@@ -153,11 +151,14 @@ export class AiTokenUsageService {
 			userKey: buildUserKey(userEmail),
 			organizationId: metadata.organizationId,
 			organizationName: metadata.organizationName,
-			projectKey: UNSCOPED_TOKEN_PROJECT_KEY,
-			projectName: UNSCOPED_TOKEN_PROJECT_NAME,
-			ide: UNSCOPED_TOKEN_IDE,
-			provider: UNSCOPED_TOKEN_PROVIDER,
-			model: UNSCOPED_TOKEN_MODEL,
+			projectKey: metadata.projectKey,
+			projectName: metadata.projectName,
+			repoRoot: metadata.repoRoot,
+			gitRemoteUrl: metadata.gitRemoteUrl,
+			gitBranch: metadata.gitBranch,
+			ide: this.ide,
+			provider,
+			model,
 			requestCount: 1,
 			inputTokens,
 			outputTokens,

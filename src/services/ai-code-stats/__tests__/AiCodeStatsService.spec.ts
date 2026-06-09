@@ -309,6 +309,10 @@ describe("AiCodeStatsService", () => {
 			commitHash: "commit-a",
 			previousCommit: "prev-a",
 			commitOccurredAt: Date.now(),
+			authorName: "Zhang San",
+			authorEmail: "zhang.san@example.com",
+			committerName: "CI Bot",
+			committerEmail: "ci@example.com",
 			changedFiles: [{ relativePath: "src/a.ts", filePath: path.join(repoA, "src/a.ts"), changedBlocks: [] }],
 		})
 
@@ -334,7 +338,15 @@ describe("AiCodeStatsService", () => {
 		)
 		const reportA = reportsByCommit.get("commit-a")!
 		const reportB = reportsByCommit.get("commit-b")!
-		expect(reportA).toMatchObject({ repoRoot: repoA, projectName: "repo-a", gitRemoteUrl: remotes.get(repoA) })
+		expect(reportA).toMatchObject({
+			repoRoot: repoA,
+			projectName: "repo-a",
+			gitRemoteUrl: remotes.get(repoA),
+			authorName: "Zhang San",
+			authorEmail: "zhang.san@example.com",
+			committerName: "CI Bot",
+			committerEmail: "ci@example.com",
+		})
 		expect(reportB).toMatchObject({ repoRoot: repoB, projectName: "repo-b", gitRemoteUrl: remotes.get(repoB) })
 		expect(reportA.projectKey).not.toBe(reportB.projectKey)
 		expect(reportA.generatedBlocks[0]).toMatchObject({

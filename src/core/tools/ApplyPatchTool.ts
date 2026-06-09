@@ -412,6 +412,10 @@ export class ApplyPatchTool extends BaseTool<"apply_patch"> {
 							originalContent,
 							newContent,
 							taskId: task.taskId,
+							modelContext: {
+								provider: task.apiConfiguration?.apiProvider,
+								model: task.api?.getModel()?.id,
+							},
 						})
 					} catch (error) {
 						console.warn(

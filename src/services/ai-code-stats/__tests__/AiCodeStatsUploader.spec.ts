@@ -60,6 +60,10 @@ const buildCommitReport = (overrides: Partial<AiCodeCommitReport> = {}): AiCodeC
 	commitHash: overrides.commitHash ?? "commit-1",
 	previousCommitHash: overrides.previousCommitHash ?? "commit-0",
 	commitOccurredAt: overrides.commitOccurredAt ?? Date.now(),
+	authorName: overrides.authorName,
+	authorEmail: overrides.authorEmail,
+	committerName: overrides.committerName,
+	committerEmail: overrides.committerEmail,
 	acceptedBlocks: overrides.acceptedBlocks ?? [
 		{
 			eventId: "generated-1",
@@ -134,6 +138,10 @@ describe("AiCodeStatsUploader", () => {
 				report: buildCommitReport({
 					reportId: "report-1",
 					commitHash: "commit-1",
+					authorName: "Zhang San",
+					authorEmail: "zhang.san@example.com",
+					committerName: "CI Bot",
+					committerEmail: "ci@example.com",
 				}),
 			}),
 		)
@@ -197,6 +205,12 @@ describe("AiCodeStatsUploader", () => {
 		)
 		expect(firstBody.reportId).toBe("report-1")
 		expect(firstBody.version).toBe("v3")
+		expect(firstBody).toMatchObject({
+			authorName: "Zhang San",
+			authorEmail: "zhang.san@example.com",
+			committerName: "CI Bot",
+			committerEmail: "ci@example.com",
+		})
 		expect(firstBody.snapshots).toHaveLength(1)
 		expect(firstBody.acceptedBlocks[0].fileSnapshotContent).toBeUndefined()
 		expect(firstBody.acceptedBlocks[0].fileSnapshotHash).toBe(firstBody.snapshots[0].contentHash)

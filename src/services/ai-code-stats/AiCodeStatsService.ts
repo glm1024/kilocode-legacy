@@ -40,6 +40,7 @@ import {
 	type AiCodeGeneratedBlock,
 	type AiCodeGeneratedBlockState,
 	type AiCodeIde,
+	type AiCodeModelContext,
 	type AiCodePatchHunk,
 	type AiCodePendingLineAttribution,
 	type AiCodeStatsEvent,
@@ -83,6 +84,18 @@ const buildLineOccurrenceIndexes = (content: string): number[] => {
 
 const normalizeGeneratedBlockId = (generatedBlockId?: string): string =>
 	typeof generatedBlockId === "string" ? generatedBlockId.trim() : ""
+
+const normalizeModelContext = (context?: AiCodeModelContext): AiCodeModelContext | undefined => {
+	const provider = context?.provider?.trim()
+	const model = context?.model?.trim()
+	if (!provider && !model) {
+		return undefined
+	}
+	return {
+		provider: provider || undefined,
+		model: model || undefined,
+	}
+}
 
 interface GeneratedLineRange {
 	lineStart: number
@@ -188,6 +201,7 @@ export interface AgentFileWriteRecord {
 	proposedContent?: string
 	newContent: string
 	taskId?: string
+	modelContext?: AiCodeModelContext
 }
 
 interface ResolvedFileContext {
@@ -208,6 +222,7 @@ export class AiCodeStatsService {
 	private readonly metadataResolver: AiCodeStatsMetadataResolver
 	// kilocode_change end
 	private readonly ide: AiCodeIde
+	private readonly taskModelContexts = new Map<string, AiCodeModelContext>()
 	private isUploading = false
 	private uploadRequestedWhileRunning = false
 	private isScanningCommitUploads = false
@@ -250,6 +265,21 @@ export class AiCodeStatsService {
 		AiCodeStatsService.instance = null
 	}
 
+	recordTaskModelUsage(taskId: string | undefined, modelContext: AiCodeModelContext | undefined): void {
+		const normalizedTaskId = taskId?.trim()
+		const normalizedModelContext = normalizeModelContext(modelContext)
+		if (!normalizedTaskId || !normalizedModelContext) {
+			return
+		}
+		this.taskModelContexts.set(normalizedTaskId, normalizedModelContext)
+		if (this.taskModelContexts.size > 500) {
+			const oldestKey = this.taskModelContexts.keys().next().value
+			if (oldestKey) {
+				this.taskModelContexts.delete(oldestKey)
+			}
+		}
+	}
+
 	start(): void {
 		void this.commitAttributionService.start().catch((error) => {
 			console.error("[AiCodeStats] Failed to start commit attribution service:", error)
@@ -270,6 +300,12 @@ export class AiCodeStatsService {
 			clearInterval(this.commitUploadScanTimer)
 			this.commitUploadScanTimer = undefined
 		}
+	}
+
+	private resolveModelContext(taskId?: string, fallback?: AiCodeModelContext): AiCodeModelContext | undefined {
+		const fallbackContext = normalizeModelContext(fallback)
+		const taskContext = taskId?.trim() ? this.taskModelContexts.get(taskId.trim()) : undefined
+		return normalizeModelContext(taskContext) ?? fallbackContext
 	}
 
 	async recordAgentFileWrite(record: AgentFileWriteRecord): Promise<void> {
@@ -293,6 +329,7 @@ export class AiCodeStatsService {
 		// kilocode_change start
 		const settings = await this.getUploadSettings()
 		const metadata = await this.metadataResolver.resolve(context.repoRoot, context.filePath, settings)
+		const modelContext = this.resolveModelContext(record.taskId, record.modelContext)
 		try {
 			await AiTokenUsageService.getInstance()?.trackRepositoryForCommitUpload(context.repoRoot)
 		} catch (error) {
@@ -321,6 +358,7 @@ export class AiCodeStatsService {
 			filePath: context.filePath,
 			taskId: record.taskId,
 			metadata,
+			modelContext,
 		})
 		await this.store.addPendingCommitMetricBlocks(nextBlocks.metricBlocks)
 
@@ -355,6 +393,7 @@ export class AiCodeStatsService {
 
 		const settings = await this.getUploadSettings()
 		const metadata = await this.metadataResolver.resolve(context.repoRoot, context.filePath, settings)
+		const modelContext = this.resolveModelContext(record.taskId, record.modelContext)
 		const timestamp = Date.now()
 		const events = blocks
 			.filter((block) => block.codeSnippet.trim().length > 0)
@@ -374,6 +413,8 @@ export class AiCodeStatsService {
 					organizationId: metadata.organizationId,
 					organizationName: metadata.organizationName,
 					sourceIp: metadata.sourceIp,
+					provider: modelContext?.provider,
+					model: modelContext?.model,
 					projectKey: metadata.projectKey,
 					projectName: metadata.projectName,
 					repoRoot: context.repoRoot,
@@ -1168,6 +1209,8 @@ export class AiCodeStatsService {
 				organizationId: block.organizationId,
 				organizationName: block.organizationName,
 				sourceIp: block.sourceIp,
+				provider: block.provider,
+				model: block.model,
 				projectKey: block.projectKey,
 				projectName: block.projectName,
 				filePath: block.filePath,
@@ -1239,6 +1282,10 @@ export class AiCodeStatsService {
 			commitHash: payload.commitHash,
 			previousCommitHash: payload.previousCommit || undefined,
 			commitOccurredAt: payload.commitOccurredAt,
+			authorName: payload.authorName,
+			authorEmail: payload.authorEmail,
+			committerName: payload.committerName,
+			committerEmail: payload.committerEmail,
 			generatedBlocks: reportBaselineBlocks.generatedBlocks,
 			acceptedBlocks: reportAcceptedBlocks,
 			changedFiles: payload.changedFiles.map((file) => ({
@@ -1466,6 +1513,8 @@ export class AiCodeStatsService {
 				organizationId: pendingLine.organizationId,
 				organizationName: pendingLine.organizationName,
 				sourceIp: pendingLine.sourceIp,
+				provider: pendingLine.provider,
+				model: pendingLine.model,
 				projectKey: pendingLine.projectKey,
 				projectName: pendingLine.projectName,
 				filePath: normalizePath(pendingLine.filePath),
@@ -1654,6 +1703,7 @@ export class AiCodeStatsService {
 		filePath: string
 		taskId?: string
 		metadata: Awaited<ReturnType<AiCodeStatsMetadataResolver["resolve"]>>
+		modelContext?: AiCodeModelContext
 	}): GeneratedStateBuildResult {
 		const finalLines = normalizeContentLines(params.finalContent)
 		let nextBlocks = this.buildPreservedGeneratedBlocks({
@@ -1704,6 +1754,7 @@ export class AiCodeStatsService {
 							baseBlock.repoRelativePath || baseBlock.relativePath || params.repoRelativePath,
 						taskId: baseBlock.taskId,
 						metadata: params.metadata,
+						modelContext: params.modelContext,
 						fileSnapshotContent: params.finalContent,
 						lineStart: addedBlock.lineStart,
 						lineEnd: addedBlock.lineEnd,
@@ -1721,6 +1772,7 @@ export class AiCodeStatsService {
 				repoRelativePath: params.repoRelativePath,
 				taskId: params.taskId,
 				metadata: params.metadata,
+				modelContext: params.modelContext,
 				finalLines,
 				finalContent: params.finalContent,
 				lineStart: addedBlock.lineStart,
@@ -1737,6 +1789,7 @@ export class AiCodeStatsService {
 					repoRelativePath: nextBlock.repoRelativePath || params.repoRelativePath,
 					taskId: nextBlock.taskId,
 					metadata: params.metadata,
+					modelContext: params.modelContext,
 					fileSnapshotContent: params.finalContent,
 					lineStart: addedBlock.lineStart,
 					lineEnd: addedBlock.lineEnd,
@@ -1875,6 +1928,7 @@ export class AiCodeStatsService {
 		repoRelativePath: string
 		taskId?: string
 		metadata: Awaited<ReturnType<AiCodeStatsMetadataResolver["resolve"]>>
+		modelContext?: AiCodeModelContext
 		fileSnapshotContent: string
 		lineStart: number
 		lineEnd: number
@@ -1896,6 +1950,8 @@ export class AiCodeStatsService {
 			organizationId: params.metadata.organizationId,
 			organizationName: params.metadata.organizationName,
 			sourceIp: params.metadata.sourceIp,
+			provider: params.modelContext?.provider,
+			model: params.modelContext?.model,
 			projectKey: params.metadata.projectKey,
 			projectName: params.metadata.projectName,
 			repoRoot: params.repoRoot,
@@ -1922,6 +1978,7 @@ export class AiCodeStatsService {
 		repoRelativePath: string
 		taskId?: string
 		metadata: Awaited<ReturnType<AiCodeStatsMetadataResolver["resolve"]>>
+		modelContext?: AiCodeModelContext
 		finalLines: string[]
 		finalContent: string
 		lineStart: number
@@ -1946,6 +2003,8 @@ export class AiCodeStatsService {
 			organizationId: params.metadata.organizationId,
 			organizationName: params.metadata.organizationName,
 			sourceIp: params.metadata.sourceIp,
+			provider: params.modelContext?.provider,
+			model: params.modelContext?.model,
 			projectKey: params.metadata.projectKey,
 			projectName: params.metadata.projectName,
 			filePath: params.filePath,
@@ -2073,6 +2132,8 @@ export class AiCodeStatsService {
 			organizationId: block.organizationId,
 			organizationName: block.organizationName,
 			sourceIp: block.sourceIp,
+			provider: block.provider,
+			model: block.model,
 			projectKey: block.projectKey,
 			projectName: block.projectName,
 			repoRoot: block.repoRoot,

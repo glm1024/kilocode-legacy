@@ -108,6 +108,7 @@ describe("AiCodeCommitAttributionService", () => {
 			},
 			loadCommitPatch: async () => "",
 			loadCommitTimestamp: async () => 1_772_500_000_000,
+			loadCommitIdentity: async () => ({}),
 			loadCommitFileContent: async (_repoRoot: string, _commitHash: string, repoRelativePath: string) =>
 				`// committed snapshot for ${repoRelativePath}\nconst value = 1\n`,
 			getCurrentBranch: async () => "feature/stats",
@@ -137,6 +138,12 @@ describe("AiCodeCommitAttributionService", () => {
 					"+const total = calculateTotal(items)",
 					"+return total",
 				].join("\n"),
+			loadCommitIdentity: async () => ({
+				authorName: "Zhang San",
+				authorEmail: "zhang.san@example.com",
+				committerName: "CI Bot",
+				committerEmail: "ci@example.com",
+			}),
 			loadCommitFileContent: async () => "const total = calculateTotal(items)\nreturn total\n",
 		})
 
@@ -178,6 +185,10 @@ describe("AiCodeCommitAttributionService", () => {
 			commitHash: "def456",
 			previousCommit: "abc123",
 			commitOccurredAt: 1_772_500_000_000,
+			authorName: "Zhang San",
+			authorEmail: "zhang.san@example.com",
+			committerName: "CI Bot",
+			committerEmail: "ci@example.com",
 		})
 		expect(payload.changedFiles).toHaveLength(1)
 		expect(payload.changedFiles[0]).toMatchObject({

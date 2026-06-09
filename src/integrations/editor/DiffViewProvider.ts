@@ -719,6 +719,10 @@ export class DiffViewProvider {
 				proposedContent,
 				newContent,
 				taskId: task?.taskId,
+				modelContext: {
+					provider: task?.apiConfiguration?.apiProvider,
+					model: task?.api?.getModel()?.id,
+				},
 			})
 		} catch (error) {
 			console.warn(

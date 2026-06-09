@@ -3,9 +3,11 @@
 	"extends": ["//"],
 	"tasks": {
 		"build": {
+			"cache": false,
 			"outputs": ["../src/webview-ui/**"]
 		},
 		"build:nightly": {
+			"cache": false,
 			"outputs": ["../apps/vscode-nightly/build/webview-ui/**"]
 		}
 	}

@@ -26,6 +26,7 @@ export interface AiCodeCommitAttributionServiceOptions {
 	createWatcher?: (repoRoot: string) => AiCodeCommitWatcher
 	loadCommitPatch?: (repoRoot: string, previousCommit: string, newCommit: string) => Promise<string>
 	loadCommitTimestamp?: (repoRoot: string, commitHash: string) => Promise<number>
+	loadCommitIdentity?: (repoRoot: string, commitHash: string) => Promise<AiCodeCommitIdentity>
 	loadCommitFileContent?: (
 		repoRoot: string,
 		commitHash: string,
@@ -138,6 +139,31 @@ const defaultLoadCommitTimestamp = async (repoRoot: string, commitHash: string):
 	return seconds * 1000
 }
 
+export interface AiCodeCommitIdentity {
+	authorName?: string
+	authorEmail?: string
+	committerName?: string
+	committerEmail?: string
+}
+
+const GIT_IDENTITY_SEPARATOR = "\x1f"
+
+const trimIdentityField = (value?: string): string | undefined => {
+	const trimmed = value?.trim()
+	return trimmed ? trimmed : undefined
+}
+
+const defaultLoadCommitIdentity = async (repoRoot: string, commitHash: string): Promise<AiCodeCommitIdentity> => {
+	const stdout = await runGitStdout(repoRoot, ["show", "-s", "--format=%an%x1f%ae%x1f%cn%x1f%ce", commitHash])
+	const parts = stdout.trimEnd().split(GIT_IDENTITY_SEPARATOR)
+	return {
+		authorName: trimIdentityField(parts[0]),
+		authorEmail: trimIdentityField(parts[1]),
+		committerName: trimIdentityField(parts[2]),
+		committerEmail: trimIdentityField(parts[3]),
+	}
+}
+
 const defaultLoadCommitFileContent = async (
 	repoRoot: string,
 	commitHash: string,
@@ -248,6 +274,10 @@ export interface AiCodeCommitFactsPayload {
 	commitHash: string
 	previousCommit: string
 	commitOccurredAt: number
+	authorName?: string
+	authorEmail?: string
+	committerName?: string
+	committerEmail?: string
 	changedFiles: AiCodeCommitChangedFile[]
 }
 
@@ -258,6 +288,7 @@ export class AiCodeCommitAttributionService {
 	private readonly createWatcher: (repoRoot: string) => AiCodeCommitWatcher
 	private readonly loadCommitPatch: (repoRoot: string, previousCommit: string, newCommit: string) => Promise<string>
 	private readonly loadCommitTimestamp: (repoRoot: string, commitHash: string) => Promise<number>
+	private readonly loadCommitIdentity: (repoRoot: string, commitHash: string) => Promise<AiCodeCommitIdentity>
 	private readonly loadCommitFileContent: (
 		repoRoot: string,
 		commitHash: string,
@@ -285,6 +316,7 @@ export class AiCodeCommitAttributionService {
 		this.createWatcher = options.createWatcher ?? defaultCreateWatcher
 		this.loadCommitPatch = options.loadCommitPatch ?? defaultLoadCommitPatch
 		this.loadCommitTimestamp = options.loadCommitTimestamp ?? defaultLoadCommitTimestamp
+		this.loadCommitIdentity = options.loadCommitIdentity ?? defaultLoadCommitIdentity
 		this.loadCommitFileContent = options.loadCommitFileContent ?? defaultLoadCommitFileContent
 		this.getCurrentBranch = options.getCurrentBranch ?? getCurrentBranch
 		this.getCurrentCommitSha = options.getCurrentCommitSha ?? defaultGetCurrentCommitSha
@@ -603,6 +635,13 @@ export class AiCodeCommitAttributionService {
 			)
 		}
 
+		let commitIdentity: AiCodeCommitIdentity = {}
+		try {
+			commitIdentity = await this.loadCommitIdentity(repoRoot, commitHash)
+		} catch (error) {
+			console.warn("[AiCodeCommitAttribution] Failed to load commit author identity:", error)
+		}
+
 		const changedFiles: AiCodeCommitChangedFile[] = []
 		const commitFileContentCache = new Map<string, Promise<string | undefined>>()
 		if (patchContent.trim()) {
@@ -654,6 +693,10 @@ export class AiCodeCommitAttributionService {
 			commitHash,
 			previousCommit,
 			commitOccurredAt,
+			authorName: commitIdentity.authorName,
+			authorEmail: commitIdentity.authorEmail,
+			committerName: commitIdentity.committerName,
+			committerEmail: commitIdentity.committerEmail,
 			changedFiles,
 		}
 	}

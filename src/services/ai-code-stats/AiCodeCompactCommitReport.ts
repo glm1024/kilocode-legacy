@@ -30,6 +30,8 @@ interface AiCodeCompactDefaults {
 	organizationId?: string
 	organizationName?: string
 	sourceIp?: string
+	provider?: string
+	model?: string
 	projectKey?: string
 	projectName?: string
 	repoRoot?: string
@@ -67,6 +69,10 @@ export interface AiCodeCompactCommitReport {
 	commitHash: string
 	previousCommitHash?: string
 	commitOccurredAt: number
+	authorName?: string
+	authorEmail?: string
+	committerName?: string
+	committerEmail?: string
 	snapshots: AiCodeSnapshotPayload[]
 	acceptedBlocks?: AiCodeCompactBlockPayload[]
 	generatedBlocks?: AiCodeCompactBlockPayload[]
@@ -142,6 +148,10 @@ export function buildCompactCommitReportPayload(
 		commitHash: report.commitHash,
 		previousCommitHash: report.previousCommitHash,
 		commitOccurredAt: report.commitOccurredAt,
+		authorName: report.authorName,
+		authorEmail: report.authorEmail,
+		committerName: report.committerName,
+		committerEmail: report.committerEmail,
 		snapshots: [],
 		acceptedBlocks: compactBlocks(report.acceptedBlocks),
 		generatedBlocks: compactBlocks(report.generatedBlocks),
@@ -166,6 +176,8 @@ function resolveDefaults(report: AiCodeCommitReport, fallbackUserEmail: string):
 		organizationId: firstBlock?.organizationId ?? firstLine?.organizationId,
 		organizationName: firstBlock?.organizationName ?? firstLine?.organizationName,
 		sourceIp: firstBlock?.sourceIp ?? firstLine?.sourceIp,
+		provider: firstBlock?.provider ?? firstLine?.provider,
+		model: firstBlock?.model ?? firstLine?.model,
 		projectKey: report.projectKey,
 		projectName: report.projectName,
 		repoRoot: normalizePath(report.repoRoot),
@@ -195,6 +207,8 @@ function compactBlock(
 		organizationId: block.organizationId,
 		organizationName: block.organizationName,
 		sourceIp: block.sourceIp,
+		provider: block.provider,
+		model: block.model,
 		projectKey: block.projectKey,
 		projectName: block.projectName,
 		repoRoot: block.repoRoot ? normalizePath(block.repoRoot) : undefined,

@@ -5,6 +5,11 @@ export type AiCodeUploadMode = "incremental"
 export type AiCodeGeneratedBlockUploadStatus = "pending" | "queued" | "uploaded"
 export type AiCodeStatsSemanticsVersion = 1
 
+export interface AiCodeModelContext {
+	provider?: string
+	model?: string
+}
+
 export interface AiCodeStatsEvent {
 	eventId: string
 	timestamp: number
@@ -20,6 +25,8 @@ export interface AiCodeStatsEvent {
 	organizationId?: string
 	organizationName?: string
 	sourceIp?: string
+	provider?: string
+	model?: string
 	projectKey?: string
 	projectName?: string
 	repoRoot?: string
@@ -56,6 +63,8 @@ export interface AiCodeGeneratedBlock {
 	organizationId?: string
 	organizationName?: string
 	sourceIp?: string
+	provider?: string
+	model?: string
 	projectKey?: string
 	projectName?: string
 	repoRoot?: string
@@ -111,6 +120,8 @@ export interface AiCodeCommitCandidateLine {
 	organizationId?: string
 	organizationName?: string
 	sourceIp?: string
+	provider?: string
+	model?: string
 	projectKey?: string
 	projectName?: string
 	filePath: string
@@ -172,6 +183,10 @@ export interface AiCodeCommitReport {
 	commitHash: string
 	previousCommitHash?: string
 	commitOccurredAt: number
+	authorName?: string
+	authorEmail?: string
+	committerName?: string
+	committerEmail?: string
 	acceptedBlocks?: AiCodeGeneratedBlock[]
 	generatedBlocks?: AiCodeGeneratedBlock[]
 	changedFiles: AiCodeCommitChangedFile[]
@@ -367,6 +382,8 @@ export interface AiCodePendingLineAttribution {
 	organizationId?: string
 	organizationName?: string
 	sourceIp?: string
+	provider?: string
+	model?: string
 	projectKey?: string
 	projectName?: string
 	filePath: string

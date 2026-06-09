@@ -1261,6 +1261,10 @@ export class AiCodeStatsStore {
 				commitHash: report.report.commitHash,
 				previousCommitHash: report.report.previousCommitHash,
 				commitOccurredAt: report.report.commitOccurredAt,
+				authorName: report.report.authorName,
+				authorEmail: report.report.authorEmail,
+				committerName: report.report.committerName,
+				committerEmail: report.report.committerEmail,
 				acceptedBlocks: (report.report.acceptedBlocks ?? []).map((block) =>
 					this.normalizeGeneratedBlockState({
 						...block,

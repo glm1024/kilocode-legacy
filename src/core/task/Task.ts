@@ -162,6 +162,7 @@ import { MessageManager } from "../message-manager"
 import { validateAndFixToolResultIds } from "./validateToolResultIds"
 import { deduplicateToolUseBlocks } from "./deduplicateToolUseBlocks"
 import { AiTokenUsageService } from "../../services/ai-token-usage"
+import { AiCodeStatsService } from "../../services/ai-code-stats"
 
 const MAX_EXPONENTIAL_BACKOFF_SECONDS = 600 // 10 minutes
 const DEFAULT_USAGE_COLLECTION_TIMEOUT_MS = 5000 // 5 seconds
@@ -3492,12 +3493,16 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 								})
 
 								const aiTokenUsageService = AiTokenUsageService.getInstance()
+								AiCodeStatsService.getInstance()?.recordTaskModelUsage(this.taskId, {
+									provider: this.apiConfiguration.apiProvider,
+									model: cachedModelId,
+								})
 								if (aiTokenUsageService) {
 									try {
 										await aiTokenUsageService.recordRequestUsage({
 											taskId: this.taskId,
 											cwd: this.cwd,
-											provider: inferenceProvider ?? this.apiConfiguration.apiProvider,
+											provider: this.apiConfiguration.apiProvider,
 											model: cachedModelId,
 											inputTokens: costResult.totalInputTokens,
 											outputTokens: costResult.totalOutputTokens,
