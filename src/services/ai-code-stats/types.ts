@@ -1,9 +1,10 @@
 export type AiCodeSourceType = "agent_insert"
 export type AiCodeIde = string
 export type AiCodeMetricType = "generated" | "accepted"
+export type AiCodeChangeType = "addition" | "deletion"
 export type AiCodeUploadMode = "incremental"
 export type AiCodeGeneratedBlockUploadStatus = "pending" | "queued" | "uploaded"
-export type AiCodeStatsSemanticsVersion = 1
+export type AiCodeStatsSemanticsVersion = 1 | 2
 
 export interface AiCodeModelContext {
 	provider?: string
@@ -17,6 +18,8 @@ export interface AiCodeStatsEvent {
 	sourceType: AiCodeSourceType
 	ide: AiCodeIde
 	metricType: AiCodeMetricType
+	/** Defaults to "addition" when absent (legacy events). */
+	changeType?: AiCodeChangeType
 	userName?: string
 	departmentName?: string
 	officeName?: string
@@ -55,6 +58,12 @@ export interface AiCodeGeneratedBlock {
 	semanticsVersion?: AiCodeStatsSemanticsVersion
 	sourceType: AiCodeSourceType
 	ide: AiCodeIde
+	/**
+	 * Defaults to "addition" when absent. For "deletion" blocks lineStart/lineEnd
+	 * refer to the pre-deletion (old file) line numbers and codeSnippet holds the
+	 * removed content.
+	 */
+	changeType?: AiCodeChangeType
 	userName?: string
 	departmentName?: string
 	officeName?: string
@@ -132,12 +141,18 @@ export interface AiCodeCommitCandidateLine {
 	gitRemoteUrl?: string
 	gitBranch?: string
 	taskId?: string
+	/**
+	 * For additions: line number in the file content at AI-write time.
+	 * For deletions: pre-deletion (old file) line number.
+	 */
 	lineNumber: number
 	rawLine: string
 	blockLineIndex: number
 	blockLineCount: number
 	lineHash: string
 	occurrenceIndex: number
+	/** Defaults to "addition" when absent (legacy candidate lines). */
+	changeType?: AiCodeChangeType
 }
 
 export interface AiCodeCommitAddedLine {
@@ -145,6 +160,16 @@ export interface AiCodeCommitAddedLine {
 	lineNumber: number
 	content: string
 	lineHash: string
+}
+
+export interface AiCodeCommitDeletedLine {
+	deletedIndex: number
+	/** Line number on the commit parent (old) side. */
+	lineNumber: number
+	content: string
+	lineHash: string
+	/** 1-based occurrence among deleted lines with the same lineHash in this file. */
+	occurrenceIndex: number
 }
 
 export interface AiCodeCommitChangedBlock {
@@ -164,6 +189,7 @@ export interface AiCodeCommitChangedFile {
 	committedSnapshotHash?: string
 	changedBlocks: AiCodeCommitChangedBlock[]
 	addedLines?: AiCodeCommitAddedLine[]
+	deletedLines?: AiCodeCommitDeletedLine[]
 }
 
 export interface AiCodeCommitReport {
@@ -234,6 +260,7 @@ export interface AiCodeCommitUploadRecord {
 	candidateBlockCount?: number
 	changedFileCount?: number
 	addedLineCount?: number
+	deletedLineCount?: number
 	repoName?: string
 	createdAt: number
 	updatedAt: number
@@ -352,6 +379,12 @@ export interface AiCodePatchAddedLine {
 	content: string
 }
 
+export interface AiCodePatchDeletedLine {
+	/** Line number on the old (pre-change) side of the patch. */
+	lineNumber: number
+	content: string
+}
+
 export interface AiCodePatchHunk {
 	oldStart: number
 	oldLines: number
@@ -363,6 +396,7 @@ export interface AiCodePatchFile {
 	filePath: string
 	previousFilePath?: string
 	addedLines: AiCodePatchAddedLine[]
+	deletedLines: AiCodePatchDeletedLine[]
 	changedBlocks: AiCodeCommitChangedBlock[]
 }
 
@@ -400,10 +434,14 @@ export interface AiCodePendingLineAttribution {
 	blockLineCount: number
 	lineHash: string
 	occurrenceIndex: number
+	/** Defaults to "addition" when absent (legacy pending lines). */
+	changeType?: AiCodeChangeType
+	/** Pre-deletion (old file) line number; only set for deletion pending lines. */
+	lineNumber?: number
 }
 
 export const AI_CODE_STATS_VERSION = 1 as const
-export const CURRENT_AI_CODE_STATS_SEMANTICS_VERSION = 1 as const
+export const CURRENT_AI_CODE_STATS_SEMANTICS_VERSION = 2 as const
 export const AI_CODE_STATS_RETENTION_DAYS = 30
 
 export const toLocalDateKey = (timestamp: number): string => {

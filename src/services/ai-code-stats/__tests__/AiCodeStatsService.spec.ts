@@ -960,6 +960,402 @@ describe("AiCodeStatsService", () => {
 		expect(queuedReports[0].report.candidateLines).toHaveLength(4)
 	})
 
+	it("records pure deletion writes as deletion blocks and pending deletion lines", async () => {
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const repoDir = await createGitRepo()
+		mockIsGitRepository.mockResolvedValue(true)
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({ enabled: false }))
+		const filePath = path.join(repoDir, "src/pure-delete.ts")
+		const originalContent = ["const keep1 = 1", "const old1 = 2", "const old2 = 3", "const keep2 = 4", ""].join(
+			"\n",
+		)
+		const newContent = ["const keep1 = 1", "const keep2 = 4", ""].join("\n")
+
+		await service.recordAgentFileWrite({
+			cwd: repoDir,
+			filePath,
+			relativePath: "src/pure-delete.ts",
+			originalContent,
+			newContent,
+			taskId: "task-pure-delete",
+		})
+
+		const store = (service as any).store
+		const generatedBlocks = await store.getGeneratedBlocksForTests()
+		expect(generatedBlocks).toHaveLength(1)
+		expect(generatedBlocks[0]).toMatchObject({
+			changeType: "deletion",
+			uploadStatus: "pending",
+			lineStart: 2,
+			lineEnd: 3,
+			lineCount: 2,
+			codeSnippet: "const old1 = 2\nconst old2 = 3",
+			fileSnapshotContent: originalContent,
+		})
+
+		const pendingCommitMetricBlocks = await store.getPendingCommitMetricBlocksForTests()
+		expect(pendingCommitMetricBlocks).toHaveLength(1)
+		expect(pendingCommitMetricBlocks[0]).toMatchObject({
+			changeType: "deletion",
+			lineStart: 2,
+			lineEnd: 3,
+			lineCount: 2,
+			codeSnippet: "const old1 = 2\nconst old2 = 3",
+		})
+
+		const pendingLines = await store.getPendingLineAttributions(repoDir)
+		expect(pendingLines).toHaveLength(2)
+		expect(pendingLines[0]).toMatchObject({
+			changeType: "deletion",
+			lineNumber: 2,
+			rawLine: "const old1 = 2",
+			blockLineIndex: 1,
+			blockLineCount: 2,
+			occurrenceIndex: 1,
+		})
+		expect(pendingLines[1]).toMatchObject({
+			changeType: "deletion",
+			lineNumber: 3,
+			rawLine: "const old2 = 3",
+		})
+	})
+
+	it("records deletion candidates for replacement edits", async () => {
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const repoDir = await createGitRepo()
+		mockIsGitRepository.mockResolvedValue(true)
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({ enabled: false }))
+		const filePath = path.join(repoDir, "src/replace.ts")
+
+		await service.recordAgentFileWrite({
+			cwd: repoDir,
+			filePath,
+			relativePath: "src/replace.ts",
+			originalContent: "const keep = 1\nconst old = 2\n",
+			newContent: "const keep = 1\nconst replaced = 3\n",
+			taskId: "task-replace",
+		})
+
+		const store = (service as any).store
+		const generatedBlocks = await store.getGeneratedBlocksForTests()
+		const additionBlocks = generatedBlocks.filter((block: any) => block.changeType !== "deletion")
+		const deletionBlocks = generatedBlocks.filter((block: any) => block.changeType === "deletion")
+		expect(additionBlocks).toHaveLength(1)
+		expect(additionBlocks[0]).toMatchObject({
+			lineStart: 2,
+			lineEnd: 2,
+			codeSnippet: "const replaced = 3",
+		})
+		expect(deletionBlocks).toHaveLength(1)
+		expect(deletionBlocks[0]).toMatchObject({
+			lineStart: 2,
+			lineEnd: 2,
+			codeSnippet: "const old = 2",
+		})
+		const pendingLines = await store.getPendingLineAttributions(repoDir)
+		const deletionLines = pendingLines.filter((line: any) => line.changeType === "deletion")
+		expect(deletionLines).toHaveLength(1)
+		expect(deletionLines[0]).toMatchObject({
+			lineNumber: 2,
+			rawLine: "const old = 2",
+			blockLineIndex: 1,
+			blockLineCount: 1,
+		})
+	})
+
+	it("computes deletion occurrence indexes from the original content for duplicate lines", async () => {
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const repoDir = await createGitRepo()
+		mockIsGitRepository.mockResolvedValue(true)
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({ enabled: false }))
+		const filePath = path.join(repoDir, "src/dup-delete.ts")
+		const originalContent = ["const dup = 1", "const keep = 2", "const dup = 1", ""].join("\n")
+		const newContent = ["const dup = 1", "const keep = 2", ""].join("\n")
+
+		await service.recordAgentFileWrite({
+			cwd: repoDir,
+			filePath,
+			relativePath: "src/dup-delete.ts",
+			originalContent,
+			newContent,
+			taskId: "task-dup-delete",
+		})
+
+		const store = (service as any).store
+		const pendingLines = await store.getPendingLineAttributions(repoDir)
+		const deletionLines = pendingLines.filter((line: any) => line.changeType === "deletion")
+		expect(deletionLines).toHaveLength(1)
+		expect(deletionLines[0]).toMatchObject({
+			lineNumber: 3,
+			rawLine: "const dup = 1",
+			occurrenceIndex: 2,
+		})
+	})
+
+	it("queues commit reports with deleted lines and deletion candidate lines", async () => {
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const repoDir = await createGitRepo()
+		mockIsGitRepository.mockResolvedValue(true)
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({ enabled: false }))
+		const filePath = path.join(repoDir, "src/delete-report.ts")
+		const originalContent = ["const keep1 = 1", "const old1 = 2", "const old2 = 3", "const keep2 = 4", ""].join(
+			"\n",
+		)
+		const newContent = ["const keep1 = 1", "const keep2 = 4", ""].join("\n")
+
+		await service.recordAgentFileWrite({
+			cwd: repoDir,
+			filePath,
+			relativePath: "src/delete-report.ts",
+			originalContent,
+			newContent,
+			taskId: "task-delete-report",
+		})
+
+		await (service as any).handleCommitCollected({
+			repoRoot: repoDir,
+			branch: "feature/delete",
+			commitHash: "commit-delete",
+			previousCommit: "commit-prev",
+			commitOccurredAt: Date.now(),
+			changedFiles: [
+				{
+					relativePath: "src/delete-report.ts",
+					filePath,
+					language: "typescript",
+					committedSnapshotContent: newContent,
+					changedBlocks: [],
+					addedLines: [],
+					deletedLines: [
+						{
+							deletedIndex: 0,
+							lineNumber: 2,
+							content: "const old1 = 2",
+							lineHash: hashLineFingerprint("const old1 = 2"),
+							occurrenceIndex: 1,
+						},
+						{
+							deletedIndex: 1,
+							lineNumber: 3,
+							content: "const old2 = 3",
+							lineHash: hashLineFingerprint("const old2 = 3"),
+							occurrenceIndex: 1,
+						},
+					],
+				},
+			],
+		})
+
+		const store = (service as any).store
+		const queuedReports = await store.getQueuedReportsForTests()
+		expect(queuedReports).toHaveLength(1)
+		const report = queuedReports[0].report
+		expect(report.changedFiles[0].deletedLines).toEqual([
+			{
+				deletedIndex: 0,
+				lineNumber: 2,
+				content: "const old1 = 2",
+				lineHash: hashLineFingerprint("const old1 = 2"),
+				occurrenceIndex: 1,
+			},
+			{
+				deletedIndex: 1,
+				lineNumber: 3,
+				content: "const old2 = 3",
+				lineHash: hashLineFingerprint("const old2 = 3"),
+				occurrenceIndex: 1,
+			},
+		])
+		const candidateLines = report.candidateLines as AiCodeCommitCandidateLine[]
+		expect(candidateLines).toHaveLength(2)
+		expect(candidateLines[0]).toMatchObject({
+			changeType: "deletion",
+			lineNumber: 2,
+			rawLine: "const old1 = 2",
+			blockLineIndex: 1,
+			blockLineCount: 2,
+			baselineMetricType: "accepted",
+		})
+		expect(candidateLines[1]).toMatchObject({
+			changeType: "deletion",
+			lineNumber: 3,
+			rawLine: "const old2 = 3",
+		})
+		const deletionBlocks = (report.generatedBlocks ?? []).filter((block: any) => block.changeType === "deletion")
+		expect(deletionBlocks).toHaveLength(1)
+		expect(deletionBlocks[0]).toMatchObject({
+			lineStart: 2,
+			lineEnd: 3,
+			lineCount: 2,
+			codeSnippet: "const old1 = 2\nconst old2 = 3",
+		})
+		const acceptedDeletionBlocks = (report.acceptedBlocks ?? []).filter(
+			(block: any) => block.changeType === "deletion",
+		)
+		expect(acceptedDeletionBlocks).toHaveLength(1)
+	})
+
+	it("queues deletion candidates when a function is replaced and another line is edited", async () => {
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const repoDir = await createGitRepo()
+		mockIsGitRepository.mockResolvedValue(true)
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({ enabled: false }))
+		const filePath = path.join(repoDir, "test2.py")
+		const originalContent = [
+			"def add_two_numbers(a, b):",
+			"    return a + b",
+			"",
+			"def subtract_two_numbers(a, b):",
+			'    """Return the difference of two numbers."""',
+			"    return a - b",
+			"",
+			"def divide_two_numbers(a, b):",
+			'    """Return the quotient of two numbers."""',
+			"    return a / b",
+			"",
+		].join("\n")
+		const newContent = [
+			"def add_two_numbers(a, b):",
+			"    return a + b",
+			"",
+			"def multiply_two_numbers(a, b):",
+			'    """Return the product of two numbers."""',
+			"    return a * b",
+			"",
+			"def divide_two_numbers(a, b):",
+			'    """Return the quotint of two numbers."""',
+			"    return a / b",
+			"",
+		].join("\n")
+
+		await service.recordAgentFileWrite({
+			cwd: repoDir,
+			filePath,
+			relativePath: "test2.py",
+			originalContent,
+			newContent,
+			taskId: "task-replace-function",
+		})
+
+		await (service as any).handleCommitCollected({
+			repoRoot: repoDir,
+			branch: "main",
+			commitHash: "commit-replace-function",
+			previousCommit: "commit-prev",
+			commitOccurredAt: Date.now(),
+			changedFiles: [
+				{
+					relativePath: "test2.py",
+					filePath,
+					language: "python",
+					committedSnapshotContent: newContent,
+					changedBlocks: [
+						{
+							startLine: 4,
+							endLine: 6,
+							lineCount: 3,
+							codeSnippet:
+								'def multiply_two_numbers(a, b):\n    """Return the product of two numbers."""\n    return a * b',
+							displayOrder: 1,
+						},
+						{
+							startLine: 9,
+							endLine: 9,
+							lineCount: 1,
+							codeSnippet: '    """Return the quotint of two numbers."""',
+							displayOrder: 2,
+						},
+					],
+					addedLines: [
+						{
+							addedIndex: 0,
+							lineNumber: 4,
+							content: "def multiply_two_numbers(a, b):",
+							lineHash: hashLineFingerprint("def multiply_two_numbers(a, b):"),
+						},
+						{
+							addedIndex: 1,
+							lineNumber: 5,
+							content: '    """Return the product of two numbers."""',
+							lineHash: hashLineFingerprint('    """Return the product of two numbers."""'),
+						},
+						{
+							addedIndex: 2,
+							lineNumber: 6,
+							content: "    return a * b",
+							lineHash: hashLineFingerprint("    return a * b"),
+						},
+						{
+							addedIndex: 3,
+							lineNumber: 9,
+							content: '    """Return the quotint of two numbers."""',
+							lineHash: hashLineFingerprint('    """Return the quotint of two numbers."""'),
+						},
+					],
+					deletedLines: [
+						{
+							deletedIndex: 0,
+							lineNumber: 4,
+							content: "def subtract_two_numbers(a, b):",
+							lineHash: hashLineFingerprint("def subtract_two_numbers(a, b):"),
+							occurrenceIndex: 1,
+						},
+						{
+							deletedIndex: 1,
+							lineNumber: 5,
+							content: '    """Return the difference of two numbers."""',
+							lineHash: hashLineFingerprint('    """Return the difference of two numbers."""'),
+							occurrenceIndex: 1,
+						},
+						{
+							deletedIndex: 2,
+							lineNumber: 6,
+							content: "    return a - b",
+							lineHash: hashLineFingerprint("    return a - b"),
+							occurrenceIndex: 1,
+						},
+						{
+							deletedIndex: 3,
+							lineNumber: 9,
+							content: '    """Return the quotient of two numbers."""',
+							lineHash: hashLineFingerprint('    """Return the quotient of two numbers."""'),
+							occurrenceIndex: 1,
+						},
+					],
+				},
+			],
+		})
+
+		const queuedReports = await (service as any).store.getQueuedReportsForTests()
+		expect(queuedReports).toHaveLength(1)
+		const report = queuedReports[0].report
+		const candidateLines = report.candidateLines as AiCodeCommitCandidateLine[]
+		const deletionCandidates = candidateLines
+			.filter((line) => line.changeType === "deletion")
+			.sort((left, right) => left.lineNumber - right.lineNumber)
+		expect(deletionCandidates).toHaveLength(4)
+		expect(deletionCandidates.map((line) => line.lineNumber)).toEqual([4, 5, 6, 9])
+		expect(deletionCandidates.map((line) => line.rawLine)).toEqual([
+			"def subtract_two_numbers(a, b):",
+			'    """Return the difference of two numbers."""',
+			"    return a - b",
+			'    """Return the quotient of two numbers."""',
+		])
+		const additionCandidates = candidateLines
+			.filter((line) => line.changeType !== "deletion")
+			.sort((left, right) => left.lineNumber - right.lineNumber)
+		expect(additionCandidates).toHaveLength(4)
+		expect(additionCandidates.map((line) => line.rawLine)).toEqual([
+			"def multiply_two_numbers(a, b):",
+			'    """Return the product of two numbers."""',
+			"    return a * b",
+			'    """Return the quotint of two numbers."""',
+		])
+		const deletionBlocks = (report.generatedBlocks ?? []).filter((block: any) => block.changeType === "deletion")
+		expect(deletionBlocks).toHaveLength(2)
+		expect(deletionBlocks.map((block: any) => block.lineStart)).toEqual([4, 9])
+	})
+
 	it("queues duplicate candidate line occurrence facts without client committed attribution fields", async () => {
 		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
 		const repoDir = await createGitRepo()

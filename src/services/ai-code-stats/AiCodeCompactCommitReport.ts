@@ -9,6 +9,7 @@ import {
 	type AiCodeCommitReport,
 	type AiCodeGeneratedBlock,
 	type AiCodeSourceType,
+	type AiCodeStatsSemanticsVersion,
 	type AiCodeStatsUploadClient,
 } from "./types"
 
@@ -55,7 +56,7 @@ export interface AiCodeCompactCommitReport {
 	version: "v3"
 	source: "kilocode-ai-code-stats"
 	mode: "commit_report"
-	semanticsVersion: 1
+	semanticsVersion: AiCodeStatsSemanticsVersion
 	attributionInputVersion?: 1
 	reportId: string
 	reportGeneratedAt: number
@@ -199,6 +200,7 @@ function compactBlock(
 		semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
 		sourceType: block.sourceType,
 		ide: block.ide,
+		changeType: block.changeType,
 		userName: block.userName,
 		departmentName: block.departmentName,
 		officeName: block.officeName,
@@ -241,6 +243,7 @@ function compactChangedFile(
 		committedSnapshotHash: rememberSnapshot(file.committedSnapshotContent) ?? file.committedSnapshotHash,
 		changedBlocks: (file.changedBlocks || []).map((block) => ({ ...block })),
 		addedLines: (file.addedLines || []).map((line) => ({ ...line })),
+		deletedLines: (file.deletedLines || []).map((line) => ({ ...line })),
 	}) as AiCodeCompactChangedFilePayload
 }
 

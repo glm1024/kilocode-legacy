@@ -120,6 +120,72 @@ describe("AiCodeDiffExtractor", () => {
 		).toEqual([])
 	})
 
+	it("extracts deleted blocks for pure deletions with old-file line numbers", () => {
+		const extractor = new AiCodeDiffExtractor()
+		const original = ["keep1", "old1", "old2", "keep2"].join("\n") + "\n"
+		const next = ["keep1", "keep2"].join("\n") + "\n"
+
+		const blocks = extractor.extractDeletedBlocks(original, next, "test.ts")
+		expect(blocks).toEqual([
+			{
+				lineStart: 2,
+				lineEnd: 3,
+				lineCount: 2,
+				codeSnippet: "old1\nold2",
+			},
+		])
+	})
+
+	it("extracts old-side deleted blocks for replacements", () => {
+		const extractor = new AiCodeDiffExtractor()
+		const original = ["keep1", "old", "keep2"].join("\n") + "\n"
+		const next = ["keep1", "new", "keep2"].join("\n") + "\n"
+
+		expect(extractor.extractDeletedBlocks(original, next, "test.ts")).toEqual([
+			{
+				lineStart: 2,
+				lineEnd: 2,
+				lineCount: 1,
+				codeSnippet: "old",
+			},
+		])
+	})
+
+	it("does not extract deleted blocks when only a trailing newline changes", () => {
+		const extractor = new AiCodeDiffExtractor()
+		expect(extractor.extractDeletedBlocks("a\nline2\n", "a\nline2", "test.ts")).toEqual([])
+		expect(extractor.extractDeletedBlocks("a\nline2", "a\nline2", "test.ts")).toEqual([])
+	})
+
+	it("extracts deleted lines from patches with old-side line numbers", () => {
+		const extractor = new AiCodeDiffExtractor()
+		const original = ["keep1", "old1", "old2", "keep2"].join("\n") + "\n"
+		const next = ["keep1", "keep2"].join("\n") + "\n"
+
+		const files = extractor.extractAddedLinesFromPatch(
+			createPatch("test.ts", original, next, "", "", { context: 0 }),
+		)
+		expect(files).toHaveLength(1)
+		expect(files[0].addedLines).toEqual([])
+		expect(files[0].deletedLines).toEqual([
+			{ lineNumber: 2, content: "old1" },
+			{ lineNumber: 3, content: "old2" },
+		])
+	})
+
+	it("extracts both added and deleted lines for replacements in patches", () => {
+		const extractor = new AiCodeDiffExtractor()
+		const original = ["keep1", "old", "keep2"].join("\n") + "\n"
+		const next = ["keep1", "new", "keep2"].join("\n") + "\n"
+
+		const files = extractor.extractAddedLinesFromPatch(
+			createPatch("test.ts", original, next, "", "", { context: 0 }),
+		)
+		expect(files).toHaveLength(1)
+		expect(files[0].addedLines).toEqual([{ lineNumber: 2, content: "new" }])
+		expect(files[0].deletedLines).toEqual([{ lineNumber: 2, content: "old" }])
+	})
+
 	it("keeps replacements on the last line semantic even without a trailing newline", () => {
 		const extractor = new AiCodeDiffExtractor()
 

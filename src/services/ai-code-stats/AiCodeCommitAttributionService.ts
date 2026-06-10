@@ -653,6 +653,19 @@ export class AiCodeCommitAttributionService {
 						lineNumber: line.lineNumber,
 						content: line.content,
 					}))
+					const deletedOccurrenceCounts = new Map<string, number>()
+					const indexedDeletedLines = (file.deletedLines ?? []).map((line, index) => {
+						const lineHash = hashLineFingerprint(line.content)
+						const occurrenceIndex = (deletedOccurrenceCounts.get(lineHash) ?? 0) + 1
+						deletedOccurrenceCounts.set(lineHash, occurrenceIndex)
+						return {
+							deletedIndex: index,
+							lineNumber: line.lineNumber,
+							content: line.content,
+							lineHash,
+							occurrenceIndex,
+						}
+					})
 
 					const normalizedRelativePath = normalizePath(file.filePath)
 					const fileSnapshotPromise =
@@ -682,6 +695,7 @@ export class AiCodeCommitAttributionService {
 							content: line.content,
 							lineHash: hashLineFingerprint(line.content),
 						})),
+						deletedLines: indexedDeletedLines,
 					})
 				}
 			}

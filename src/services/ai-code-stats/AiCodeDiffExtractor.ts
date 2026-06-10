@@ -106,6 +106,10 @@ export class AiCodeDiffExtractor {
 	}
 
 	extractDeletedBlocks(originalContent: string, finalContent: string, filePath: string): AiCodeAddedCodeBlock[] {
+		if (this.isOnlyTrailingNewlineChange(originalContent, finalContent)) {
+			return []
+		}
+
 		const patch = createPatch(
 			filePath,
 			this.normalizeEol(originalContent),
@@ -125,28 +129,57 @@ export class AiCodeDiffExtractor {
 		for (const filePatch of parsed) {
 			for (const hunk of filePatch.hunks || []) {
 				for (const semanticHunk of this.buildSemanticHunks(hunk.oldStart, hunk.newStart, hunk.lines || [])) {
-					if (semanticHunk.oldLines <= 0 || semanticHunk.newLines !== 0) {
+					if (semanticHunk.oldLines <= 0) {
 						continue
 					}
 
-					const deletedLines = semanticHunk.lines
-						.filter((diffLine) => diffLine.startsWith("-") && !diffLine.startsWith("---"))
-						.map((diffLine) => diffLine.slice(1))
-					if (deletedLines.length === 0) {
-						continue
+					let oldLineCursor = semanticHunk.oldStart
+					let currentBlock: { lineStart: number; lines: string[] } | null = null
+
+					const flushCurrentBlock = () => {
+						if (!currentBlock || currentBlock.lines.length === 0) {
+							currentBlock = null
+							return
+						}
+						const lineCount = currentBlock.lines.length
+						blocks.push({
+							lineStart: currentBlock.lineStart,
+							lineEnd: currentBlock.lineStart + lineCount - 1,
+							lineCount,
+							codeSnippet: currentBlock.lines.join("\n"),
+						})
+						currentBlock = null
 					}
 
-					blocks.push({
-						lineStart: semanticHunk.oldStart,
-						lineEnd: semanticHunk.oldStart + deletedLines.length - 1,
-						lineCount: deletedLines.length,
-						codeSnippet: deletedLines.join("\n"),
-					})
+					for (const diffLine of semanticHunk.lines) {
+						if (diffLine.startsWith("-") && !diffLine.startsWith("---")) {
+							if (!currentBlock) {
+								currentBlock = { lineStart: oldLineCursor, lines: [] }
+							}
+							currentBlock.lines.push(diffLine.slice(1))
+							oldLineCursor++
+							continue
+						}
+
+						flushCurrentBlock()
+						if (diffLine.startsWith(" ")) {
+							oldLineCursor++
+						}
+					}
+
+					flushCurrentBlock()
 				}
 			}
 		}
 
 		return blocks
+	}
+
+	private isOnlyTrailingNewlineChange(originalContent: string, finalContent: string): boolean {
+		return (
+			(originalContent.endsWith("\n") && originalContent.slice(0, -1) === finalContent) ||
+			(finalContent.endsWith("\n") && finalContent.slice(0, -1) === originalContent)
+		)
 	}
 
 	extractAddedLinesFromPatch(patchContent: string): AiCodePatchFile[] {
@@ -165,11 +198,13 @@ export class AiCodeDiffExtractor {
 			}
 
 			const addedLines: AiCodePatchFile["addedLines"] = []
+			const deletedLines: AiCodePatchFile["deletedLines"] = []
 			const changedBlocks: AiCodeCommitChangedBlock[] = []
 			let displayOrder = 1
 			for (const hunk of filePatch.hunks || []) {
 				for (const semanticHunk of this.buildSemanticHunks(hunk.oldStart, hunk.newStart, hunk.lines || [])) {
 					let newLineCursor = semanticHunk.newStart
+					let oldLineCursor = semanticHunk.oldStart
 					let currentBlock: { startLine: number; lines: string[] } | null = null
 
 					const flushCurrentBlock = () => {
@@ -208,8 +243,18 @@ export class AiCodeDiffExtractor {
 
 						flushCurrentBlock()
 
+						if (diffLine.startsWith("-") && !diffLine.startsWith("---")) {
+							deletedLines.push({
+								lineNumber: oldLineCursor,
+								content: diffLine.slice(1),
+							})
+							oldLineCursor++
+							continue
+						}
+
 						if (diffLine.startsWith(" ")) {
 							newLineCursor++
+							oldLineCursor++
 						}
 					}
 
@@ -217,7 +262,7 @@ export class AiCodeDiffExtractor {
 				}
 			}
 
-			if (addedLines.length === 0) {
+			if (addedLines.length === 0 && deletedLines.length === 0) {
 				continue
 			}
 
@@ -225,6 +270,7 @@ export class AiCodeDiffExtractor {
 				filePath,
 				previousFilePath,
 				addedLines,
+				deletedLines,
 				changedBlocks,
 			})
 		}

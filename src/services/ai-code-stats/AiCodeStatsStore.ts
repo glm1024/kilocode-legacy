@@ -136,6 +136,10 @@ export class AiCodeStatsStore {
 					(total, file) => total + (file.addedLines?.length ?? 0),
 					0,
 				),
+				deletedLineCount: (normalizedReport.report.changedFiles ?? []).reduce(
+					(total, file) => total + (file.deletedLines?.length ?? 0),
+					0,
+				),
 			})
 			await this.persistGeneratedBlocks()
 			await this.persistPendingCommitMetricBlocks()
@@ -1053,6 +1057,7 @@ export class AiCodeStatsStore {
 				typeof record.candidateBlockCount === "number" ? record.candidateBlockCount : undefined,
 			changedFileCount: typeof record.changedFileCount === "number" ? record.changedFileCount : undefined,
 			addedLineCount: typeof record.addedLineCount === "number" ? record.addedLineCount : undefined,
+			deletedLineCount: typeof record.deletedLineCount === "number" ? record.deletedLineCount : undefined,
 			repoName: record.repoName,
 			createdAt: typeof record.createdAt === "number" ? record.createdAt : now,
 			updatedAt: typeof record.updatedAt === "number" ? record.updatedAt : now,
@@ -1323,6 +1328,23 @@ export class AiCodeStatsStore {
 									? line.lineHash
 									: hashLineFingerprint(typeof line.content === "string" ? line.content : ""),
 						})),
+						deletedLines: (file.deletedLines ?? []).map((line, index) => ({
+							deletedIndex:
+								typeof line.deletedIndex === "number" && line.deletedIndex >= 0
+									? line.deletedIndex
+									: index,
+							lineNumber:
+								typeof line.lineNumber === "number" && line.lineNumber > 0 ? line.lineNumber : 1,
+							content: typeof line.content === "string" ? line.content : "",
+							lineHash:
+								typeof line.lineHash === "string" && line.lineHash.trim()
+									? line.lineHash
+									: hashLineFingerprint(typeof line.content === "string" ? line.content : ""),
+							occurrenceIndex:
+								typeof line.occurrenceIndex === "number" && line.occurrenceIndex > 0
+									? line.occurrenceIndex
+									: 1,
+						})),
 					}
 				}),
 				candidateLines: (report.report.candidateLines ?? []).map((line, index) => {
@@ -1383,6 +1405,7 @@ export class AiCodeStatsStore {
 							typeof line.occurrenceIndex === "number" && line.occurrenceIndex > 0
 								? line.occurrenceIndex
 								: 1,
+						changeType: line.changeType === "deletion" ? "deletion" : undefined,
 					}
 				}),
 			},
