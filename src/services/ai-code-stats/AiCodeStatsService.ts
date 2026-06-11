@@ -24,6 +24,7 @@ import {
 } from "./AiCodeStatsUploadDiagnostics"
 import {
 	AiCodeStatsUploader,
+	type AiCodeCommitLifecycleUploadResult,
 	type AiCodeCommitReportUploadResult,
 	type AiCodeStatsUploadResult,
 } from "./AiCodeStatsUploader"
@@ -34,6 +35,7 @@ import {
 	normalizePath,
 	type AiCodeAddedCodeBlock,
 	type AiCodeCommitCandidateLine,
+	type AiCodeCommitLifecycleReport,
 	type AiCodeCommitReport,
 	type AiCodeCommitServerStatus,
 	type AiCodeCommitUploadRecord,
@@ -240,6 +242,9 @@ export class AiCodeStatsService {
 		this.commitAttributionService = new AiCodeCommitAttributionService(this.store, {
 			onCommitCollected: async (payload) => {
 				await this.handleCommitCollected(payload)
+			},
+			onCommitLifecycleObserved: async (payload) => {
+				await this.handleCommitLifecycleObserved(payload)
 			},
 		})
 		// kilocode_change start
@@ -1545,6 +1550,34 @@ export class AiCodeStatsService {
 		}
 	}
 
+	private async handleCommitLifecycleObserved(payload: AiCodeCommitLifecycleReport): Promise<void> {
+		const createdAt = Date.now()
+		await this.store.queueCommitLifecycleReport({
+			report: {
+				...payload,
+				client: payload.client ?? this.buildUploadClient(),
+				reportedAt: payload.reportedAt || createdAt,
+			},
+			createdAt,
+		})
+		await this.store.appendDiagnosticEvent({
+			type: "lifecycle_report_queued",
+			commitHash: payload.oldCommitHash ?? payload.newCommitHash ?? payload.commitHashes?.[0],
+			reportId: payload.reportId,
+			repoRoot: payload.repoRoot,
+			status: "queued",
+			details: {
+				eventId: payload.eventId,
+				eventType: payload.eventType,
+				reason: payload.reason,
+				confidence: payload.confidence,
+				commitHashes: payload.commitHashes,
+				replacementCommitHashes: payload.replacementCommitHashes,
+			},
+		})
+		await this.requestCommitTriggeredUpload()
+	}
+
 	private async selectCommitCandidateBlocks(payload: AiCodeCommitFactsPayload): Promise<CommitCandidateSelection> {
 		const changedPathSet = this.buildCommitChangedPathSet(payload)
 		const addedLineHashesByPath = this.buildChangedLineHashesByPath(payload, "addition")
@@ -2468,6 +2501,62 @@ export class AiCodeStatsService {
 				},
 			)
 
+			let lifecycleUploadResult: AiCodeCommitLifecycleUploadResult = {
+				uploadedReports: 0,
+				failedReports: 0,
+				failedReportErrors: [],
+				rawPayloadBytes: 0,
+				compressedPayloadBytes: 0,
+				timeoutMs: 0,
+			}
+			let lifecycleUploadError: string | undefined
+			try {
+				lifecycleUploadResult = await this.uploader.uploadQueuedLifecycleReports(settings)
+			} catch (error) {
+				lifecycleUploadError = error instanceof Error ? error.message : String(error)
+			}
+			if (lifecycleUploadError) {
+				await this.store.appendDiagnosticEvent({
+					type: "lifecycle_upload_failed",
+					status: "upload_failed",
+					message: lifecycleUploadError,
+					details: {
+						trigger,
+						action,
+						...this.mergeFailureDiagnostics(
+							buildUploadFailureDiagnostics(lifecycleUploadError),
+							uploadTargetDetails,
+						),
+					},
+				})
+			}
+			for (const failure of lifecycleUploadResult.failedReportErrors) {
+				const baseFailureDiagnostics = buildUploadFailureDiagnostics(failure.message)
+				const failureDiagnostics = this.mergeFailureDiagnostics(
+					{
+						...baseFailureDiagnostics,
+						errorCategory: failure.errorCategory ?? baseFailureDiagnostics.errorCategory,
+						userMessage: failure.userMessage ?? baseFailureDiagnostics.userMessage,
+						targetProtocol: failure.targetProtocol,
+						targetHost: failure.targetHost,
+						targetPath: failure.targetPath,
+					},
+					uploadTargetDetails,
+				)
+				await this.store.appendDiagnosticEvent({
+					type: "lifecycle_upload_failed",
+					commitHash: failure.commitHash,
+					reportId: failure.reportId,
+					status: "upload_failed",
+					message: failure.message,
+					details: {
+						trigger,
+						action,
+						...failureDiagnostics,
+					},
+				})
+			}
+
 			let eventUploadResult: AiCodeStatsUploadResult = { uploaded: 0 }
 			let eventUploadError: string | undefined
 			try {
@@ -2492,11 +2581,19 @@ export class AiCodeStatsService {
 				})
 			}
 
-			const failedReports = reportUploadResult.failedReports + (reportUploadError ? 1 : 0)
+			const failedReports =
+				reportUploadResult.failedReports +
+				lifecycleUploadResult.failedReports +
+				(reportUploadError ? 1 : 0) +
+				(lifecycleUploadError ? 1 : 0)
 			const failureMessages = [
 				reportUploadError,
 				reportUploadResult.failedReportErrors.length > 0
 					? `${reportUploadResult.failedReportErrors.length} queued commit report(s) failed`
+					: undefined,
+				lifecycleUploadError,
+				lifecycleUploadResult.failedReportErrors.length > 0
+					? `${lifecycleUploadResult.failedReportErrors.length} queued lifecycle report(s) failed`
 					: undefined,
 				eventUploadError ? `AI code stats upload failed: ${eventUploadError}` : undefined,
 			].filter((message): message is string => Boolean(message))
@@ -2504,15 +2601,19 @@ export class AiCodeStatsService {
 				status: failureMessages.length > 0 ? "failed" : "success",
 				timestamp: Date.now(),
 				uploadedEvents: reportUploadResult.uploadedBlocks + eventUploadResult.uploaded,
-				uploadedReports: reportUploadResult.uploadedReports,
+				uploadedReports: reportUploadResult.uploadedReports + lifecycleUploadResult.uploadedReports,
 				failedReports,
-				failedReportErrors: reportUploadResult.failedReportErrors,
+				failedReportErrors: [
+					...reportUploadResult.failedReportErrors,
+					...lifecycleUploadResult.failedReportErrors,
+				],
 				eventUploadFailed: Boolean(eventUploadError),
 				eventUploadError,
 				message: failureMessages.length > 0 ? failureMessages.join("; ") : undefined,
-				rawPayloadBytes: reportUploadResult.rawPayloadBytes,
-				compressedPayloadBytes: reportUploadResult.compressedPayloadBytes,
-				timeoutMs: reportUploadResult.timeoutMs,
+				rawPayloadBytes: reportUploadResult.rawPayloadBytes + lifecycleUploadResult.rawPayloadBytes,
+				compressedPayloadBytes:
+					reportUploadResult.compressedPayloadBytes + lifecycleUploadResult.compressedPayloadBytes,
+				timeoutMs: Math.max(reportUploadResult.timeoutMs, lifecycleUploadResult.timeoutMs),
 				mode: "incremental",
 				trigger,
 			}

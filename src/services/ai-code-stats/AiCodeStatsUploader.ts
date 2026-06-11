@@ -12,6 +12,7 @@ import {
 	CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
 	normalizePath,
 	normalizeUserEmail,
+	type AiCodeCommitLifecycleReport,
 	type AiCodeCommitServerStatus,
 	type AiCodeStatsFailedReportUpload,
 	type AiCodeStatsUploadClient,
@@ -32,6 +33,15 @@ export interface AiCodeStatsUploadResult {
 export interface AiCodeCommitReportUploadResult {
 	uploadedReports: number
 	uploadedBlocks: number
+	failedReports: number
+	failedReportErrors: AiCodeStatsFailedReportUpload[]
+	rawPayloadBytes: number
+	compressedPayloadBytes: number
+	timeoutMs: number
+}
+
+export interface AiCodeCommitLifecycleUploadResult {
+	uploadedReports: number
 	failedReports: number
 	failedReportErrors: AiCodeStatsFailedReportUpload[]
 	rawPayloadBytes: number
@@ -194,6 +204,89 @@ export class AiCodeStatsUploader {
 		}
 	}
 
+	async uploadQueuedLifecycleReports(
+		settings: AiCodeStatsUploadSettings,
+	): Promise<AiCodeCommitLifecycleUploadResult> {
+		if (!settings.webhookUrl?.trim()) {
+			return this.emptyCommitLifecycleUploadResult()
+		}
+		const fallbackUserEmail = normalizeUserEmail(settings.userEmail)
+		if (!fallbackUserEmail) {
+			return this.emptyCommitLifecycleUploadResult()
+		}
+
+		const webhookUrl = resolveAiCodeStatsWebhookUrl(settings.webhookUrl)
+		const reports = await this.store.getQueuedCommitLifecycleReports()
+		let uploadedReports = 0
+		let rawPayloadBytes = 0
+		let compressedPayloadBytes = 0
+		let timeoutMs = 0
+		const failedReportErrors: AiCodeStatsFailedReportUpload[] = []
+
+		for (const queued of reports) {
+			const payload = this.normalizeLifecyclePayloadForUpload(queued.report)
+			const prepared = await this.prepareJsonPayload(payload)
+			rawPayloadBytes += prepared.rawPayloadBytes
+			compressedPayloadBytes += prepared.compressedPayloadBytes
+			timeoutMs = Math.max(timeoutMs, prepared.timeoutMs)
+			const commitHash = this.lifecycleReportCommitHash(payload)
+			try {
+				await this.postPreparedJson(
+					webhookUrl,
+					prepared,
+					{
+						reportId: payload.reportId,
+						commitHash,
+					},
+					"AI code commit lifecycle upload failed",
+				)
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error)
+				const diagnostics = buildUploadFailureDiagnostics(message, webhookUrl)
+				failedReportErrors.push({
+					reportId: payload.reportId,
+					commitHash,
+					rawPayloadBytes: prepared.rawPayloadBytes,
+					compressedPayloadBytes: prepared.compressedPayloadBytes,
+					encoding: prepared.contentEncoding,
+					timeoutMs: prepared.timeoutMs,
+					message,
+					...diagnostics,
+				})
+				continue
+			}
+			await this.store.acknowledgeQueuedCommitLifecycleReport(payload.eventId)
+			await this.store.appendDiagnosticEvent({
+				type: "lifecycle_upload_succeeded",
+				commitHash,
+				reportId: payload.reportId,
+				repoRoot: payload.repoRoot,
+				status: "uploaded",
+				details: {
+					eventId: payload.eventId,
+					eventType: payload.eventType,
+					reason: payload.reason,
+					confidence: payload.confidence,
+					rawPayloadBytes: prepared.rawPayloadBytes,
+					compressedPayloadBytes: prepared.compressedPayloadBytes,
+					timeoutMs: prepared.timeoutMs,
+					encoding: prepared.contentEncoding,
+					...summarizeUploadTarget(webhookUrl),
+				},
+			})
+			uploadedReports += 1
+		}
+
+		return {
+			uploadedReports,
+			failedReports: failedReportErrors.length,
+			failedReportErrors,
+			rawPayloadBytes,
+			compressedPayloadBytes,
+			timeoutMs,
+		}
+	}
+
 	async queryCommitStatuses(
 		settings: AiCodeStatsUploadSettings,
 		query: AiCodeCommitServerStatusQuery,
@@ -240,6 +333,38 @@ export class AiCodeStatsUploader {
 			compressedPayloadBytes: 0,
 			timeoutMs: 0,
 		}
+	}
+
+	private emptyCommitLifecycleUploadResult(): AiCodeCommitLifecycleUploadResult {
+		return {
+			uploadedReports: 0,
+			failedReports: 0,
+			failedReportErrors: [],
+			rawPayloadBytes: 0,
+			compressedPayloadBytes: 0,
+			timeoutMs: 0,
+		}
+	}
+
+	private normalizeLifecyclePayloadForUpload(report: AiCodeCommitLifecycleReport): AiCodeCommitLifecycleReport {
+		return {
+			...report,
+			repoRoot: normalizePath(report.repoRoot),
+			commitHashes: report.commitHashes ? [...new Set(report.commitHashes.filter(Boolean))] : undefined,
+			replacementCommitHashes: report.replacementCommitHashes
+				? [...new Set(report.replacementCommitHashes.filter(Boolean))]
+				: undefined,
+		}
+	}
+
+	private lifecycleReportCommitHash(report: AiCodeCommitLifecycleReport): string {
+		return (
+			report.oldCommitHash ||
+			report.newCommitHash ||
+			report.commitHashes?.[0] ||
+			report.replacementCommitHashes?.[0] ||
+			"commit_lifecycle"
+		)
 	}
 
 	private async postJson(webhookUrl: string, payload: unknown, errorPrefix: string): Promise<void> {

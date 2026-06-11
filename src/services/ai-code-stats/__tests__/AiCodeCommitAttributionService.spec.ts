@@ -214,7 +214,7 @@ describe("AiCodeCommitAttributionService", () => {
 		])
 		expect(await store.getPendingLineAttributions("/repo")).toHaveLength(2)
 		expect(onCommitComparisonCompleted).toHaveBeenCalledTimes(1)
-		expect(await store.getRepoObservedCommit("/repo")).toBe("def456")
+		expect(await store.getRepoObservedCommit("/repo", "feature/stats")).toBe("def456")
 	})
 
 	it("reports manual-only files while preserving candidate facts locally", async () => {
@@ -297,8 +297,127 @@ describe("AiCodeCommitAttributionService", () => {
 		})
 
 		expect(onCommitComparisonCompleted).not.toHaveBeenCalled()
-		expect(await store.getRepoObservedCommit("/repo")).toBe("head-1")
+		expect(await store.getRepoObservedCommit("/repo", "feature/stats")).toBe("head-1")
 		expect(await store.getPendingLineAttributions("/repo")).toHaveLength(1)
+	})
+
+	it("observes amend rewrite as a strong commit_replaced lifecycle report", async () => {
+		const onCommitLifecycleObserved = vi.fn(async (_payload: any) => {})
+		await store.addPendingLineAttributions([buildPendingLine()])
+		await store.setRepoObservedCommit("/repo", "old-amend", "feature/stats")
+		const service = createService({
+			onCommitLifecycleObserved,
+			getCurrentCommitSha: async () => "new-amend",
+			isAncestor: async (_repoRoot, olderCommit, newerCommit) => {
+				if (olderCommit === "old-amend" && newerCommit === "new-amend") {
+					return false
+				}
+				if (olderCommit === "new-amend" && newerCommit === "old-amend") {
+					return false
+				}
+				return true
+			},
+			loadCommitParent: async (_repoRoot, commitHash) =>
+				commitHash === "old-amend" || commitHash === "new-amend" ? "same-parent" : undefined,
+		})
+
+		await service.start()
+
+		await vi.waitFor(() => {
+			expect(onCommitLifecycleObserved).toHaveBeenCalledTimes(1)
+		})
+		expect(onCommitLifecycleObserved.mock.calls[0][0]).toMatchObject({
+			mode: "commit_lifecycle",
+			eventType: "commit_replaced",
+			reason: "amend",
+			confidence: "strong",
+			repoRoot: "/repo",
+			projectKey: "repo",
+			projectName: "repo",
+			gitRemoteUrl: "git@example.com:acme/repo.git",
+			gitBranch: "feature/stats",
+			oldCommitHash: "old-amend",
+			newCommitHash: "new-amend",
+			commitHashes: ["old-amend"],
+			replacementCommitHashes: ["new-amend"],
+		})
+		expect(onCommitLifecycleObserved.mock.calls[0][0].eventId).toMatch(/^lifecycle-/)
+	})
+
+	it("observes reset rewrite as a strong commits_abandoned lifecycle report", async () => {
+		const onCommitLifecycleObserved = vi.fn(async (_payload: any) => {})
+		await store.addPendingLineAttributions([buildPendingLine()])
+		await store.setRepoObservedCommit("/repo", "old-reset-tip", "feature/stats")
+		const service = createService({
+			onCommitLifecycleObserved,
+			getCurrentCommitSha: async () => "reset-base",
+			isAncestor: async (_repoRoot, olderCommit, newerCommit) => {
+				if (olderCommit === "old-reset-tip" && newerCommit === "reset-base") {
+					return false
+				}
+				if (olderCommit === "reset-base" && newerCommit === "old-reset-tip") {
+					return true
+				}
+				return false
+			},
+			listCommitsBetween: async (_repoRoot, fromExclusive, toInclusive) =>
+				fromExclusive === "reset-base" && toInclusive === "old-reset-tip"
+					? ["old-reset-a", "old-reset-tip"]
+					: [],
+		})
+
+		await service.start()
+
+		await vi.waitFor(() => {
+			expect(onCommitLifecycleObserved).toHaveBeenCalledTimes(1)
+		})
+		expect(onCommitLifecycleObserved.mock.calls[0][0]).toMatchObject({
+			mode: "commit_lifecycle",
+			eventType: "commits_abandoned",
+			reason: "reset",
+			confidence: "strong",
+			oldCommitHash: "old-reset-a",
+			commitHashes: ["old-reset-a", "old-reset-tip"],
+			replacementCommitHashes: [],
+		})
+		expect(await store.getRepoObservedCommit("/repo", "feature/stats")).toBe("reset-base")
+	})
+
+	it("observes non-fast-forward branch rewrite as weak diagnostic lifecycle report", async () => {
+		const onCommitLifecycleObserved = vi.fn(async (_payload: any) => {})
+		await store.addPendingLineAttributions([buildPendingLine()])
+		await store.setRepoObservedCommit("/repo", "old-rewrite-tip", "feature/stats")
+		const service = createService({
+			onCommitLifecycleObserved,
+			getCurrentCommitSha: async () => "new-rewrite-tip",
+			isAncestor: async () => false,
+			loadCommitParent: async (_repoRoot, commitHash) =>
+				commitHash === "old-rewrite-tip" ? "old-parent" : "new-parent",
+			mergeBase: async () => "rewrite-base",
+			listCommitsBetween: async (_repoRoot, fromExclusive, toInclusive) => {
+				if (fromExclusive === "rewrite-base" && toInclusive === "old-rewrite-tip") {
+					return ["old-rewrite-a", "old-rewrite-tip"]
+				}
+				if (fromExclusive === "rewrite-base" && toInclusive === "new-rewrite-tip") {
+					return ["new-rewrite-a", "new-rewrite-tip"]
+				}
+				return []
+			},
+		})
+
+		await service.start()
+
+		await vi.waitFor(() => {
+			expect(onCommitLifecycleObserved).toHaveBeenCalledTimes(1)
+		})
+		expect(onCommitLifecycleObserved.mock.calls[0][0]).toMatchObject({
+			mode: "commit_lifecycle",
+			eventType: "branch_rewrite_observed",
+			reason: "rewrite_unknown",
+			confidence: "weak",
+			commitHashes: ["old-rewrite-a", "old-rewrite-tip"],
+			replacementCommitHashes: ["new-rewrite-a", "new-rewrite-tip"],
+		})
 	})
 
 	it("loads large commit diffs per file instead of hitting the old 16MB git buffer", async () => {
@@ -366,7 +485,7 @@ describe("AiCodeCommitAttributionService", () => {
 
 		expect(onCommitCollected).not.toHaveBeenCalled()
 		expect(onCommitComparisonCompleted).not.toHaveBeenCalled()
-		expect(await store.getRepoObservedCommit("/repo")).toBe("head-1")
+		expect(await store.getRepoObservedCommit("/repo", "feature/stats")).toBe("head-1")
 		expect(await store.getPendingLineAttributions("/repo")).toHaveLength(1)
 	})
 })

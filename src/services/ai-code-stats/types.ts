@@ -1,3 +1,5 @@
+import type { AiCodeUploadErrorCategory } from "./AiCodeStatsUploadDiagnostics"
+
 export type AiCodeSourceType = "agent_insert"
 export type AiCodeIde = string
 export type AiCodeMetricType = "generated" | "accepted"
@@ -225,6 +227,41 @@ export interface AiCodeQueuedCommitReport {
 	generatedBlockIds: string[]
 }
 
+export type AiCodeCommitLifecycleEventType = "commit_replaced" | "commits_abandoned" | "branch_rewrite_observed"
+
+export type AiCodeCommitLifecycleReason = "amend" | "reset" | "rebase" | "squash" | "cherry_pick" | "rewrite_unknown"
+
+export type AiCodeCommitLifecycleConfidence = "strong" | "weak"
+
+export interface AiCodeCommitLifecycleReport {
+	version: "v1"
+	source: "kilocode-ai-code-stats"
+	mode: "commit_lifecycle"
+	semanticsVersion?: AiCodeStatsSemanticsVersion
+	eventId: string
+	reportId: string
+	eventOccurredAt: number
+	reportedAt: number
+	client?: AiCodeStatsUploadClient
+	repoRoot: string
+	projectKey?: string
+	projectName?: string
+	gitRemoteUrl?: string
+	gitBranch?: string
+	eventType: AiCodeCommitLifecycleEventType
+	reason: AiCodeCommitLifecycleReason
+	confidence: AiCodeCommitLifecycleConfidence
+	oldCommitHash?: string
+	newCommitHash?: string
+	commitHashes?: string[]
+	replacementCommitHashes?: string[]
+}
+
+export interface AiCodeQueuedCommitLifecycleReport {
+	report: AiCodeCommitLifecycleReport
+	createdAt: number
+}
+
 export type AiCodePendingCommitMetricBlock = AiCodeGeneratedBlock
 
 export type AiCodeCommitUploadStatus =
@@ -290,6 +327,9 @@ export interface AiCodeCommitServerStatus {
 	receivedAt?: string | number | null
 	reportId?: string | null
 	message?: string | null
+	lifecycleStatus?: "active" | "superseded" | "abandoned" | "unknown" | string
+	inactiveReason?: string | null
+	supersededByCommitHash?: string | null
 }
 
 export interface AiCodeStatsFailedReportUpload {
@@ -300,7 +340,7 @@ export interface AiCodeStatsFailedReportUpload {
 	encoding?: "gzip" | "identity" | string
 	timeoutMs?: number
 	message: string
-	errorCategory?: string
+	errorCategory?: AiCodeUploadErrorCategory
 	userMessage?: string
 	targetProtocol?: string
 	targetHost?: string

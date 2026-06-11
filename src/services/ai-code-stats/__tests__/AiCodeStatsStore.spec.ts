@@ -10,6 +10,7 @@ import { hashLineFingerprint } from "../AiCodeLineFingerprint"
 import {
 	CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
 	type AiCodePendingLineAttribution,
+	type AiCodeQueuedCommitLifecycleReport,
 	type AiCodeQueuedCommitReport,
 } from "../types"
 
@@ -62,6 +63,34 @@ const buildQueuedReport = (overrides: Partial<AiCodeQueuedCommitReport> = {}): A
 	},
 	createdAt: overrides.createdAt ?? Date.now(),
 	generatedBlockIds: overrides.generatedBlockIds ?? [],
+})
+
+const buildQueuedLifecycleReport = (
+	overrides: Partial<AiCodeQueuedCommitLifecycleReport> = {},
+): AiCodeQueuedCommitLifecycleReport => ({
+	report: overrides.report ?? {
+		version: "v1",
+		source: "kilocode-ai-code-stats",
+		mode: "commit_lifecycle",
+		semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
+		eventId: "lifecycle-1",
+		reportId: "report-lifecycle-1",
+		eventOccurredAt: Date.now(),
+		reportedAt: Date.now(),
+		client: { ide: "vscode" },
+		repoRoot: "/repo",
+		projectKey: "project-key",
+		projectName: "repo",
+		gitBranch: "feature/stats",
+		eventType: "commit_replaced",
+		reason: "amend",
+		confidence: "strong",
+		oldCommitHash: "old-commit",
+		newCommitHash: "new-commit",
+		commitHashes: ["old-commit"],
+		replacementCommitHashes: ["new-commit"],
+	},
+	createdAt: overrides.createdAt ?? Date.now(),
 })
 
 describe("AiCodeStatsStore", () => {
@@ -174,10 +203,40 @@ describe("AiCodeStatsStore", () => {
 
 		await store.addPendingLineAttributions([pendingLine])
 		await store.setRepoObservedCommit("/repo", "abc123")
+		await store.setRepoObservedCommit("/repo", "branch-a-tip", "feature/a")
+		await store.setRepoObservedCommit("/repo", "branch-b-tip", "feature/b")
 		expect(await store.getRepoObservedCommit("/repo")).toBe("abc123")
+		expect(await store.getRepoObservedCommit("/repo", "feature/a")).toBe("branch-a-tip")
+		expect(await store.getRepoObservedCommit("/repo", "feature/b")).toBe("branch-b-tip")
 
 		await store.removePendingLineAttributions(["line-1"])
 		expect(await store.getRepoObservedCommit("/repo")).toBeUndefined()
+		expect(await store.getRepoObservedCommit("/repo", "feature/a")).toBeUndefined()
+		expect(await store.getRepoObservedCommit("/repo", "feature/b")).toBeUndefined()
+	})
+
+	it("queues and acknowledges commit lifecycle reports independently from commit reports", async () => {
+		await store.queueCommitReport(buildQueuedReport())
+		await store.queueCommitLifecycleReport(buildQueuedLifecycleReport())
+		await store.queueCommitLifecycleReport(buildQueuedLifecycleReport())
+
+		expect(await store.getQueuedReportsForTests()).toHaveLength(1)
+		const lifecycleReports = await store.getQueuedCommitLifecycleReportsForTests()
+		expect(lifecycleReports).toHaveLength(1)
+		expect(lifecycleReports[0].report).toMatchObject({
+			mode: "commit_lifecycle",
+			eventId: "lifecycle-1",
+			eventType: "commit_replaced",
+			reason: "amend",
+			confidence: "strong",
+			commitHashes: ["old-commit"],
+			replacementCommitHashes: ["new-commit"],
+		})
+
+		await store.acknowledgeQueuedCommitLifecycleReport("lifecycle-1")
+
+		expect(await store.getQueuedCommitLifecycleReportsForTests()).toEqual([])
+		expect(await store.getQueuedReportsForTests()).toHaveLength(1)
 	})
 
 	it("keeps pending lines while a queued report is waiting and after acknowledgement", async () => {

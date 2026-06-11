@@ -1,5 +1,6 @@
 // kilocode_change - new file
 
+import crypto from "crypto"
 import { exec as execCallback, spawn } from "child_process"
 import * as path from "path"
 import { promisify } from "util"
@@ -9,7 +10,16 @@ import { getCurrentBranch, isDetachedHead } from "../code-index/managed/git-util
 import { AiCodeDiffExtractor } from "./AiCodeDiffExtractor"
 import { hashLineFingerprint } from "./AiCodeLineFingerprint"
 import { AiCodeStatsStore } from "./AiCodeStatsStore"
-import { normalizePath, type AiCodeCommitChangedFile, type AiCodePendingLineAttribution } from "./types"
+import {
+	CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
+	normalizePath,
+	type AiCodeCommitChangedFile,
+	type AiCodeCommitLifecycleConfidence,
+	type AiCodeCommitLifecycleEventType,
+	type AiCodeCommitLifecycleReason,
+	type AiCodeCommitLifecycleReport,
+	type AiCodePendingLineAttribution,
+} from "./types"
 
 const execAsync = promisify(execCallback)
 const EXEC_MAX_BUFFER_BYTES = 16 * 1024 * 1024
@@ -38,7 +48,10 @@ export interface AiCodeCommitAttributionServiceOptions {
 	isAncestor?: (repoRoot: string, olderCommit: string, newerCommit: string) => Promise<boolean>
 	listCommitsBetween?: (repoRoot: string, fromExclusive: string, toInclusive: string) => Promise<string[]>
 	listCommitsSinceTimestamp?: (repoRoot: string, sinceTs: number) => Promise<string[]>
+	loadCommitParent?: (repoRoot: string, commitHash: string) => Promise<string | undefined>
+	mergeBase?: (repoRoot: string, leftCommit: string, rightCommit: string) => Promise<string | undefined>
 	onCommitCollected?: (payload: AiCodeCommitFactsPayload) => Promise<void>
+	onCommitLifecycleObserved?: (payload: AiCodeCommitLifecycleReport) => Promise<void>
 	onCommitComparisonCompleted?: () => Promise<void>
 }
 
@@ -225,6 +238,28 @@ const defaultListCommitsSinceTimestamp = async (repoRoot: string, sinceTs: numbe
 	return splitGitOutputLines(stdout)
 }
 
+const defaultLoadCommitParent = async (repoRoot: string, commitHash: string): Promise<string | undefined> => {
+	try {
+		const stdout = await runGitStdout(repoRoot, ["rev-parse", `${commitHash}^`])
+		return stdout.trim() || undefined
+	} catch {
+		return undefined
+	}
+}
+
+const defaultMergeBase = async (
+	repoRoot: string,
+	leftCommit: string,
+	rightCommit: string,
+): Promise<string | undefined> => {
+	try {
+		const stdout = await runGitStdout(repoRoot, ["merge-base", leftCommit, rightCommit])
+		return stdout.trim() || undefined
+	} catch {
+		return undefined
+	}
+}
+
 const LANGUAGE_BY_EXTENSION: Record<string, string> = {
 	".js": "javascript",
 	".jsx": "javascript",
@@ -304,7 +339,14 @@ export class AiCodeCommitAttributionService {
 		toInclusive: string,
 	) => Promise<string[]>
 	private readonly listCommitsSinceTimestamp: (repoRoot: string, sinceTs: number) => Promise<string[]>
+	private readonly loadCommitParent: (repoRoot: string, commitHash: string) => Promise<string | undefined>
+	private readonly mergeBase: (
+		repoRoot: string,
+		leftCommit: string,
+		rightCommit: string,
+	) => Promise<string | undefined>
 	private readonly onCommitCollected?: (payload: AiCodeCommitFactsPayload) => Promise<void>
+	private readonly onCommitLifecycleObserved?: (payload: AiCodeCommitLifecycleReport) => Promise<void>
 	private readonly onCommitComparisonCompleted?: () => Promise<void>
 	private started = false
 
@@ -324,7 +366,10 @@ export class AiCodeCommitAttributionService {
 		this.isAncestor = options.isAncestor ?? defaultIsAncestor
 		this.listCommitsBetween = options.listCommitsBetween ?? defaultListCommitsBetween
 		this.listCommitsSinceTimestamp = options.listCommitsSinceTimestamp ?? defaultListCommitsSinceTimestamp
+		this.loadCommitParent = options.loadCommitParent ?? defaultLoadCommitParent
+		this.mergeBase = options.mergeBase ?? defaultMergeBase
 		this.onCommitCollected = options.onCommitCollected
+		this.onCommitLifecycleObserved = options.onCommitLifecycleObserved
 		this.onCommitComparisonCompleted = options.onCommitComparisonCompleted
 	}
 
@@ -436,7 +481,7 @@ export class AiCodeCommitAttributionService {
 			return
 		}
 
-		await this.store.setRepoObservedCommit(repoRoot, event.newCommit)
+		await this.store.setRepoObservedCommit(repoRoot, event.newCommit, event.branch)
 	}
 
 	private async syncRepoToCurrentHead(repoRoot: string): Promise<void> {
@@ -471,12 +516,13 @@ export class AiCodeCommitAttributionService {
 			return
 		}
 
-		const lastObservedCommit = await this.store.getRepoObservedCommit(repoRoot)
+		const lastObservedCommit = await this.store.getRepoObservedCommit(repoRoot, currentBranch)
 		const commitsToReplay = await this.resolveCommitsToReplay(
 			repoRoot,
 			pendingLines,
 			lastObservedCommit,
 			currentCommit,
+			currentBranch,
 		)
 		if (commitsToReplay === null) {
 			return
@@ -496,7 +542,7 @@ export class AiCodeCommitAttributionService {
 				return
 			}
 
-			await this.store.setRepoObservedCommit(repoRoot, commitHash)
+			await this.store.setRepoObservedCommit(repoRoot, commitHash, currentBranch)
 		}
 
 		if (replayProcessed) {
@@ -509,7 +555,7 @@ export class AiCodeCommitAttributionService {
 			return
 		}
 
-		await this.store.setRepoObservedCommit(repoRoot, currentCommit)
+		await this.store.setRepoObservedCommit(repoRoot, currentCommit, currentBranch)
 	}
 
 	private async resolveCommitsToReplay(
@@ -517,6 +563,7 @@ export class AiCodeCommitAttributionService {
 		pendingLines: AiCodePendingLineAttribution[],
 		lastObservedCommit: string | undefined,
 		currentCommit: string,
+		currentBranch: string,
 	): Promise<string[] | null> {
 		if (lastObservedCommit?.trim()) {
 			if (lastObservedCommit === currentCommit) {
@@ -532,6 +579,16 @@ export class AiCodeCommitAttributionService {
 				if (currentCommitDescendsFromCursor) {
 					return await this.listCommitsBetween(repoRoot, lastObservedCommit, currentCommit)
 				}
+				const rewrittenCommits = await this.resolveRewrittenCommitsToReplay(
+					repoRoot,
+					pendingLines,
+					lastObservedCommit,
+					currentCommit,
+					currentBranch,
+				)
+				if (rewrittenCommits) {
+					return rewrittenCommits
+				}
 			} catch (error) {
 				console.error("[AiCodeCommitAttribution] Failed to compare commit ancestry:", error)
 				return null
@@ -544,6 +601,168 @@ export class AiCodeCommitAttributionService {
 			console.error("[AiCodeCommitAttribution] Failed to list historical commits for catch-up:", error)
 			return null
 		}
+	}
+
+	private async resolveRewrittenCommitsToReplay(
+		repoRoot: string,
+		pendingLines: AiCodePendingLineAttribution[],
+		lastObservedCommit: string,
+		currentCommit: string,
+		currentBranch: string,
+	): Promise<string[] | null> {
+		const currentIsAncestorOfCursor = await this.isAncestor(repoRoot, currentCommit, lastObservedCommit)
+		if (currentIsAncestorOfCursor) {
+			const abandonedCommits = await this.listCommitsBetween(repoRoot, currentCommit, lastObservedCommit)
+			await this.emitCommitLifecycleReport({
+				repoRoot,
+				pendingLines,
+				currentBranch,
+				eventType: "commits_abandoned",
+				reason: "reset",
+				confidence: "strong",
+				oldCommits: abandonedCommits.length > 0 ? abandonedCommits : [lastObservedCommit],
+				newCommits: [],
+			})
+			return []
+		}
+
+		const [oldParent, newParent] = await Promise.all([
+			this.loadCommitParent(repoRoot, lastObservedCommit),
+			this.loadCommitParent(repoRoot, currentCommit),
+		])
+		if (oldParent && newParent && oldParent === newParent) {
+			await this.emitCommitLifecycleReport({
+				repoRoot,
+				pendingLines,
+				currentBranch,
+				eventType: "commit_replaced",
+				reason: "amend",
+				confidence: "strong",
+				oldCommits: [lastObservedCommit],
+				newCommits: [currentCommit],
+			})
+			return [currentCommit]
+		}
+
+		const commonBase = await this.mergeBase(repoRoot, lastObservedCommit, currentCommit)
+		if (commonBase && commonBase !== lastObservedCommit && commonBase !== currentCommit) {
+			const [oldRange, newRange] = await Promise.all([
+				this.listCommitsBetween(repoRoot, commonBase, lastObservedCommit),
+				this.listCommitsBetween(repoRoot, commonBase, currentCommit),
+			])
+			if (oldRange.length > 0 && newRange.length > 0) {
+				await this.emitCommitLifecycleReport({
+					repoRoot,
+					pendingLines,
+					currentBranch,
+					eventType: "branch_rewrite_observed",
+					reason: "rewrite_unknown",
+					confidence: "weak",
+					oldCommits: oldRange,
+					newCommits: newRange,
+				})
+				return []
+			}
+		}
+
+		await this.emitCommitLifecycleReport({
+			repoRoot,
+			pendingLines,
+			currentBranch,
+			eventType: "branch_rewrite_observed",
+			reason: "rewrite_unknown",
+			confidence: "weak",
+			oldCommits: [lastObservedCommit],
+			newCommits: [currentCommit],
+		})
+		return []
+	}
+
+	private async emitCommitLifecycleReport(params: {
+		repoRoot: string
+		pendingLines: AiCodePendingLineAttribution[]
+		currentBranch: string
+		eventType: AiCodeCommitLifecycleEventType
+		reason: AiCodeCommitLifecycleReason
+		confidence: AiCodeCommitLifecycleConfidence
+		oldCommits: string[]
+		newCommits: string[]
+	}): Promise<void> {
+		if (!this.onCommitLifecycleObserved) {
+			return
+		}
+		const oldCommits = this.uniqueCommitHashes(params.oldCommits)
+		const newCommits = this.uniqueCommitHashes(params.newCommits)
+		if (oldCommits.length === 0 && newCommits.length === 0) {
+			return
+		}
+		const referenceLine = params.pendingLines[0]
+		const now = Date.now()
+		const report: AiCodeCommitLifecycleReport = {
+			version: "v1",
+			source: "kilocode-ai-code-stats",
+			mode: "commit_lifecycle",
+			semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
+			eventId: this.buildLifecycleEventId(
+				params.repoRoot,
+				params.currentBranch,
+				params.eventType,
+				params.reason,
+				params.confidence,
+				oldCommits,
+				newCommits,
+			),
+			reportId: crypto.randomUUID(),
+			eventOccurredAt: now,
+			reportedAt: now,
+			repoRoot: normalizePath(params.repoRoot),
+			projectKey: referenceLine?.projectKey,
+			projectName: referenceLine?.projectName,
+			gitRemoteUrl: referenceLine?.gitRemoteUrl,
+			gitBranch: params.currentBranch || referenceLine?.gitBranch,
+			eventType: params.eventType,
+			reason: params.reason,
+			confidence: params.confidence,
+			oldCommitHash: oldCommits[0],
+			newCommitHash: newCommits[0],
+			commitHashes: oldCommits,
+			replacementCommitHashes: newCommits,
+		}
+		try {
+			await this.onCommitLifecycleObserved(report)
+		} catch (error) {
+			console.error("[AiCodeCommitAttribution] Failed to persist commit lifecycle report:", error)
+		}
+	}
+
+	private buildLifecycleEventId(
+		repoRoot: string,
+		branch: string,
+		eventType: AiCodeCommitLifecycleEventType,
+		reason: AiCodeCommitLifecycleReason,
+		confidence: AiCodeCommitLifecycleConfidence,
+		oldCommits: string[],
+		newCommits: string[],
+	): string {
+		const digest = crypto
+			.createHash("sha256")
+			.update(
+				[
+					normalizePath(repoRoot),
+					branch,
+					eventType,
+					reason,
+					confidence,
+					oldCommits.join(","),
+					newCommits.join(","),
+				].join("\u0000"),
+			)
+			.digest("hex")
+		return `lifecycle-${digest.slice(0, 32)}`
+	}
+
+	private uniqueCommitHashes(commits: string[]): string[] {
+		return [...new Set(commits.map((commit) => commit.trim()).filter(Boolean))]
 	}
 
 	private getEarliestPendingTimestamp(pendingLines: AiCodePendingLineAttribution[]): number {

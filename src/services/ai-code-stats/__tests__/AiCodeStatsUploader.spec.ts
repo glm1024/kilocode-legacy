@@ -12,7 +12,9 @@ import { AiCodeStatsStore } from "../AiCodeStatsStore"
 import { AiCodeStatsUploader } from "../AiCodeStatsUploader"
 import {
 	CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
+	type AiCodeCommitLifecycleReport,
 	type AiCodeCommitReport,
+	type AiCodeQueuedCommitLifecycleReport,
 	type AiCodeQueuedCommitReport,
 	type AiCodeStatsEvent,
 } from "../types"
@@ -112,6 +114,37 @@ const buildQueuedReport = (overrides: Partial<AiCodeQueuedCommitReport> = {}): A
 	report: overrides.report ?? buildCommitReport(),
 	createdAt: overrides.createdAt ?? Date.now(),
 	generatedBlockIds: overrides.generatedBlockIds ?? ["generated-1"],
+})
+
+const buildLifecycleReport = (overrides: Partial<AiCodeCommitLifecycleReport> = {}): AiCodeCommitLifecycleReport => ({
+	version: "v1",
+	source: "kilocode-ai-code-stats",
+	mode: "commit_lifecycle",
+	semanticsVersion: overrides.semanticsVersion ?? CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
+	eventId: overrides.eventId ?? "lifecycle-1",
+	reportId: overrides.reportId ?? "report-lifecycle-1",
+	eventOccurredAt: overrides.eventOccurredAt ?? Date.now(),
+	reportedAt: overrides.reportedAt ?? Date.now(),
+	client: overrides.client ?? { ide: "vscode", machineId: "machine-1" },
+	repoRoot: overrides.repoRoot ?? "/workspace/project",
+	projectKey: overrides.projectKey ?? "project-key",
+	projectName: overrides.projectName ?? "repo",
+	gitRemoteUrl: overrides.gitRemoteUrl ?? "https://github.com/example/repo.git",
+	gitBranch: overrides.gitBranch ?? "feature/stats",
+	eventType: overrides.eventType ?? "commit_replaced",
+	reason: overrides.reason ?? "amend",
+	confidence: overrides.confidence ?? "strong",
+	oldCommitHash: overrides.oldCommitHash ?? "old-commit",
+	newCommitHash: overrides.newCommitHash ?? "new-commit",
+	commitHashes: overrides.commitHashes ?? ["old-commit"],
+	replacementCommitHashes: overrides.replacementCommitHashes ?? ["new-commit"],
+})
+
+const buildQueuedLifecycleReport = (
+	overrides: Partial<AiCodeQueuedCommitLifecycleReport> = {},
+): AiCodeQueuedCommitLifecycleReport => ({
+	report: overrides.report ?? buildLifecycleReport(),
+	createdAt: overrides.createdAt ?? Date.now(),
 })
 
 describe("AiCodeStatsUploader", () => {
@@ -239,6 +272,47 @@ describe("AiCodeStatsUploader", () => {
 		})
 		expect(secondBody.changedFiles[0].committedSnapshotContent).toBeUndefined()
 		expect(await store.getQueuedReportsForTests()).toHaveLength(0)
+	})
+
+	it("uploads queued lifecycle reports and acknowledges them", async () => {
+		await store.queueCommitLifecycleReport(buildQueuedLifecycleReport())
+
+		const fetchMock = vi
+			.fn()
+			.mockImplementation(() => Promise.resolve(acceptedIngestResponse({ kind: "commit_lifecycle" })))
+		vi.stubGlobal("fetch", fetchMock)
+
+		const result = await uploader.uploadQueuedLifecycleReports({
+			enabled: true,
+			webhookUrl: "https://example.com/webhook",
+			userEmail: "current.user@example.com",
+		})
+
+		expect(result).toMatchObject({ uploadedReports: 1, failedReports: 0 })
+		expect(result.rawPayloadBytes).toBeGreaterThan(0)
+		expect(fetchMock.mock.calls).toHaveLength(1)
+		expect(fetchMock.mock.calls[0][1].headers).toMatchObject({
+			"X-Ai-Code-Stats-Wire-Version": "v3",
+			"X-Ai-Code-Stats-Report-Id": "report-lifecycle-1",
+			"X-Ai-Code-Stats-Commit-Hash": "old-commit",
+		})
+		const body = await parseJsonBody(
+			fetchMock.mock.calls[0][1].body as BodyInit,
+			fetchMock.mock.calls[0][1].headers as Record<string, string>,
+		)
+		expect(body).toMatchObject({
+			mode: "commit_lifecycle",
+			eventId: "lifecycle-1",
+			reportId: "report-lifecycle-1",
+			eventType: "commit_replaced",
+			reason: "amend",
+			confidence: "strong",
+			oldCommitHash: "old-commit",
+			newCommitHash: "new-commit",
+			commitHashes: ["old-commit"],
+			replacementCommitHashes: ["new-commit"],
+		})
+		expect(await store.getQueuedCommitLifecycleReportsForTests()).toHaveLength(0)
 	})
 
 	it("uploads standalone generated events from the local queue", async () => {

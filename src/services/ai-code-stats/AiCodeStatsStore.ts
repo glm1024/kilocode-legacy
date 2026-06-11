@@ -16,6 +16,7 @@ import {
 	type AiCodeCommitUploadDiagnosticEvent,
 	type AiCodeCommitUploadRecord,
 	type AiCodePendingLineAttribution,
+	type AiCodeQueuedCommitLifecycleReport,
 	type AiCodeQueuedCommitReport,
 	type AiCodeStatsEvent,
 	type AiCodeStatsLastUpload,
@@ -26,6 +27,7 @@ const STATE_FILE = "state.json"
 const PENDING_LINES_FILE = "pending-lines.json"
 const GENERATED_BLOCKS_FILE = "generated-blocks.json"
 const QUEUED_REPORTS_FILE = "queued-reports.json"
+const QUEUED_LIFECYCLE_REPORTS_FILE = "queued-lifecycle-reports.json"
 const COMMIT_UPLOAD_RECORDS_FILE = "commit-upload-records.json"
 const DIAGNOSTICS_FILE = "diagnostics.jsonl"
 const PENDING_COMMIT_METRIC_BLOCKS_FILE = "pending-commit-metric-blocks.json"
@@ -59,6 +61,7 @@ export class AiCodeStatsStore {
 	private readonly pendingLinesPath: string
 	private readonly generatedBlocksPath: string
 	private readonly queuedReportsPath: string
+	private readonly queuedLifecycleReportsPath: string
 	private readonly commitUploadRecordsPath: string
 	private readonly diagnosticsPath: string
 	private readonly pendingCommitMetricBlocksPath: string
@@ -67,6 +70,7 @@ export class AiCodeStatsStore {
 	private pendingLines: AiCodePendingLineAttribution[] = []
 	private generatedBlocks: AiCodeGeneratedBlockState[] = []
 	private queuedReports: AiCodeQueuedCommitReport[] = []
+	private queuedLifecycleReports: AiCodeQueuedCommitLifecycleReport[] = []
 	private commitUploadRecords: AiCodeCommitUploadRecord[] = []
 	private pendingCommitMetricBlocks: AiCodePendingCommitMetricBlock[] = []
 	private snapshots: Record<string, AiCodeSnapshotStoreEntry> = {}
@@ -81,6 +85,7 @@ export class AiCodeStatsStore {
 		this.pendingLinesPath = path.join(this.baseDir, PENDING_LINES_FILE)
 		this.generatedBlocksPath = path.join(this.baseDir, GENERATED_BLOCKS_FILE)
 		this.queuedReportsPath = path.join(this.baseDir, QUEUED_REPORTS_FILE)
+		this.queuedLifecycleReportsPath = path.join(this.baseDir, QUEUED_LIFECYCLE_REPORTS_FILE)
 		this.commitUploadRecordsPath = path.join(this.baseDir, COMMIT_UPLOAD_RECORDS_FILE)
 		this.diagnosticsPath = path.join(this.baseDir, DIAGNOSTICS_FILE)
 		this.pendingCommitMetricBlocksPath = path.join(this.baseDir, PENDING_COMMIT_METRIC_BLOCKS_FILE)
@@ -159,6 +164,29 @@ export class AiCodeStatsStore {
 					left.report.reportId.localeCompare(right.report.reportId),
 			)
 			.map((report) => this.normalizeQueuedReport(report))
+	}
+
+	async queueCommitLifecycleReport(report: AiCodeQueuedCommitLifecycleReport): Promise<void> {
+		await this.enqueue(async () => {
+			await this.ensureLoaded()
+			const normalizedReport = this.normalizeQueuedCommitLifecycleReport(report)
+			if (this.queuedLifecycleReports.some((item) => item.report.eventId === normalizedReport.report.eventId)) {
+				return
+			}
+			this.queuedLifecycleReports.push(normalizedReport)
+			await this.persistQueuedLifecycleReports()
+		})
+	}
+
+	async getQueuedCommitLifecycleReports(): Promise<AiCodeQueuedCommitLifecycleReport[]> {
+		await this.ensureLoaded()
+		return this.queuedLifecycleReports
+			.slice()
+			.sort(
+				(left, right) =>
+					left.createdAt - right.createdAt || left.report.eventId.localeCompare(right.report.eventId),
+			)
+			.map((report) => this.normalizeQueuedCommitLifecycleReport(report))
 	}
 
 	async getCommitUploadRecords(): Promise<AiCodeCommitUploadRecord[]> {
@@ -364,6 +392,18 @@ export class AiCodeStatsStore {
 		})
 	}
 
+	async acknowledgeQueuedCommitLifecycleReport(eventId: string): Promise<void> {
+		await this.enqueue(async () => {
+			await this.ensureLoaded()
+			const nextReports = this.queuedLifecycleReports.filter((report) => report.report.eventId !== eventId)
+			if (nextReports.length === this.queuedLifecycleReports.length) {
+				return
+			}
+			this.queuedLifecycleReports = nextReports
+			await this.persistQueuedLifecycleReports()
+		})
+	}
+
 	async getGeneratedBlockStates(): Promise<AiCodeGeneratedBlockState[]> {
 		await this.ensureLoaded()
 		return this.generatedBlocks.map((block) => this.normalizeGeneratedBlockState(block))
@@ -536,13 +576,12 @@ export class AiCodeStatsStore {
 		})
 	}
 
-	async getRepoObservedCommit(repoRoot: string): Promise<string | undefined> {
+	async getRepoObservedCommit(repoRoot: string, gitBranch?: string): Promise<string | undefined> {
 		await this.ensureLoaded()
-		const normalizedRepoRoot = normalizePath(path.resolve(repoRoot))
-		return this.state!.repoObservedCommits[normalizedRepoRoot]
+		return this.state!.repoObservedCommits[this.buildRepoObservedCommitKey(repoRoot, gitBranch)]
 	}
 
-	async setRepoObservedCommit(repoRoot: string, commitSha: string): Promise<void> {
+	async setRepoObservedCommit(repoRoot: string, commitSha: string, gitBranch?: string): Promise<void> {
 		if (!commitSha.trim()) {
 			return
 		}
@@ -550,24 +589,38 @@ export class AiCodeStatsStore {
 		await this.enqueue(async () => {
 			await this.ensureLoaded()
 			const state = this.state!
-			const normalizedRepoRoot = normalizePath(path.resolve(repoRoot))
-			if (state.repoObservedCommits[normalizedRepoRoot] === commitSha) {
+			const observedKey = this.buildRepoObservedCommitKey(repoRoot, gitBranch)
+			if (state.repoObservedCommits[observedKey] === commitSha) {
 				return
 			}
-			state.repoObservedCommits[normalizedRepoRoot] = commitSha
+			state.repoObservedCommits[observedKey] = commitSha
 			await this.persistState()
 		})
 	}
 
-	async removeRepoObservedCommit(repoRoot: string): Promise<void> {
+	async removeRepoObservedCommit(repoRoot: string, gitBranch?: string): Promise<void> {
 		await this.enqueue(async () => {
 			await this.ensureLoaded()
 			const state = this.state!
-			const normalizedRepoRoot = normalizePath(path.resolve(repoRoot))
-			if (!(normalizedRepoRoot in state.repoObservedCommits)) {
-				return
+			if (gitBranch?.trim()) {
+				const observedKey = this.buildRepoObservedCommitKey(repoRoot, gitBranch)
+				if (!(observedKey in state.repoObservedCommits)) {
+					return
+				}
+				delete state.repoObservedCommits[observedKey]
+			} else {
+				const normalizedRepoRoot = normalizePath(path.resolve(repoRoot))
+				const nextObservedCommits: Record<string, string> = {}
+				for (const [key, value] of Object.entries(state.repoObservedCommits)) {
+					if (this.repoRootFromObservedCommitKey(key) !== normalizedRepoRoot) {
+						nextObservedCommits[key] = value
+					}
+				}
+				if (Object.keys(nextObservedCommits).length === Object.keys(state.repoObservedCommits).length) {
+					return
+				}
+				state.repoObservedCommits = nextObservedCommits
 			}
-			delete state.repoObservedCommits[normalizedRepoRoot]
 			await this.persistState()
 		})
 	}
@@ -620,6 +673,9 @@ export class AiCodeStatsStore {
 			this.pendingCommitMetricBlocks = this.pendingCommitMetricBlocks.filter(
 				(block) => block.timestamp >= cutoffTimestamp,
 			)
+			this.queuedLifecycleReports = this.queuedLifecycleReports.filter(
+				(report) => report.createdAt >= cutoffTimestamp,
+			)
 			this.generatedBlocks = this.generatedBlocks.filter((block) => {
 				if (block.uploadStatus !== "uploaded") {
 					return true
@@ -631,6 +687,7 @@ export class AiCodeStatsStore {
 			await this.persistPendingLines()
 			await this.persistPendingCommitMetricBlocks()
 			await this.persistGeneratedBlocks()
+			await this.persistQueuedLifecycleReports()
 		})
 	}
 
@@ -682,6 +739,7 @@ export class AiCodeStatsStore {
 			this.pendingLines = []
 			this.generatedBlocks = []
 			this.queuedReports = []
+			this.queuedLifecycleReports = []
 			this.commitUploadRecords = []
 			this.pendingCommitMetricBlocks = []
 			this.snapshots = {}
@@ -691,6 +749,7 @@ export class AiCodeStatsStore {
 			await this.persistGeneratedBlocks()
 			await this.persistPendingCommitMetricBlocks()
 			await this.persistQueuedReports()
+			await this.persistQueuedLifecycleReports()
 			await this.persistCommitUploadRecords()
 			await this.persistSnapshots()
 			return
@@ -760,6 +819,26 @@ export class AiCodeStatsStore {
 		}
 
 		try {
+			const raw = await fs.readFile(this.queuedLifecycleReportsPath, "utf8")
+			const parsed = JSON.parse(raw)
+			this.queuedLifecycleReports = Array.isArray(parsed)
+				? parsed
+						.filter(
+							(report): report is AiCodeQueuedCommitLifecycleReport =>
+								typeof report === "object" &&
+								report !== null &&
+								isCurrentSemanticsVersion(
+									(report as AiCodeQueuedCommitLifecycleReport).report?.semanticsVersion,
+								),
+						)
+						.map((report) => this.normalizeQueuedCommitLifecycleReport(report))
+				: []
+		} catch {
+			this.queuedLifecycleReports = []
+			await this.persistQueuedLifecycleReports()
+		}
+
+		try {
 			const raw = await fs.readFile(this.commitUploadRecordsPath, "utf8")
 			const parsed = JSON.parse(raw)
 			this.commitUploadRecords = Array.isArray(parsed)
@@ -796,6 +875,7 @@ export class AiCodeStatsStore {
 		await this.persistGeneratedBlocks()
 		await this.persistPendingCommitMetricBlocks()
 		await this.persistQueuedReports()
+		await this.persistQueuedLifecycleReports()
 		await this.persistCommitUploadRecords()
 	}
 
@@ -848,6 +928,10 @@ export class AiCodeStatsStore {
 			this.queuedReportsPath,
 			this.queuedReports.map((report) => this.compactQueuedReportForStorage(report)),
 		)
+	}
+
+	private async persistQueuedLifecycleReports(): Promise<void> {
+		await safeWriteJson(this.queuedLifecycleReportsPath, this.queuedLifecycleReports)
 	}
 
 	private async persistCommitUploadRecords(): Promise<void> {
@@ -1412,17 +1496,77 @@ export class AiCodeStatsStore {
 		}
 	}
 
+	private normalizeQueuedCommitLifecycleReport(
+		report: AiCodeQueuedCommitLifecycleReport,
+	): AiCodeQueuedCommitLifecycleReport {
+		const uniqueOldCommits = Array.isArray(report.report.commitHashes)
+			? [
+					...new Set(
+						report.report.commitHashes.filter(
+							(hash): hash is string => typeof hash === "string" && !!hash.trim(),
+						),
+					),
+				]
+			: []
+		const uniqueNewCommits = Array.isArray(report.report.replacementCommitHashes)
+			? [
+					...new Set(
+						report.report.replacementCommitHashes.filter(
+							(hash): hash is string => typeof hash === "string" && !!hash.trim(),
+						),
+					),
+				]
+			: []
+		return {
+			createdAt: typeof report.createdAt === "number" ? report.createdAt : Date.now(),
+			report: {
+				version: "v1",
+				source: "kilocode-ai-code-stats",
+				mode: "commit_lifecycle",
+				semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
+				eventId: report.report.eventId,
+				reportId: report.report.reportId,
+				eventOccurredAt:
+					typeof report.report.eventOccurredAt === "number" ? report.report.eventOccurredAt : Date.now(),
+				reportedAt: typeof report.report.reportedAt === "number" ? report.report.reportedAt : Date.now(),
+				client: report.report.client,
+				repoRoot: normalizePath(report.report.repoRoot),
+				projectKey: report.report.projectKey,
+				projectName: report.report.projectName,
+				gitRemoteUrl: report.report.gitRemoteUrl,
+				gitBranch: report.report.gitBranch,
+				eventType: report.report.eventType,
+				reason: report.report.reason,
+				confidence: report.report.confidence,
+				oldCommitHash: report.report.oldCommitHash,
+				newCommitHash: report.report.newCommitHash,
+				commitHashes: uniqueOldCommits,
+				replacementCommitHashes: uniqueNewCommits,
+			},
+		}
+	}
+
 	private pruneRepoObservedCommits(state: AiCodeStatsPersistedState): boolean {
 		const pendingRepoRoots = new Set(this.pendingLines.map((line) => line.repoRoot))
 		let changed = false
 		for (const repoRoot of Object.keys(state.repoObservedCommits)) {
-			if (pendingRepoRoots.has(repoRoot)) {
+			if (pendingRepoRoots.has(this.repoRootFromObservedCommitKey(repoRoot))) {
 				continue
 			}
 			delete state.repoObservedCommits[repoRoot]
 			changed = true
 		}
 		return changed
+	}
+
+	private buildRepoObservedCommitKey(repoRoot: string, gitBranch?: string): string {
+		const normalizedRepoRoot = normalizePath(path.resolve(repoRoot))
+		const branch = gitBranch?.trim()
+		return branch ? `${normalizedRepoRoot}\u0000${branch}` : normalizedRepoRoot
+	}
+
+	private repoRootFromObservedCommitKey(key: string): string {
+		return key.split("\u0000")[0] || key
 	}
 
 	private pruneInactiveUploadedBlocks(): void {
@@ -1535,6 +1679,7 @@ export class AiCodeStatsStore {
 			this.pendingLines = []
 			this.generatedBlocks = []
 			this.queuedReports = []
+			this.queuedLifecycleReports = []
 			this.commitUploadRecords = []
 			this.pendingCommitMetricBlocks = []
 			this.snapshots = {}
@@ -1547,6 +1692,7 @@ export class AiCodeStatsStore {
 			await this.persistGeneratedBlocks()
 			await this.persistPendingCommitMetricBlocks()
 			await this.persistQueuedReports()
+			await this.persistQueuedLifecycleReports()
 			await this.persistCommitUploadRecords()
 			await this.persistSnapshots()
 		})
@@ -1583,6 +1729,11 @@ export class AiCodeStatsStore {
 	async getQueuedReportsForTests(): Promise<AiCodeQueuedCommitReport[]> {
 		await this.ensureLoaded()
 		return this.queuedReports.map((report) => this.normalizeQueuedReport(report))
+	}
+
+	async getQueuedCommitLifecycleReportsForTests(): Promise<AiCodeQueuedCommitLifecycleReport[]> {
+		await this.ensureLoaded()
+		return this.queuedLifecycleReports.map((report) => this.normalizeQueuedCommitLifecycleReport(report))
 	}
 
 	async getSnapshotsForTests(): Promise<Record<string, AiCodeSnapshotStoreEntry>> {
