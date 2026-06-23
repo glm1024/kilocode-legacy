@@ -239,6 +239,29 @@ describe("StatisticsSettings", () => {
 		}
 	})
 
+	it("renders remote organization options when provided", () => {
+		render(
+			<StatisticsSettings
+				aiCodeStatsWebhookUrl=""
+				statisticsDepartmentOptions={[
+					{
+						name: "研发中心",
+						offices: [
+							{
+								name: "平台部",
+								teams: ["后端组"],
+							},
+						],
+					},
+				]}
+				setCachedStateField={vi.fn()}
+			/>,
+		)
+
+		expect(screen.getByTestId("ai-code-stats-department-name")).toHaveTextContent("研发中心")
+		expect(screen.queryByText("云计算研发部")).not.toBeInTheDocument()
+	})
+
 	it("shows inline webhook validation error from save flow", () => {
 		render(
 			<StatisticsSettings
@@ -274,9 +297,25 @@ describe("StatisticsSettings", () => {
 
 	it("validates required identity fields and requires team only when the office has teams", () => {
 		expect(getStatisticsIdentityValidationKey({})).toBe("settings:statistics.validation.departmentRequired")
+		expect(getStatisticsIdentityValidationKey({ departmentName: "不存在部门" })).toBe(
+			"settings:statistics.validation.departmentInvalid",
+		)
 		expect(getStatisticsIdentityValidationKey({ departmentName: "云存储研发部" })).toBe(
 			"settings:statistics.validation.officeRequired",
 		)
+		expect(
+			getStatisticsIdentityValidationKey({
+				departmentName: "云存储研发部",
+				officeName: "不存在处",
+			}),
+		).toBe("settings:statistics.validation.officeInvalid")
+		expect(
+			getStatisticsIdentityValidationKey({
+				departmentName: "云存储研发部",
+				officeName: "架设处",
+				teamName: "不存在组",
+			}),
+		).toBe("settings:statistics.validation.teamInvalid")
 		expect(
 			getStatisticsIdentityValidationKey({
 				departmentName: "云存储研发部",

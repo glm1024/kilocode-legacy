@@ -90,9 +90,10 @@ import AgentBehaviourView from "../kilocode/settings/AgentBehaviourView" // kilo
 // kilocode_change start
 import {
 	StatisticsSettings,
+	STATISTICS_DEPARTMENT_OPTIONS,
 	type StatisticsIdentityValidationField,
+	type StatisticsDepartmentOption,
 	getStatisticsIdentityValidationKey,
-	getStatisticsTeamOptions,
 	normalizeStatisticsEmail,
 } from "./StatisticsSettings"
 // kilocode_change end
@@ -108,8 +109,11 @@ export const settingsTabList =
 // kilocode_change start
 const statisticsIdentityValidationFieldByKey: Record<string, StatisticsIdentityValidationField> = {
 	"settings:statistics.validation.departmentRequired": "department",
+	"settings:statistics.validation.departmentInvalid": "department",
 	"settings:statistics.validation.officeRequired": "office",
+	"settings:statistics.validation.officeInvalid": "office",
 	"settings:statistics.validation.teamRequired": "team",
+	"settings:statistics.validation.teamInvalid": "team",
 	"settings:statistics.validation.nameRequired": "userName",
 	"settings:statistics.validation.emailRequired": "userEmail",
 	"settings:statistics.validation.emailInvalid": "userEmail",
@@ -121,6 +125,18 @@ export const settingsTabTriggerActive =
 	"opacity-100 border-vscode-focusBorder bg-vscode-list-activeSelectionBackground hover:bg-vscode-list-activeSelectionBackground cursor-default" // kilocode_change add hover:bg-* and cursor-default
 const AI_CODE_STATS_INGEST_PATH = "/api/v1/ingest/ai-code-stats"
 const AI_TOKEN_USAGE_INGEST_PATH = "/api/v1/ingest/ai-token-usage"
+
+type OrganizationOptionsMessageValues = {
+	requestId?: string
+	source?: "remote" | "cache"
+	config?: unknown
+	errorCode?: string
+}
+
+type OrganizationOptionsConfig = {
+	enabled?: boolean
+	departments?: unknown
+}
 
 const resolveSettingsIngestPath = (pathname: string, targetPath: string): string => {
 	const normalizedPathname = pathname.replace(/\/+$/, "") || "/"
@@ -155,6 +171,40 @@ const normalizeAiCodeStatsWebhookUrl = (value: string): string => {
 	} catch {
 		return trimmed
 	}
+}
+
+const normalizeStatisticsDepartmentOptions = (departments: unknown): StatisticsDepartmentOption[] => {
+	if (!Array.isArray(departments)) {
+		return []
+	}
+
+	return departments
+		.map((department) => {
+			if (!department || typeof department !== "object") {
+				return undefined
+			}
+			const rawDepartment = department as Record<string, unknown>
+			const name = typeof rawDepartment.name === "string" ? rawDepartment.name.trim() : ""
+			const offices = Array.isArray(rawDepartment.offices) ? rawDepartment.offices : []
+			const normalizedOffices = offices
+				.map((office) => {
+					if (!office || typeof office !== "object") {
+						return undefined
+					}
+					const rawOffice = office as Record<string, unknown>
+					const officeName = typeof rawOffice.name === "string" ? rawOffice.name.trim() : ""
+					const teams = Array.isArray(rawOffice.teams)
+						? rawOffice.teams
+								.map((team) => (typeof team === "string" ? team.trim() : ""))
+								.filter((team) => team.length > 0)
+						: []
+					return officeName ? { name: officeName, teams } : undefined
+				})
+				.filter((office): office is StatisticsDepartmentOption["offices"][number] => Boolean(office))
+
+			return name && normalizedOffices.length > 0 ? { name, offices: normalizedOffices } : undefined
+		})
+		.filter((department): department is StatisticsDepartmentOption => Boolean(department))
 }
 
 export interface SettingsViewRef {
@@ -241,6 +291,12 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 	const [aiCodeStatsIdentityValidationErrorField, setAiCodeStatsIdentityValidationErrorField] = useState<
 		StatisticsIdentityValidationField | undefined
 	>(undefined)
+	const [statisticsDepartmentOptions, setStatisticsDepartmentOptions] =
+		useState<StatisticsDepartmentOption[]>(STATISTICS_DEPARTMENT_OPTIONS)
+	const [statisticsOrganizationStatusMessage, setStatisticsOrganizationStatusMessage] = useState<string | undefined>(
+		undefined,
+	)
+	const organizationOptionsRequestSeqRef = useRef(0)
 	// kilocode_change end
 
 	// kilocode_change begin
@@ -739,6 +795,94 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 		},
 		[t],
 	)
+
+	const refreshStatisticsOrganizationOptions = useCallback(
+		async (webhookUrl?: string): Promise<StatisticsDepartmentOption[]> => {
+			const normalizedWebhookUrl = normalizeAiCodeStatsWebhookUrl(webhookUrl ?? "")
+			if (!normalizedWebhookUrl) {
+				setStatisticsDepartmentOptions(STATISTICS_DEPARTMENT_OPTIONS)
+				setStatisticsOrganizationStatusMessage(undefined)
+				return STATISTICS_DEPARTMENT_OPTIONS
+			}
+
+			const requestSeq = organizationOptionsRequestSeqRef.current + 1
+			organizationOptionsRequestSeqRef.current = requestSeq
+			const requestId = `organization-options-${Date.now()}-${requestSeq}`
+
+			return await new Promise((resolve) => {
+				const timeoutMs = 8_000
+				let settled = false
+
+				const cleanup = () => {
+					window.clearTimeout(timeoutId)
+					window.removeEventListener("message", handleMessage)
+				}
+
+				const applyOptions = (options: StatisticsDepartmentOption[], statusMessage?: string) => {
+					if (requestSeq === organizationOptionsRequestSeqRef.current) {
+						setStatisticsDepartmentOptions(options)
+						setStatisticsOrganizationStatusMessage(statusMessage)
+					}
+					resolve(options)
+				}
+
+				const settle = (options: StatisticsDepartmentOption[], statusMessage?: string) => {
+					if (settled) {
+						return
+					}
+					settled = true
+					cleanup()
+					applyOptions(options, statusMessage)
+				}
+
+				const timeoutId = window.setTimeout(() => {
+					settle(STATISTICS_DEPARTMENT_OPTIONS, t("settings:statistics.organizationOptions.fallback"))
+				}, timeoutMs)
+
+				const handleMessage = (event: MessageEvent) => {
+					const message = event.data
+					if (message?.type !== "aiCodeStatsOrganizationOptions") {
+						return
+					}
+
+					const values = message.values as OrganizationOptionsMessageValues | undefined
+					if (values?.requestId !== requestId) {
+						return
+					}
+
+					if (!message.success) {
+						settle(STATISTICS_DEPARTMENT_OPTIONS, t("settings:statistics.organizationOptions.fallback"))
+						return
+					}
+
+					const config = values?.config as OrganizationOptionsConfig | undefined
+					if (config?.enabled !== true) {
+						settle(STATISTICS_DEPARTMENT_OPTIONS, undefined)
+						return
+					}
+
+					const normalizedDepartments = normalizeStatisticsDepartmentOptions(config.departments)
+					if (normalizedDepartments.length === 0) {
+						settle(STATISTICS_DEPARTMENT_OPTIONS, t("settings:statistics.organizationOptions.fallback"))
+						return
+					}
+
+					settle(
+						normalizedDepartments,
+						values?.source === "cache" ? t("settings:statistics.organizationOptions.cache") : undefined,
+					)
+				}
+
+				window.addEventListener("message", handleMessage)
+				vscode.postMessage({
+					type: "getAiCodeStatsOrganizationOptions",
+					text: normalizedWebhookUrl,
+					values: { requestId },
+				})
+			})
+		},
+		[t],
+	)
 	// kilocode_change end
 
 	const handleSubmit = async () => {
@@ -750,37 +894,38 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 				const normalizedWebhookUrl = normalizeAiCodeStatsWebhookUrl(trimmedWebhookUrl)
 				const normalizedDepartmentName = (aiCodeStatsDepartmentName ?? "").trim()
 				const normalizedOfficeName = (aiCodeStatsOfficeName ?? "").trim()
-				const selectedTeamOptions = getStatisticsTeamOptions(normalizedDepartmentName, normalizedOfficeName)
-				const normalizedTeamName =
-					selectedTeamOptions.length > 0 && selectedTeamOptions.includes((aiCodeStatsTeamName ?? "").trim())
-						? (aiCodeStatsTeamName ?? "").trim()
-						: ""
+				const normalizedTeamName = (aiCodeStatsTeamName ?? "").trim()
 				const normalizedUserName = (aiCodeStatsUserName ?? "").trim()
 				const normalizedUserEmail = normalizeStatisticsEmail(aiCodeStatsUserEmail)
 				const originalWebhookUrl = (extensionState.aiCodeStatsWebhookUrl ?? "").trim()
 				const shouldTestWebhook = normalizedWebhookUrl.length > 0 && trimmedWebhookUrl !== originalWebhookUrl
 				const shouldValidateStatistics = activeTab === "statistics"
-				const identityValidationKey = shouldValidateStatistics
-					? getStatisticsIdentityValidationKey({
+				let currentStatisticsDepartmentOptions = statisticsDepartmentOptions
+
+				if (shouldValidateStatistics) {
+					if (!normalizedWebhookUrl) {
+						setAiCodeStatsWebhookValidationError(t("settings:statistics.webhook.test.required"))
+						return
+					}
+
+					currentStatisticsDepartmentOptions =
+						await refreshStatisticsOrganizationOptions(normalizedWebhookUrl)
+					const identityValidationKey = getStatisticsIdentityValidationKey(
+						{
 							departmentName: normalizedDepartmentName,
 							officeName: normalizedOfficeName,
 							teamName: normalizedTeamName,
 							userName: normalizedUserName,
 							userEmail: normalizedUserEmail,
-						})
-					: undefined
-
-				if (identityValidationKey) {
-					setAiCodeStatsIdentityValidationError(t(identityValidationKey))
-					setAiCodeStatsIdentityValidationErrorField(
-						statisticsIdentityValidationFieldByKey[identityValidationKey] ?? "userEmail",
+						},
+						currentStatisticsDepartmentOptions,
 					)
-					return
-				}
 
-				if (shouldValidateStatistics) {
-					if (!normalizedWebhookUrl) {
-						setAiCodeStatsWebhookValidationError(t("settings:statistics.webhook.test.required"))
+					if (identityValidationKey) {
+						setAiCodeStatsIdentityValidationError(t(identityValidationKey))
+						setAiCodeStatsIdentityValidationErrorField(
+							statisticsIdentityValidationFieldByKey[identityValidationKey] ?? "userEmail",
+						)
 						return
 					}
 
@@ -1492,6 +1637,9 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>((props, ref)
 								webhookValidationError={aiCodeStatsWebhookValidationError}
 								identityValidationError={aiCodeStatsIdentityValidationError}
 								identityValidationErrorField={aiCodeStatsIdentityValidationErrorField}
+								statisticsDepartmentOptions={statisticsDepartmentOptions}
+								organizationOptionsStatusMessage={statisticsOrganizationStatusMessage}
+								onRefreshOrganizationOptions={refreshStatisticsOrganizationOptions}
 							/>
 						)}
 						{/* kilocode_change end */}

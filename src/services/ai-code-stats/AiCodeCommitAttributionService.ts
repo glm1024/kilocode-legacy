@@ -470,6 +470,15 @@ export class AiCodeCommitAttributionService {
 			return
 		}
 
+		const rewriteReplayCommits = await this.resolveCommitEventRewriteReplay(repoRoot, event)
+		if (rewriteReplayCommits === null) {
+			return
+		}
+		if (rewriteReplayCommits) {
+			await this.processReplayCommits(repoRoot, event.branch, event.newCommit, rewriteReplayCommits)
+			return
+		}
+
 		const result = await this.processCommit(repoRoot, event.branch, event.newCommit, event.previousCommit)
 		if (!result.processed) {
 			return
@@ -482,6 +491,75 @@ export class AiCodeCommitAttributionService {
 		}
 
 		await this.store.setRepoObservedCommit(repoRoot, event.newCommit, event.branch)
+	}
+
+	private async resolveCommitEventRewriteReplay(
+		repoRoot: string,
+		event: Extract<GitWatcherEvent, { type: "commit" }>,
+	): Promise<string[] | null | undefined> {
+		const lastObservedCommit = await this.store.getRepoObservedCommit(repoRoot, event.branch)
+		if (!lastObservedCommit?.trim() || lastObservedCommit === event.newCommit) {
+			return undefined
+		}
+
+		try {
+			if (await this.isAncestor(repoRoot, lastObservedCommit, event.newCommit)) {
+				return undefined
+			}
+
+			const pendingLines = await this.store.getPendingLineAttributions(repoRoot)
+			if (pendingLines.length === 0) {
+				await this.cleanupRepo(repoRoot)
+				return []
+			}
+
+			return await this.resolveRewrittenCommitsToReplay(
+				repoRoot,
+				pendingLines,
+				lastObservedCommit,
+				event.newCommit,
+				event.branch,
+			)
+		} catch (error) {
+			console.error("[AiCodeCommitAttribution] Failed to compare commit event ancestry:", error)
+			return null
+		}
+	}
+
+	private async processReplayCommits(
+		repoRoot: string,
+		branch: string,
+		currentCommit: string,
+		commitsToReplay: string[],
+	): Promise<void> {
+		let replayProcessed = false
+		for (const commitHash of commitsToReplay) {
+			const result = await this.processCommit(repoRoot, branch, commitHash, "")
+			if (!result.processed) {
+				return
+			}
+
+			replayProcessed = true
+
+			if (result.remainingPendingLines === 0) {
+				await this.notifyCommitComparisonCompleted()
+				return
+			}
+
+			await this.store.setRepoObservedCommit(repoRoot, commitHash, branch)
+		}
+
+		if (replayProcessed) {
+			await this.notifyCommitComparisonCompleted()
+		}
+
+		const remainingPendingLines = await this.store.getPendingLineAttributions(repoRoot)
+		if (remainingPendingLines.length === 0) {
+			await this.cleanupRepo(repoRoot)
+			return
+		}
+
+		await this.store.setRepoObservedCommit(repoRoot, currentCommit, branch)
 	}
 
 	private async syncRepoToCurrentHead(repoRoot: string): Promise<void> {
@@ -528,34 +606,7 @@ export class AiCodeCommitAttributionService {
 			return
 		}
 
-		let replayProcessed = false
-		for (const commitHash of commitsToReplay) {
-			const result = await this.processCommit(repoRoot, currentBranch, commitHash, "")
-			if (!result.processed) {
-				return
-			}
-
-			replayProcessed = true
-
-			if (result.remainingPendingLines === 0) {
-				await this.notifyCommitComparisonCompleted()
-				return
-			}
-
-			await this.store.setRepoObservedCommit(repoRoot, commitHash, currentBranch)
-		}
-
-		if (replayProcessed) {
-			await this.notifyCommitComparisonCompleted()
-		}
-
-		const remainingPendingLines = await this.store.getPendingLineAttributions(repoRoot)
-		if (remainingPendingLines.length === 0) {
-			await this.cleanupRepo(repoRoot)
-			return
-		}
-
-		await this.store.setRepoObservedCommit(repoRoot, currentCommit, currentBranch)
+		await this.processReplayCommits(repoRoot, currentBranch, currentCommit, commitsToReplay)
 	}
 
 	private async resolveCommitsToReplay(

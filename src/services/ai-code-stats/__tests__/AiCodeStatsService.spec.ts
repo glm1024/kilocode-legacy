@@ -1557,6 +1557,119 @@ describe("AiCodeStatsService", () => {
 		expect(secondReport.candidateLines[0].clientLineId).toContain("commit-second:")
 	})
 
+	it("reuses retained uploaded AI blocks when an amend commit includes earlier AI lines after context rewrite", async () => {
+		mockIsGitRepository.mockResolvedValue(true)
+		mockGetRemoteUrl.mockResolvedValue("https://github.com/example/amend-retained.git")
+		mockGetCurrentBranch.mockResolvedValue("main")
+
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const repoDir = await createGitRepo()
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({
+			webhookUrl: "https://example.com/prod-api",
+			userEmail: "tester@example.com",
+		}))
+		const uploadedReports: any[] = []
+		const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+			const payload = await parseJsonBody(
+				init?.body as BodyInit,
+				init?.headers as Record<string, string> | undefined,
+			)
+			if (payload.mode === "commit_report") {
+				uploadedReports.push(payload)
+			}
+			return acceptedIngestResponse()
+		})
+		vi.stubGlobal("fetch", fetchMock)
+
+		const relativePath = "src/amend-retained.ts"
+		const filePath = path.join(repoDir, relativePath)
+		const commitBeforeAmend = "1111111111111111111111111111111111111111"
+		const commitAfterAmend = "2222222222222222222222222222222222222222"
+		const baseContent = "export const base = 1\n"
+		const subtractLine = "export const subtract = (a: number, b: number) => a - b"
+		const multiplyLine = "export const multiply = (a: number, b: number) => a * b"
+		await service.recordAgentFileWrite({
+			cwd: repoDir,
+			filePath,
+			relativePath,
+			originalContent: baseContent,
+			newContent: `${baseContent}${subtractLine}\n`,
+			taskId: "task-amend-retained",
+		})
+
+		await (service as any).handleCommitCollected({
+			repoRoot: repoDir,
+			branch: "main",
+			commitHash: commitBeforeAmend,
+			previousCommit: "commit-base",
+			commitOccurredAt: Date.now(),
+			changedFiles: [
+				{
+					relativePath,
+					filePath,
+					language: "typescript",
+					addedLines: [
+						{
+							addedIndex: 0,
+							lineNumber: 2,
+							content: subtractLine,
+							lineHash: hashLineFingerprint(subtractLine),
+						},
+					],
+				},
+			],
+		})
+		expect(uploadedReports).toHaveLength(1)
+
+		await service.recordAgentFileWrite({
+			cwd: repoDir,
+			filePath,
+			relativePath,
+			originalContent: `${baseContent}${subtractLine}\n`,
+			newContent: `${baseContent}${subtractLine}\n${multiplyLine}\n`,
+			taskId: "task-amend-retained",
+		})
+
+		await (service as any).handleCommitCollected({
+			repoRoot: repoDir,
+			branch: "main",
+			commitHash: commitAfterAmend,
+			previousCommit: "",
+			commitOccurredAt: Date.now(),
+			changedFiles: [
+				{
+					relativePath,
+					filePath,
+					language: "typescript",
+					addedLines: [
+						{
+							addedIndex: 0,
+							lineNumber: 2,
+							content: subtractLine,
+							lineHash: hashLineFingerprint(subtractLine),
+						},
+						{
+							addedIndex: 1,
+							lineNumber: 3,
+							content: multiplyLine,
+							lineHash: hashLineFingerprint(multiplyLine),
+						},
+					],
+				},
+			],
+		})
+
+		expect(uploadedReports).toHaveLength(2)
+		const amendedReport = uploadedReports[1]
+		expect(amendedReport.commitHash).toBe(commitAfterAmend)
+		expect(amendedReport.generatedBlocks).toHaveLength(2)
+		expect(amendedReport.candidateLines).toHaveLength(2)
+		expect(amendedReport.candidateLines.every((line: any) => line.clientLineId.length <= 128)).toBe(true)
+		expect(amendedReport.candidateLines.map((line: any) => line.rawLine)).toEqual(
+			expect.arrayContaining([subtractLine, multiplyLine]),
+		)
+	})
+
 	it("does not create commit reports for retained uploaded AI blocks when added lines do not match", async () => {
 		mockIsGitRepository.mockResolvedValue(true)
 		mockGetRemoteUrl.mockResolvedValue("https://github.com/example/uploaded-miss.git")
@@ -2434,6 +2547,91 @@ describe("AiCodeStatsService", () => {
 		expect(await store.getQueuedReportsForTests()).toHaveLength(0)
 		expect(uploadedReports).toHaveLength(1)
 		expect(uploadedReports[0].commitHash).toBe(commitHash)
+	})
+
+	it("defers lifecycle uploads when queued commit reports fail", async () => {
+		mockIsGitRepository.mockResolvedValue(true)
+		mockGetRemoteUrl.mockResolvedValue("https://github.com/example/lifecycle-defer.git")
+		mockGetCurrentBranch.mockResolvedValue("main")
+
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const repoDir = await createGitRepo()
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({
+			webhookUrl: "https://example.com/prod-api",
+			userEmail: "tester@example.com",
+		}))
+
+		const relativePath = "src/lifecycle-defer.ts"
+		const filePath = path.join(repoDir, relativePath)
+		const originalContent = "const base = 1\n"
+		const aiContent = "const base = 1\nconst lifecycleDeferred = true\n"
+		await commitFile(repoDir, relativePath, originalContent, "base")
+		await service.recordAgentFileWrite({
+			cwd: repoDir,
+			filePath,
+			relativePath,
+			originalContent,
+			newContent: aiContent,
+			taskId: "task-lifecycle-defer",
+		})
+		const commitHash = await commitFile(repoDir, relativePath, aiContent, "ai lifecycle defer")
+
+		const lifecycleUploads: any[] = []
+		const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+			const payload = await parseJsonBody(
+				init?.body as BodyInit,
+				init?.headers as Record<string, string> | undefined,
+			)
+			if (payload.mode === "commit_report") {
+				return new Response("backend stopped", { status: 503, statusText: "Service Unavailable" })
+			}
+			if (payload.mode === "commit_lifecycle") {
+				lifecycleUploads.push(payload)
+			}
+			return acceptedIngestResponse()
+		})
+		vi.stubGlobal("fetch", fetchMock)
+
+		const store = (service as any).store
+		await store.queueCommitLifecycleReport({
+			createdAt: Date.now(),
+			report: {
+				source: "kilocode-ai-code-stats",
+				version: "v1",
+				mode: "commit_lifecycle",
+				semanticsVersion: 1,
+				eventId: "lifecycle-defer-event",
+				reportId: "lifecycle-defer-report",
+				client: { ide: "vscode" },
+				projectKey: "lifecycle-defer",
+				projectName: "lifecycle-defer",
+				repoRoot: repoDir,
+				gitRemoteUrl: "https://github.com/example/lifecycle-defer.git",
+				gitBranch: "main",
+				eventType: "commit_replaced",
+				reason: "amend",
+				confidence: "strong",
+				oldCommitHash: "old-lifecycle-commit",
+				newCommitHash: commitHash,
+				commitHashes: ["old-lifecycle-commit"],
+				replacementHashes: [commitHash],
+				eventOccurredAt: Date.now(),
+				reportedAt: Date.now(),
+			},
+		})
+
+		const facts = await (service as any).commitAttributionService.collectCommitFactsForReplay(
+			repoDir,
+			commitHash,
+			"main",
+		)
+		await (service as any).handleCommitCollected(facts)
+
+		expect(lifecycleUploads).toHaveLength(0)
+		expect(await store.getQueuedCommitLifecycleReportsForTests()).toHaveLength(1)
+		const diagnosticsPath = await service.exportCommitUploadDiagnostics()
+		const diagnostics = await fs.readFile(diagnosticsPath, "utf8")
+		expect(diagnostics).toContain("lifecycle_upload_deferred")
 	})
 
 	it("retries only the selected failed commit report", async () => {

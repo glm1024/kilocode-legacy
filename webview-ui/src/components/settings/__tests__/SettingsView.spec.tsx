@@ -33,6 +33,26 @@ vi.mock("../ApiConfigManager", () => ({
 
 // kilocode_change start
 vi.mock("../StatisticsSettings", () => ({
+	STATISTICS_DEPARTMENT_OPTIONS: [
+		{
+			name: "云存储研发部",
+			offices: [
+				{
+					name: "架设处",
+					teams: [
+						"研发一组",
+						"研发二组",
+						"研发三组",
+						"研发四组",
+						"研发五组",
+						"研发六组",
+						"研发七组",
+						"研发八组",
+					],
+				},
+			],
+		},
+	],
 	StatisticsSettings: ({
 		aiCodeStatsWebhookUrl,
 		aiCodeStatsDepartmentName,
@@ -798,16 +818,37 @@ describe("SettingsView - Statistics Webhook Save Validation", () => {
 		vi.clearAllMocks()
 	})
 
-	const completeWebhookTestIfRequested = () => {
-		if (getPostMessageCallsByType("testAiCodeStatsWebhook").length === 0) {
-			return
-		}
+	const completeWebhookTestIfRequested = async () => {
+		await waitFor(() => {
+			expect(getPostMessageCallsByType("testAiCodeStatsWebhook").length).toBeGreaterThan(0)
+		})
 
 		window.postMessage(
 			{
 				type: "aiCodeStatsWebhookTestResult",
 				success: true,
 				text: "",
+			},
+			"*",
+		)
+	}
+
+	const completeOrganizationOptionsIfRequested = async (config = { enabled: false, departments: [] }) => {
+		await waitFor(() => {
+			expect(getPostMessageCallsByType("getAiCodeStatsOrganizationOptions").length).toBeGreaterThan(0)
+		})
+		const request = getPostMessageCallsByType("getAiCodeStatsOrganizationOptions").at(-1)
+
+		window.postMessage(
+			{
+				type: "aiCodeStatsOrganizationOptions",
+				success: true,
+				text: "",
+				values: {
+					requestId: (request.values as { requestId?: string } | undefined)?.requestId,
+					source: "remote",
+					config,
+				},
 			},
 			"*",
 		)
@@ -824,10 +865,13 @@ describe("SettingsView - Statistics Webhook Save Validation", () => {
 			target: { value: "https://new.example.com/webhook" },
 		})
 		fireEvent.click(screen.getByTestId("save-button"))
+		await completeOrganizationOptionsIfRequested()
 
-		expect(vscode.postMessage).toHaveBeenCalledWith({
-			type: "testAiCodeStatsWebhook",
-			text: "https://new.example.com/webhook/api/v1/ingest/ai-code-stats",
+		await waitFor(() => {
+			expect(vscode.postMessage).toHaveBeenCalledWith({
+				type: "testAiCodeStatsWebhook",
+				text: "https://new.example.com/webhook/api/v1/ingest/ai-code-stats",
+			})
 		})
 		expect(getPostMessageCallsByType("updateSettings")).toHaveLength(0)
 
@@ -858,10 +902,13 @@ describe("SettingsView - Statistics Webhook Save Validation", () => {
 			target: { value: "http://localhost:8081" },
 		})
 		fireEvent.click(screen.getByTestId("save-button"))
+		await completeOrganizationOptionsIfRequested()
 
-		expect(vscode.postMessage).toHaveBeenCalledWith({
-			type: "testAiCodeStatsWebhook",
-			text: "http://localhost:8081/api/v1/ingest/ai-code-stats",
+		await waitFor(() => {
+			expect(vscode.postMessage).toHaveBeenCalledWith({
+				type: "testAiCodeStatsWebhook",
+				text: "http://localhost:8081/api/v1/ingest/ai-code-stats",
+			})
 		})
 
 		window.postMessage(
@@ -897,7 +944,8 @@ describe("SettingsView - Statistics Webhook Save Validation", () => {
 			target: { value: "  Team Nine  " },
 		})
 		fireEvent.click(screen.getByTestId("save-button"))
-		completeWebhookTestIfRequested()
+		await completeOrganizationOptionsIfRequested()
+		await completeWebhookTestIfRequested()
 
 		await waitFor(() => {
 			expect(getPostMessageCallsByType("updateSettings").length).toBeGreaterThan(0)
@@ -921,7 +969,8 @@ describe("SettingsView - Statistics Webhook Save Validation", () => {
 			target: { value: "  Alice.Zhang@Example.COM  " },
 		})
 		fireEvent.click(screen.getByTestId("save-button"))
-		completeWebhookTestIfRequested()
+		await completeOrganizationOptionsIfRequested()
+		await completeWebhookTestIfRequested()
 
 		await waitFor(() => {
 			expect(getPostMessageCallsByType("updateSettings").length).toBeGreaterThan(0)
@@ -945,7 +994,8 @@ describe("SettingsView - Statistics Webhook Save Validation", () => {
 			target: { value: "Team Nine" },
 		})
 		fireEvent.click(screen.getByTestId("save-button"))
-		completeWebhookTestIfRequested()
+		await completeOrganizationOptionsIfRequested()
+		await completeWebhookTestIfRequested()
 
 		await waitFor(() => {
 			expect(getPostMessageCallsByType("updateSettings").length).toBeGreaterThan(0)
@@ -988,10 +1038,13 @@ describe("SettingsView - Statistics Webhook Save Validation", () => {
 			target: { value: "http://localhost:8081" },
 		})
 		fireEvent.click(screen.getByTestId("save-button"))
+		await completeOrganizationOptionsIfRequested()
 
-		expect(vscode.postMessage).toHaveBeenCalledWith({
-			type: "testAiCodeStatsWebhook",
-			text: "http://localhost:8081/api/v1/ingest/ai-code-stats",
+		await waitFor(() => {
+			expect(vscode.postMessage).toHaveBeenCalledWith({
+				type: "testAiCodeStatsWebhook",
+				text: "http://localhost:8081/api/v1/ingest/ai-code-stats",
+			})
 		})
 
 		window.postMessage(
@@ -1025,10 +1078,13 @@ describe("SettingsView - Statistics Webhook Save Validation", () => {
 			target: { value: "https://new.example.com/webhook" },
 		})
 		fireEvent.click(screen.getByTestId("save-button"))
+		await completeOrganizationOptionsIfRequested()
 
-		expect(vscode.postMessage).toHaveBeenCalledWith({
-			type: "testAiCodeStatsWebhook",
-			text: "https://new.example.com/webhook/api/v1/ingest/ai-code-stats",
+		await waitFor(() => {
+			expect(vscode.postMessage).toHaveBeenCalledWith({
+				type: "testAiCodeStatsWebhook",
+				text: "https://new.example.com/webhook/api/v1/ingest/ai-code-stats",
+			})
 		})
 
 		window.postMessage(
@@ -1060,6 +1116,11 @@ describe("SettingsView - Statistics Webhook Save Validation", () => {
 			target: { value: "http://localhost:8081" },
 		})
 		fireEvent.click(screen.getByTestId("save-button"))
+		await completeOrganizationOptionsIfRequested()
+
+		await waitFor(() => {
+			expect(getPostMessageCallsByType("testAiCodeStatsWebhook").length).toBeGreaterThan(0)
+		})
 
 		window.postMessage(
 			{

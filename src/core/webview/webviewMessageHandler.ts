@@ -112,6 +112,7 @@ import { fetchWithRetries, RequestTimedOutError } from "../../shared/http" // ki
 // kilocode_change start
 import {
 	InvalidAiCodeStatsWebhookUrlError,
+	resolveAiCodeStatsOrganizationOptionsUrl,
 	resolveAiCodeStatsWebhookUrl,
 } from "../../services/ai-code-stats/AiCodeStatsWebhookUrl"
 import { AiCodeStatsService } from "../../services/ai-code-stats"
@@ -120,6 +121,13 @@ import {
 	resolveAiTokenUsageWebhookUrl,
 } from "../../services/ai-token-usage/AiTokenUsageWebhookUrl"
 // kilocode_change end
+
+type AiCodeStatsOrganizationOptionsCacheEntry = {
+	fetchedAt: number
+	config: unknown
+}
+
+const AI_CODE_STATS_ORGANIZATION_OPTIONS_CACHE_KEY = "aiCodeStatsOrganizationOptionsCache"
 import { setPendingTodoList } from "../tools/UpdateTodoListTool"
 import { ManagedIndexer } from "../../services/code-index/managed/ManagedIndexer"
 import { SessionManager } from "../../shared/kilocode/cli-sessions/core/SessionManager" // kilocode_change
@@ -2048,6 +2056,83 @@ export const webviewMessageHandler = async (
 					values: {
 						errorCode,
 					},
+				})
+			}
+			break
+		}
+		case "getAiCodeStatsOrganizationOptions": {
+			const webhookUrl = typeof message.text === "string" ? message.text.trim() : ""
+			const requestId =
+				message.values && typeof message.values === "object" && "requestId" in message.values
+					? String((message.values as { requestId?: unknown }).requestId ?? "")
+					: ""
+			const postResult = async (success: boolean, values: Record<string, unknown>, text = "") => {
+				await provider.postMessageToWebview({
+					type: "aiCodeStatsOrganizationOptions",
+					success,
+					text,
+					values: {
+						requestId,
+						...values,
+					},
+				})
+			}
+
+			if (!webhookUrl) {
+				await postResult(false, { errorCode: "webhook_required" })
+				break
+			}
+
+			let targetUrl = ""
+			try {
+				targetUrl = resolveAiCodeStatsOrganizationOptionsUrl(webhookUrl)
+			} catch (error) {
+				await postResult(false, {
+					errorCode: error instanceof InvalidAiCodeStatsWebhookUrlError ? error.code : "invalid_url",
+				})
+				break
+			}
+
+			const cache =
+				provider.context.globalState.get<Record<string, AiCodeStatsOrganizationOptionsCacheEntry>>(
+					AI_CODE_STATS_ORGANIZATION_OPTIONS_CACHE_KEY,
+				) ?? {}
+
+			try {
+				const response = await fetchWithRetries({
+					url: targetUrl,
+					method: "GET",
+					retries: 0,
+					timeout: 8_000,
+					shouldRetry: () => false,
+				})
+				if (!response.ok) {
+					throw new Error(`${response.status} ${response.statusText}`)
+				}
+				const config = await response.json()
+				const nextCache = {
+					...cache,
+					[targetUrl]: {
+						fetchedAt: Date.now(),
+						config,
+					},
+				}
+				await provider.context.globalState.update(AI_CODE_STATS_ORGANIZATION_OPTIONS_CACHE_KEY, nextCache)
+				await postResult(true, { config, source: "remote", targetUrl })
+			} catch (error) {
+				const cached = cache[targetUrl]
+				if (cached) {
+					await postResult(true, {
+						config: cached.config,
+						source: "cache",
+						targetUrl,
+						fetchedAt: cached.fetchedAt,
+					})
+					break
+				}
+				await postResult(false, {
+					errorCode: error instanceof RequestTimedOutError ? "timeout" : "network_error",
+					targetUrl,
 				})
 			}
 			break

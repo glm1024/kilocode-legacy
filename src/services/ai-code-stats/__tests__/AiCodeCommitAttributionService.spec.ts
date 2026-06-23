@@ -344,6 +344,68 @@ describe("AiCodeCommitAttributionService", () => {
 		expect(onCommitLifecycleObserved.mock.calls[0][0].eventId).toMatch(/^lifecycle-/)
 	})
 
+	it("observes amend rewrite from commit watcher events before replaying the new commit", async () => {
+		const onCommitLifecycleObserved = vi.fn(async (_payload: any) => {})
+		const onCommitCollected = vi.fn(async (_payload: any) => {})
+		const loadCommitPatch = vi.fn(async () =>
+			[
+				"diff --git a/src/old.ts b/src/old.ts",
+				"--- a/src/old.ts",
+				"+++ b/src/old.ts",
+				"@@ -0,0 +1,1 @@",
+				"+const total = calculateTotal(items)",
+			].join("\n"),
+		)
+		await store.addPendingLineAttributions([buildPendingLine()])
+		await store.setRepoObservedCommit("/repo", "old-amend", "feature/stats")
+		const service = createService({
+			onCommitLifecycleObserved,
+			onCommitCollected,
+			loadCommitPatch,
+			getCurrentCommitSha: async () => "old-amend",
+			isAncestor: async (_repoRoot, olderCommit, newerCommit) => {
+				if (olderCommit === "old-amend" && newerCommit === "new-amend") {
+					return false
+				}
+				if (olderCommit === "new-amend" && newerCommit === "old-amend") {
+					return false
+				}
+				return true
+			},
+			loadCommitParent: async (_repoRoot, commitHash) =>
+				commitHash === "old-amend" || commitHash === "new-amend" ? "same-parent" : undefined,
+		})
+
+		await service.start()
+		watchers[0].emit({
+			type: "commit",
+			previousCommit: "old-amend",
+			newCommit: "new-amend",
+			branch: "feature/stats",
+			isBaseBranch: false,
+			watcher: watchers[0],
+			files: [],
+		})
+
+		await vi.waitFor(() => {
+			expect(onCommitLifecycleObserved).toHaveBeenCalledTimes(1)
+			expect(onCommitCollected).toHaveBeenCalledTimes(1)
+		})
+		expect(onCommitLifecycleObserved.mock.calls[0][0]).toMatchObject({
+			mode: "commit_lifecycle",
+			eventType: "commit_replaced",
+			reason: "amend",
+			confidence: "strong",
+			oldCommitHash: "old-amend",
+			newCommitHash: "new-amend",
+		})
+		expect(onCommitCollected.mock.calls[0][0]).toMatchObject({
+			commitHash: "new-amend",
+			previousCommit: "",
+		})
+		expect(loadCommitPatch).toHaveBeenCalledWith("/repo", "", "new-amend")
+	})
+
 	it("observes reset rewrite as a strong commits_abandoned lifecycle report", async () => {
 		const onCommitLifecycleObserved = vi.fn(async (_payload: any) => {})
 		await store.addPendingLineAttributions([buildPendingLine()])

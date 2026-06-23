@@ -103,27 +103,48 @@ export const STATISTICS_DEPARTMENT_OPTIONS: StatisticsDepartmentOption[] = [
 	},
 ]
 
-export const getStatisticsOfficeOptions = (departmentName?: string): StatisticsOfficeOption[] =>
-	STATISTICS_DEPARTMENT_OPTIONS.find((department) => department.name === departmentName)?.offices ?? []
+export const getStatisticsOfficeOptions = (
+	departmentName?: string,
+	departments: StatisticsDepartmentOption[] = STATISTICS_DEPARTMENT_OPTIONS,
+): StatisticsOfficeOption[] => departments.find((department) => department.name === departmentName)?.offices ?? []
 
-export const getStatisticsTeamOptions = (departmentName?: string, officeName?: string): string[] =>
-	getStatisticsOfficeOptions(departmentName).find((office) => office.name === officeName)?.teams ?? []
+export const getStatisticsTeamOptions = (
+	departmentName?: string,
+	officeName?: string,
+	departments: StatisticsDepartmentOption[] = STATISTICS_DEPARTMENT_OPTIONS,
+): string[] =>
+	getStatisticsOfficeOptions(departmentName, departments).find((office) => office.name === officeName)?.teams ?? []
 
-export const getStatisticsIdentityValidationKey = ({
-	departmentName,
-	officeName,
-	teamName,
-	userName,
-	userEmail,
-}: StatisticsIdentityFields): string | undefined => {
-	if (!departmentName?.trim()) {
+export const getStatisticsIdentityValidationKey = (
+	{ departmentName, officeName, teamName, userName, userEmail }: StatisticsIdentityFields,
+	departments: StatisticsDepartmentOption[] = STATISTICS_DEPARTMENT_OPTIONS,
+): string | undefined => {
+	const normalizedDepartmentName = departmentName?.trim() ?? ""
+	const normalizedOfficeName = officeName?.trim() ?? ""
+	const normalizedTeamName = teamName?.trim() ?? ""
+	if (!normalizedDepartmentName) {
 		return "settings:statistics.validation.departmentRequired"
 	}
-	if (!officeName?.trim()) {
+	const department = departments.find((item) => item.name === normalizedDepartmentName)
+	if (!department) {
+		return "settings:statistics.validation.departmentInvalid"
+	}
+	if (!normalizedOfficeName) {
 		return "settings:statistics.validation.officeRequired"
 	}
-	if (getStatisticsTeamOptions(departmentName, officeName).length > 0 && !teamName?.trim()) {
-		return "settings:statistics.validation.teamRequired"
+	const office = department.offices.find((item) => item.name === normalizedOfficeName)
+	if (!office) {
+		return "settings:statistics.validation.officeInvalid"
+	}
+	if (office.teams.length > 0) {
+		if (!normalizedTeamName) {
+			return "settings:statistics.validation.teamRequired"
+		}
+		if (!office.teams.includes(normalizedTeamName)) {
+			return "settings:statistics.validation.teamInvalid"
+		}
+	} else if (normalizedTeamName) {
+		return "settings:statistics.validation.teamInvalid"
 	}
 	if (!userName?.trim()) {
 		return "settings:statistics.validation.nameRequired"
@@ -251,6 +272,9 @@ type StatisticsSettingsProps = HTMLAttributes<HTMLDivElement> & {
 	// kilocode_change start
 	identityValidationError?: string
 	identityValidationErrorField?: StatisticsIdentityValidationField
+	statisticsDepartmentOptions?: StatisticsDepartmentOption[]
+	organizationOptionsStatusMessage?: string
+	onRefreshOrganizationOptions?: (webhookUrl?: string) => void
 	// kilocode_change end
 }
 
@@ -268,6 +292,9 @@ export const StatisticsSettings = ({
 	// kilocode_change start
 	identityValidationError,
 	identityValidationErrorField,
+	statisticsDepartmentOptions,
+	organizationOptionsStatusMessage,
+	onRefreshOrganizationOptions,
 	// kilocode_change end
 	...props
 }: StatisticsSettingsProps) => {
@@ -276,11 +303,12 @@ export const StatisticsSettings = ({
 	const [commitUploadRecords, setCommitUploadRecords] = useState<CommitUploadRecord[]>([])
 	const [pendingRecordId, setPendingRecordId] = useState<string | undefined>()
 	// kilocode_change start
-	const officeOptions = getStatisticsOfficeOptions(aiCodeStatsDepartmentName)
-	const teamOptions = getStatisticsTeamOptions(aiCodeStatsDepartmentName, aiCodeStatsOfficeName)
-	const selectedDepartmentName = STATISTICS_DEPARTMENT_OPTIONS.some(
-		(department) => department.name === aiCodeStatsDepartmentName,
-	)
+	const departmentOptions = statisticsDepartmentOptions?.length
+		? statisticsDepartmentOptions
+		: STATISTICS_DEPARTMENT_OPTIONS
+	const officeOptions = getStatisticsOfficeOptions(aiCodeStatsDepartmentName, departmentOptions)
+	const teamOptions = getStatisticsTeamOptions(aiCodeStatsDepartmentName, aiCodeStatsOfficeName, departmentOptions)
+	const selectedDepartmentName = departmentOptions.some((department) => department.name === aiCodeStatsDepartmentName)
 		? aiCodeStatsDepartmentName
 		: ""
 	const selectedOfficeName = officeOptions.some((office) => office.name === aiCodeStatsOfficeName)
@@ -311,6 +339,14 @@ export const StatisticsSettings = ({
 				{identityValidationError}
 			</div>
 		) : null
+
+	useEffect(() => {
+		if (!onRefreshOrganizationOptions) {
+			return
+		}
+		const timer = window.setTimeout(() => onRefreshOrganizationOptions(aiCodeStatsWebhookUrl), 300)
+		return () => window.clearTimeout(timer)
+	}, [aiCodeStatsWebhookUrl, onRefreshOrganizationOptions])
 
 	useEffect(() => {
 		const handleMessage = (event: MessageEvent) => {
@@ -430,6 +466,15 @@ export const StatisticsSettings = ({
 			<Section>
 				<div className="flex flex-col gap-6">
 					{/* kilocode_change start */}
+					{organizationOptionsStatusMessage && (
+						<div
+							className="rounded border border-vscode-panel-border bg-vscode-editor-background px-3 py-2 text-sm leading-6 text-vscode-descriptionForeground"
+							role="status"
+							aria-live="polite"
+							data-testid="ai-code-stats-organization-options-status">
+							{organizationOptionsStatusMessage}
+						</div>
+					)}
 					<SearchableSetting
 						settingId="statistics-department-name"
 						section="statistics"
@@ -447,7 +492,7 @@ export const StatisticsSettings = ({
 							</SelectTrigger>
 							<SelectContent>
 								<SelectGroup>
-									{STATISTICS_DEPARTMENT_OPTIONS.map((department) => (
+									{departmentOptions.map((department) => (
 										<SelectItem key={department.name} value={department.name}>
 											{department.name}
 										</SelectItem>

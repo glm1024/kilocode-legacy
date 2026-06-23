@@ -70,11 +70,18 @@
 		},
 		"validation": {
 			"departmentRequired": "请选择部门。",
+			"departmentInvalid": "当前部门不在服务器组织配置中，请重新选择部门。",
 			"officeRequired": "请选择处。",
+			"officeInvalid": "当前处不在服务器组织配置中，请重新选择处。",
 			"teamRequired": "请选择组。",
+			"teamInvalid": "当前组不在服务器组织配置中，请重新选择组。",
 			"nameRequired": "请填写姓名。",
 			"emailRequired": "请填写公司邮箱。",
 			"emailInvalid": "公司邮箱格式不正确。"
+		},
+		"organizationOptions": {
+			"cache": "无法连接服务器，已使用上次获取的组织配置。",
+			"fallback": "无法获取服务器组织配置，已使用内置组织选项。"
 		},
 		"webhook": {
 			"label": "上报服务器地址",

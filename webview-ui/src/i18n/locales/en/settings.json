@@ -70,11 +70,18 @@
 		},
 		"validation": {
 			"departmentRequired": "Please select a department.",
+			"departmentInvalid": "The current department is not in the server organization configuration. Please select it again.",
 			"officeRequired": "Please select an office.",
+			"officeInvalid": "The current office is not in the server organization configuration. Please select it again.",
 			"teamRequired": "Please select a team.",
+			"teamInvalid": "The current team is not in the server organization configuration. Please select it again.",
 			"nameRequired": "Please enter a name.",
 			"emailRequired": "Please enter a company email.",
 			"emailInvalid": "Company email format is invalid."
+		},
+		"organizationOptions": {
+			"cache": "Could not connect to the server. Using the last organization configuration fetched from this address.",
+			"fallback": "Could not load the server organization configuration. Using built-in organization options."
 		},
 		"webhook": {
 			"label": "Upload Server URL",

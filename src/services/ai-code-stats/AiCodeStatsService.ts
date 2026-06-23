@@ -60,6 +60,7 @@ const COMMIT_UPLOAD_SCAN_VISIBLE_LIMIT = 10
 const AUTO_REANALYSIS_MAX_ATTEMPTS = 3
 const AUTO_REANALYSIS_BACKOFF_MS = [0, 5 * 60 * 1000, 30 * 60 * 1000] as const
 const COMMIT_TIMESTAMP_MATCH_SKEW_MS = 2000
+const COMMIT_CANDIDATE_CLIENT_LINE_ID_MAX_LENGTH = 128
 
 const normalizeContentLines = (content: string): string[] => {
 	const normalized = content.replace(/\r\n/g, "\n")
@@ -1625,7 +1626,10 @@ export class AiCodeStatsService {
 			if (!repoRelativePath || !changedPathSet.has(repoRelativePath)) {
 				return false
 			}
-			return uploadedBlockIdsWithAddedLineMatch.has(block.generatedBlockId)
+			return (
+				uploadedBlockIdsWithAddedLineMatch.has(block.generatedBlockId) ||
+				this.generatedBlockHasChangedLineMatch(block, addedLineHashesByPath, deletedLineHashesByPath)
+			)
 		})
 
 		return {
@@ -1666,6 +1670,40 @@ export class AiCodeStatsService {
 			}
 		}
 		return hashesByPath
+	}
+
+	private generatedBlockHasChangedLineMatch(
+		block: AiCodeGeneratedBlockState,
+		addedLineHashesByPath: Map<string, Set<string>>,
+		deletedLineHashesByPath: Map<string, Set<string>>,
+	): boolean {
+		const repoRelativePath = normalizePath(block.repoRelativePath || block.relativePath || "")
+		if (!repoRelativePath) {
+			return false
+		}
+		const isDeletionBlock = block.changeType === "deletion"
+		const matchHashes = isDeletionBlock
+			? deletedLineHashesByPath.get(repoRelativePath)
+			: addedLineHashesByPath.get(repoRelativePath)
+		if (!matchHashes || matchHashes.size === 0) {
+			return false
+		}
+		const content = block.currentCodeSnippet ?? block.codeSnippet ?? ""
+		return normalizeContentLines(content).some((line) => matchHashes.has(hashLineFingerprint(line)))
+	}
+
+	private buildCommitCandidateLineId(parts: Array<string | number | undefined>): string {
+		const rawId = parts
+			.map((part) => (part === undefined ? "" : String(part)))
+			.filter((part) => part.length > 0)
+			.join(":")
+		if (rawId.length <= COMMIT_CANDIDATE_CLIENT_LINE_ID_MAX_LENGTH) {
+			return rawId
+		}
+
+		const digest = crypto.createHash("sha1").update(rawId, "utf8").digest("hex")
+		const prefixLength = COMMIT_CANDIDATE_CLIENT_LINE_ID_MAX_LENGTH - digest.length - 1
+		return `${rawId.slice(0, prefixLength)}:${digest}`
 	}
 
 	private resolveChangedFileRepoPaths(
@@ -1752,7 +1790,11 @@ export class AiCodeStatsService {
 					? lineStart + pendingLine.blockLineIndex - 1
 					: pendingLine.blockLineIndex
 			candidateLines.push({
-				clientLineId: `${params.commitHash}:${pendingLine.id}:${pendingLine.lineHash}`,
+				clientLineId: this.buildCommitCandidateLineId([
+					params.commitHash,
+					pendingLine.id,
+					pendingLine.lineHash,
+				]),
 				generatedBlockId,
 				baselineEventId:
 					baselineEventIdsByBlockId.get(generatedBlockId) ?? `${generatedBlockId}:${baselineMetricType}`,
@@ -1788,6 +1830,96 @@ export class AiCodeStatsService {
 				occurrenceIndex: pendingLine.occurrenceIndex,
 				changeType: pendingLine.changeType,
 			})
+		}
+
+		const candidateLineKeys = new Set(
+			candidateLines.map(
+				(line) => `${line.generatedBlockId}:${line.lineHash}:${line.occurrenceIndex ?? line.blockLineIndex}`,
+			),
+		)
+		for (const block of params.pendingGeneratedBlocks) {
+			const generatedBlockId = normalizeGeneratedBlockId(block.generatedBlockId)
+			if (!generatedBlockId || !uploadedBlockIds.has(generatedBlockId)) {
+				continue
+			}
+			const repoRelativePath = normalizePath(block.repoRelativePath || block.relativePath || "")
+			if (params.changedPathSet.size > 0 && (!repoRelativePath || !params.changedPathSet.has(repoRelativePath))) {
+				continue
+			}
+			const isDeletionBlock = block.changeType === "deletion"
+			const matchHashes = isDeletionBlock
+				? params.deletedLineHashesByPath.get(repoRelativePath)
+				: params.addedLineHashesByPath.get(repoRelativePath)
+			if (!matchHashes || matchHashes.size === 0) {
+				continue
+			}
+			const content = block.currentCodeSnippet ?? block.codeSnippet ?? ""
+			const contentLines = normalizeContentLines(content)
+			const lineStart = lineStartsByBlockId.get(generatedBlockId)
+			const occurrenceCounts = new Map<string, number>()
+			for (let index = 0; index < contentLines.length; index += 1) {
+				const rawLine = contentLines[index]
+				const lineHash = hashLineFingerprint(rawLine)
+				const occurrenceIndex = (occurrenceCounts.get(lineHash) ?? 0) + 1
+				occurrenceCounts.set(lineHash, occurrenceIndex)
+				if (!matchHashes.has(lineHash)) {
+					continue
+				}
+				const candidateLineKey = `${generatedBlockId}:${lineHash}:${occurrenceIndex}`
+				if (candidateLineKeys.has(candidateLineKey)) {
+					continue
+				}
+				candidateLineKeys.add(candidateLineKey)
+				const blockLineIndex = index + 1
+				const lineNumber = isDeletionBlock
+					? blockLineIndex
+					: typeof lineStart === "number"
+						? lineStart + blockLineIndex - 1
+						: blockLineIndex
+				candidateLines.push({
+					clientLineId: this.buildCommitCandidateLineId([
+						params.commitHash,
+						generatedBlockId,
+						"uploaded",
+						lineHash,
+						blockLineIndex,
+					]),
+					generatedBlockId,
+					baselineEventId:
+						baselineEventIdsByBlockId.get(generatedBlockId) ?? `${generatedBlockId}:${baselineMetricType}`,
+					baselineMetricType,
+					sourceTimestamp: block.currentTimestamp ?? block.timestamp,
+					sourceType: block.sourceType,
+					ide: block.ide,
+					userName: block.userName,
+					departmentName: block.departmentName,
+					officeName: block.officeName,
+					teamName: block.teamName,
+					userEmail: block.userEmail,
+					organizationId: block.organizationId,
+					organizationName: block.organizationName,
+					sourceIp: block.sourceIp,
+					provider: block.provider,
+					model: block.model,
+					projectKey: block.projectKey,
+					projectName: block.projectName,
+					filePath: normalizePath(block.filePath),
+					relativePath: normalizePath(block.relativePath),
+					repoRoot: normalizePath(block.repoRoot || params.repoRoot),
+					repoRelativePath,
+					language: block.language,
+					gitRemoteUrl: block.gitRemoteUrl,
+					gitBranch: params.gitBranch || block.gitBranch,
+					taskId: block.taskId,
+					lineNumber,
+					rawLine,
+					blockLineIndex,
+					blockLineCount: contentLines.length,
+					lineHash,
+					occurrenceIndex,
+					changeType: block.changeType,
+				})
+			}
 		}
 
 		return candidateLines.sort(
@@ -2510,10 +2642,29 @@ export class AiCodeStatsService {
 				timeoutMs: 0,
 			}
 			let lifecycleUploadError: string | undefined
-			try {
-				lifecycleUploadResult = await this.uploader.uploadQueuedLifecycleReports(settings)
-			} catch (error) {
-				lifecycleUploadError = error instanceof Error ? error.message : String(error)
+			const shouldDeferLifecycleUpload = Boolean(reportUploadError) || reportUploadResult.failedReports > 0
+			if (shouldDeferLifecycleUpload) {
+				const queuedLifecycleReports = await this.store.getQueuedCommitLifecycleReports()
+				if (queuedLifecycleReports.length > 0) {
+					await this.store.appendDiagnosticEvent({
+						type: "lifecycle_upload_deferred",
+						status: "queued",
+						message: "commit lifecycle upload deferred until queued commit reports succeed",
+						details: {
+							trigger,
+							action,
+							queuedLifecycleReportCount: queuedLifecycleReports.length,
+							failedCommitReports: reportUploadResult.failedReports + (reportUploadError ? 1 : 0),
+							...uploadTargetDetails,
+						},
+					})
+				}
+			} else {
+				try {
+					lifecycleUploadResult = await this.uploader.uploadQueuedLifecycleReports(settings)
+				} catch (error) {
+					lifecycleUploadError = error instanceof Error ? error.message : String(error)
+				}
 			}
 			if (lifecycleUploadError) {
 				await this.store.appendDiagnosticEvent({
