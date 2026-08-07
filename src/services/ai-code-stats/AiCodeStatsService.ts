@@ -31,6 +31,7 @@ import {
 import { resolveAiCodeStatsCommitStatusUrl, resolveAiCodeStatsWebhookUrl } from "./AiCodeStatsWebhookUrl"
 import {
 	AI_CODE_STATS_RETENTION_DAYS,
+	buildRepoCommitKey,
 	CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
 	normalizePath,
 	type AiCodeAddedCodeBlock,
@@ -61,6 +62,12 @@ const AUTO_REANALYSIS_MAX_ATTEMPTS = 3
 const AUTO_REANALYSIS_BACKOFF_MS = [0, 5 * 60 * 1000, 30 * 60 * 1000] as const
 const COMMIT_TIMESTAMP_MATCH_SKEW_MS = 2000
 const COMMIT_CANDIDATE_CLIENT_LINE_ID_MAX_LENGTH = 128
+const INCREMENTAL_UPLOAD_MAX_EVENTS_PER_REQUEST = 1000
+const INCREMENTAL_UPLOAD_MAX_BATCHES_PER_RUN = 10
+const COMMIT_REPORT_MAX_REPORTS_PER_RUN = 10
+const COMMIT_REPORT_UPLOAD_BUDGET_MS = 60 * 1000
+const LIFECYCLE_REPORT_MAX_REPORTS_PER_RUN = 50
+const LIFECYCLE_REPORT_UPLOAD_BUDGET_MS = 30 * 1000
 
 const normalizeContentLines = (content: string): string[] => {
 	const normalized = content.replace(/\r\n/g, "\n")
@@ -230,7 +237,12 @@ export class AiCodeStatsService {
 	private readonly taskModelContexts = new Map<string, AiCodeModelContext>()
 	private isUploading = false
 	private uploadRequestedWhileRunning = false
-	private isScanningCommitUploads = false
+	private readonly pendingTargetedUploadRequests: Array<{
+		reportId: string
+		action: AiCodeUploadAction
+	}> = []
+	private uploadRunPromise: Promise<void> | undefined
+	private commitUploadScanPromise: Promise<void> | undefined
 	private commitUploadScanTimer: NodeJS.Timeout | undefined
 
 	private constructor(
@@ -292,12 +304,12 @@ export class AiCodeStatsService {
 		void this.commitAttributionService.start().catch((error) => {
 			console.error("[AiCodeStats] Failed to start commit attribution service:", error)
 		})
-		void this.refreshCommitUploadStatus().catch((error) => {
-			console.error("[AiCodeStats] Failed to scan commit upload status on startup:", error)
+		void this.runCommitUploadMaintenance().catch((error) => {
+			console.error("[AiCodeStats] Failed to resume commit uploads on startup:", error)
 		})
 		this.commitUploadScanTimer ??= setInterval(() => {
-			void this.refreshCommitUploadStatus().catch((error) => {
-				console.error("[AiCodeStats] Failed to scan commit upload status:", error)
+			void this.runCommitUploadMaintenance().catch((error) => {
+				console.error("[AiCodeStats] Failed to run commit upload maintenance:", error)
 			})
 		}, COMMIT_UPLOAD_SCAN_INTERVAL_MS)
 	}
@@ -406,8 +418,6 @@ export class AiCodeStatsService {
 				changeType: "deletion",
 			}),
 		)
-		await this.store.addPendingCommitMetricBlocks([...nextBlocks.metricBlocks, ...deletionMetricBlocks])
-
 		const lineOccurrenceIndexes = buildLineOccurrenceIndexes(record.newContent)
 		const pendingLineAttributions = nextBlocks.nextBlocks.flatMap((block) =>
 			this.buildPendingLineAttributions(block, lineOccurrenceIndexes),
@@ -430,6 +440,7 @@ export class AiCodeStatsService {
 			sourceType: "agent_insert",
 			nextBlocks: [...nextBlocks.nextBlocks, ...existingDeletionBlocks, ...deletionBlockStates],
 			nextPendingLines: [...pendingLineAttributions, ...carriedDeletionPendingLines, ...deletionPendingLines],
+			nextPendingCommitMetricBlocks: [...nextBlocks.metricBlocks, ...deletionMetricBlocks],
 		})
 		await this.commitAttributionService.refreshRepoTracking(context.repoRoot)
 	}
@@ -497,17 +508,30 @@ export class AiCodeStatsService {
 		return this.store.getVisibleCommitUploadRecords()
 	}
 
+	private async runCommitUploadMaintenance(): Promise<void> {
+		// A report can be durably queued immediately before VS Code exits. Drain
+		// the outbox first on startup and every maintenance tick; receipt/status
+		// reconciliation alone cannot make a never-sent queued report progress.
+		await this.requestCommitTriggeredUpload()
+		await this.refreshCommitUploadStatus()
+	}
+
 	async refreshCommitUploadStatus(): Promise<AiCodeCommitUploadRecord[]> {
-		if (this.isScanningCommitUploads) {
+		if (this.commitUploadScanPromise) {
+			await this.commitUploadScanPromise
 			return this.store.getVisibleCommitUploadRecords()
 		}
 
-		this.isScanningCommitUploads = true
+		const scanPromise = this.scanCommitUploadStatus()
+		this.commitUploadScanPromise = scanPromise
 		try {
-			await this.scanCommitUploadStatus()
+			await scanPromise
 		} finally {
-			this.isScanningCommitUploads = false
+			if (this.commitUploadScanPromise === scanPromise) {
+				this.commitUploadScanPromise = undefined
+			}
 		}
+
 		return this.store.getVisibleCommitUploadRecords()
 	}
 
@@ -638,6 +662,7 @@ export class AiCodeStatsService {
 					exportedAt: new Date().toISOString(),
 					client: this.buildUploadClient(),
 					records: diagnostics.records.map((record) => this.redactCommitUploadRecord(record)),
+					blockedEvents: diagnostics.blockedEvents,
 					events: diagnostics.events.map((event) => ({
 						...event,
 						repoRoot: event.repoRoot ? this.redactRepoRoot(event.repoRoot) : undefined,
@@ -653,7 +678,7 @@ export class AiCodeStatsService {
 
 	private async scanCommitUploadStatus(): Promise<void> {
 		const settings = await this.getUploadSettings()
-		if (!settings.webhookUrl?.trim() || !settings.userEmail?.trim()) {
+		if (!settings.webhookUrl?.trim()) {
 			return
 		}
 
@@ -1041,7 +1066,7 @@ export class AiCodeStatsService {
 
 	private async confirmSingleCommitStatus(repoRoot: string, commitHash: string, reportId?: string): Promise<void> {
 		const settings = await this.getUploadSettings()
-		if (!settings.webhookUrl?.trim() || !settings.userEmail?.trim()) {
+		if (!settings.webhookUrl?.trim()) {
 			return
 		}
 		const statuses = await this.uploader.queryCommitStatuses(settings, {
@@ -1433,6 +1458,18 @@ export class AiCodeStatsService {
 		payload: AiCodeCommitFactsPayload,
 		options: CommitReportBuildOptions = {},
 	): Promise<void> {
+		if (!options.includeUploadedBlocks) {
+			const normalizedRepoRoot = normalizePath(path.resolve(payload.repoRoot))
+			const existingReport = (await this.store.getCommitUploadRecords()).some(
+				(record) =>
+					normalizePath(path.resolve(record.repoRoot)) === normalizedRepoRoot &&
+					record.commitHash === payload.commitHash,
+			)
+			if (existingReport) {
+				return
+			}
+		}
+
 		const selection = await this.selectCommitCandidateBlocks(payload)
 		const changedPathSet = selection.changedPathSet
 		const candidateGeneratedBlocks = selection.candidateBlocks
@@ -2551,28 +2588,63 @@ export class AiCodeStatsService {
 	}
 
 	private async appendPendingMetricEvents(events: AiCodeStatsEvent[]): Promise<void> {
-		for (const event of events) {
-			await this.store.appendEvent(event)
-		}
+		await this.store.appendEvents(events)
 	}
 
 	private async requestCommitTriggeredUpload(
 		reportId?: string,
 		action: AiCodeUploadAction = "commit",
 	): Promise<void> {
-		if (this.isUploading) {
-			this.uploadRequestedWhileRunning = true
-			return
+		if (this.uploadRunPromise) {
+			if (
+				reportId &&
+				!this.pendingTargetedUploadRequests.some(
+					(request) => request.reportId === reportId && request.action === action,
+				)
+			) {
+				this.pendingTargetedUploadRequests.push({ reportId, action })
+			} else if (!reportId) {
+				this.uploadRequestedWhileRunning = true
+			}
+			return this.uploadRunPromise
 		}
 
 		this.isUploading = true
+		this.uploadRequestedWhileRunning = false
+		const runPromise = this.runCommitTriggeredUploadLoop(reportId, action)
+		this.uploadRunPromise = runPromise
 		try {
-			do {
-				this.uploadRequestedWhileRunning = false
-				await this.performIncrementalUpload("commit", reportId, action)
-			} while (this.uploadRequestedWhileRunning)
+			await runPromise
 		} finally {
-			this.isUploading = false
+			if (this.uploadRunPromise === runPromise) {
+				this.uploadRunPromise = undefined
+				this.isUploading = false
+			}
+		}
+	}
+
+	private async runCommitTriggeredUploadLoop(
+		reportId?: string,
+		action: AiCodeUploadAction = "commit",
+	): Promise<void> {
+		let selectedReportId = reportId
+		let selectedAction = action
+		while (true) {
+			await this.performIncrementalUpload("commit", selectedReportId, selectedAction)
+
+			const targetedRequest = this.pendingTargetedUploadRequests.shift()
+			if (targetedRequest) {
+				selectedReportId = targetedRequest.reportId
+				selectedAction = targetedRequest.action
+				continue
+			}
+
+			if (!this.uploadRequestedWhileRunning) {
+				break
+			}
+			this.uploadRequestedWhileRunning = false
+			selectedReportId = undefined
+			selectedAction = "commit"
 		}
 	}
 
@@ -2619,7 +2691,20 @@ export class AiCodeStatsService {
 				})
 			}
 			try {
-				reportUploadResult = await this.uploader.uploadQueuedReports(settings, { reportId })
+				const isTargetedRetry = Boolean(reportId)
+				const isAutomaticReanalysis = action === "reanalysis"
+				reportUploadResult = await this.uploader.uploadQueuedReports(settings, {
+					reportId,
+					maxReports: isTargetedRetry ? 1 : COMMIT_REPORT_MAX_REPORTS_PER_RUN,
+					deadlineAt: isTargetedRetry ? undefined : Date.now() + COMMIT_REPORT_UPLOAD_BUDGET_MS,
+					// Automatic reanalysis already has its own durable 5/30 minute
+					// retry schedule. Nesting transport retries inside each scheduled
+					// attempt multiplies one logical retry into three requests and can
+					// hold the maintenance scan for minutes on network timeouts.
+					// Keep immediate retries only for an explicit user-targeted retry.
+					requestRetries: isTargetedRetry && !isAutomaticReanalysis ? 3 : 0,
+					stopOnGlobalFailure: true,
+				})
 			} catch (error) {
 				reportUploadError = error instanceof Error ? error.message : String(error)
 			}
@@ -2642,29 +2727,41 @@ export class AiCodeStatsService {
 				timeoutMs: 0,
 			}
 			let lifecycleUploadError: string | undefined
-			const shouldDeferLifecycleUpload = Boolean(reportUploadError) || reportUploadResult.failedReports > 0
-			if (shouldDeferLifecycleUpload) {
-				const queuedLifecycleReports = await this.store.getQueuedCommitLifecycleReports()
-				if (queuedLifecycleReports.length > 0) {
-					await this.store.appendDiagnosticEvent({
-						type: "lifecycle_upload_deferred",
-						status: "queued",
-						message: "commit lifecycle upload deferred until queued commit reports succeed",
-						details: {
-							trigger,
-							action,
-							queuedLifecycleReportCount: queuedLifecycleReports.length,
-							failedCommitReports: reportUploadResult.failedReports + (reportUploadError ? 1 : 0),
-							...uploadTargetDetails,
-						},
-					})
-				}
-			} else {
-				try {
-					lifecycleUploadResult = await this.uploader.uploadQueuedLifecycleReports(settings)
-				} catch (error) {
-					lifecycleUploadError = error instanceof Error ? error.message : String(error)
-				}
+			const remainingCommitReports = await this.store.getQueuedCommitReports()
+			const blockedLifecycleRepoCommitKeys = new Set(
+				remainingCommitReports
+					.filter((queued) => Boolean(queued.report.commitHash))
+					.map((queued) => buildRepoCommitKey(queued.report.repoRoot, queued.report.commitHash)),
+			)
+			const queuedLifecycleReports = await this.store.getQueuedCommitLifecycleReports()
+			const deferredLifecycleReports = queuedLifecycleReports.filter((queued) =>
+				this.lifecycleReportTouchesCommitHashes(queued.report, blockedLifecycleRepoCommitKeys),
+			)
+			if (deferredLifecycleReports.length > 0) {
+				await this.store.appendDiagnosticEvent({
+					type: "lifecycle_upload_deferred",
+					status: "queued",
+					message: "related commit lifecycle upload deferred until its queued commit report succeeds",
+					details: {
+						trigger,
+						action,
+						queuedLifecycleReportCount: queuedLifecycleReports.length,
+						deferredLifecycleReportCount: deferredLifecycleReports.length,
+						blockedCommitCount: blockedLifecycleRepoCommitKeys.size,
+						...uploadTargetDetails,
+					},
+				})
+			}
+			try {
+				lifecycleUploadResult = await this.uploader.uploadQueuedLifecycleReports(settings, {
+					blockedRepoCommitKeys: blockedLifecycleRepoCommitKeys,
+					maxReports: LIFECYCLE_REPORT_MAX_REPORTS_PER_RUN,
+					deadlineAt: Date.now() + LIFECYCLE_REPORT_UPLOAD_BUDGET_MS,
+					requestRetries: 0,
+					stopOnGlobalFailure: true,
+				})
+			} catch (error) {
+				lifecycleUploadError = error instanceof Error ? error.message : String(error)
 			}
 			if (lifecycleUploadError) {
 				await this.store.appendDiagnosticEvent({
@@ -2710,8 +2807,21 @@ export class AiCodeStatsService {
 
 			let eventUploadResult: AiCodeStatsUploadResult = { uploaded: 0 }
 			let eventUploadError: string | undefined
+			const blockedEventById = new Map<string, NonNullable<AiCodeStatsUploadResult["blockedEvents"]>[number]>()
 			try {
-				eventUploadResult = await this.uploader.upload(settings, { client: this.buildUploadClient() })
+				for (let batchIndex = 0; batchIndex < INCREMENTAL_UPLOAD_MAX_BATCHES_PER_RUN; batchIndex += 1) {
+					const batchResult = await this.uploader.upload(settings, {
+						client: this.buildUploadClient(),
+						maxEvents: INCREMENTAL_UPLOAD_MAX_EVENTS_PER_REQUEST,
+					})
+					eventUploadResult.uploaded += batchResult.uploaded
+					for (const block of batchResult.blockedEvents ?? []) {
+						blockedEventById.set(block.eventId, block)
+					}
+					if (batchResult.uploaded === 0) {
+						break
+					}
+				}
 			} catch (error) {
 				eventUploadError = error instanceof Error ? error.message : String(error)
 			}
@@ -2731,6 +2841,37 @@ export class AiCodeStatsService {
 					},
 				})
 			}
+			const blockedEventReasons = [...blockedEventById.values()].reduce<
+				NonNullable<AiCodeStatsLastUpload["blockedEventReasons"]>
+			>((summaries, block) => {
+				const existing = summaries.find(
+					(summary) =>
+						summary.category === block.category &&
+						summary.reason === block.reason &&
+						summary.retryable === block.retryable,
+				)
+				if (existing) {
+					existing.count += 1
+				} else {
+					summaries.push({
+						category: block.category,
+						reason: block.reason,
+						retryable: block.retryable,
+						count: 1,
+					})
+				}
+				return summaries
+			}, [])
+			const blockedEventMessage =
+				blockedEventById.size > 0
+					? `${blockedEventById.size} incremental event(s) blocked: ${blockedEventReasons
+							.map((summary) => `${summary.category} (${summary.count})`)
+							.join(", ")}`
+					: undefined
+			const effectiveEventUploadError =
+				[eventUploadError, blockedEventMessage]
+					.filter((message): message is string => Boolean(message))
+					.join("; ") || undefined
 
 			const failedReports =
 				reportUploadResult.failedReports +
@@ -2746,7 +2887,7 @@ export class AiCodeStatsService {
 				lifecycleUploadResult.failedReportErrors.length > 0
 					? `${lifecycleUploadResult.failedReportErrors.length} queued lifecycle report(s) failed`
 					: undefined,
-				eventUploadError ? `AI code stats upload failed: ${eventUploadError}` : undefined,
+				effectiveEventUploadError ? `AI code stats upload failed: ${effectiveEventUploadError}` : undefined,
 			].filter((message): message is string => Boolean(message))
 			const lastUpload: AiCodeStatsLastUpload = {
 				status: failureMessages.length > 0 ? "failed" : "success",
@@ -2758,8 +2899,10 @@ export class AiCodeStatsService {
 					...reportUploadResult.failedReportErrors,
 					...lifecycleUploadResult.failedReportErrors,
 				],
-				eventUploadFailed: Boolean(eventUploadError),
-				eventUploadError,
+				eventUploadFailed: Boolean(effectiveEventUploadError),
+				eventUploadError: effectiveEventUploadError,
+				blockedEvents: blockedEventById.size || undefined,
+				blockedEventReasons: blockedEventReasons.length > 0 ? blockedEventReasons : undefined,
 				message: failureMessages.length > 0 ? failureMessages.join("; ") : undefined,
 				rawPayloadBytes: reportUploadResult.rawPayloadBytes + lifecycleUploadResult.rawPayloadBytes,
 				compressedPayloadBytes:
@@ -2780,6 +2923,23 @@ export class AiCodeStatsService {
 			}
 			await this.store.setLastUploadStatus(lastUpload)
 		}
+	}
+
+	private lifecycleReportTouchesCommitHashes(
+		report: AiCodeCommitLifecycleReport,
+		repoCommitKeys: Set<string>,
+	): boolean {
+		if (repoCommitKeys.size === 0) {
+			return false
+		}
+		return [
+			report.oldCommitHash,
+			report.newCommitHash,
+			...(report.commitHashes ?? []),
+			...(report.replacementCommitHashes ?? []),
+		].some(
+			(commitHash) => Boolean(commitHash) && repoCommitKeys.has(buildRepoCommitKey(report.repoRoot, commitHash!)),
+		)
 	}
 
 	private async markFailedCommitReportUploads(

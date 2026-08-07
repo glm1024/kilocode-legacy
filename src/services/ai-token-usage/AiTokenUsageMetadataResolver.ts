@@ -26,8 +26,6 @@ export interface AiTokenUsageResolvedMetadata extends AiTokenUsageGitMetadata {
 }
 
 export class AiTokenUsageMetadataResolver {
-	private readonly gitMetadataCache = new Map<string, Promise<AiTokenUsageGitMetadata>>()
-
 	constructor(private readonly localIdentityResolver = new AiCodeStatsLocalIdentityResolver()) {}
 
 	async resolve(
@@ -63,14 +61,10 @@ export class AiTokenUsageMetadataResolver {
 	}
 
 	private async resolveGitMetadata(repoRoot: string): Promise<AiTokenUsageGitMetadata> {
-		const cached = this.gitMetadataCache.get(repoRoot)
-		if (cached) {
-			return cached
-		}
-
-		const pending = this.loadGitMetadata(repoRoot)
-		this.gitMetadataCache.set(repoRoot, pending)
-		return pending
+		// Branch is a per-request fact. Keeping a process-lifetime repository
+		// cache here would attribute all later requests to the branch that was
+		// active during the first request.
+		return this.loadGitMetadata(repoRoot)
 	}
 
 	private async loadGitMetadata(repoRoot: string): Promise<AiTokenUsageGitMetadata> {

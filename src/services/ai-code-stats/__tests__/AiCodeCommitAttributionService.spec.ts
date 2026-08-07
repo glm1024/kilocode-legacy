@@ -112,10 +112,11 @@ describe("AiCodeCommitAttributionService", () => {
 			loadCommitFileContent: async (_repoRoot: string, _commitHash: string, repoRelativePath: string) =>
 				`// committed snapshot for ${repoRelativePath}\nconst value = 1\n`,
 			getCurrentBranch: async () => "feature/stats",
-			getCurrentCommitSha: async () => "head-1",
+			getCurrentCommitSha: async () => "abc123",
 			isDetachedHead: async () => false,
 			isAncestor: async () => true,
-			listCommitsBetween: async () => [],
+			listCommitsBetween: async (_repoRoot, fromExclusive, toInclusive) =>
+				fromExclusive === toInclusive ? [] : [toInclusive],
 			listCommitsSinceTimestamp: async () => [],
 			...overrides,
 		})
@@ -174,8 +175,12 @@ describe("AiCodeCommitAttributionService", () => {
 			files: [],
 		})
 
+		// The watcher callback is intentionally fire-and-forget. Wait for the
+		// terminal comparison callback, not the earlier facts callback, so this
+		// assertion also covers the durable observed-commit write that precedes
+		// completion.
 		await vi.waitFor(() => {
-			expect(onCommitCollected).toHaveBeenCalledTimes(1)
+			expect(onCommitComparisonCompleted).toHaveBeenCalledTimes(1)
 		})
 
 		const payload = onCommitCollected.mock.calls[0][0]
@@ -213,7 +218,7 @@ describe("AiCodeCommitAttributionService", () => {
 			},
 		])
 		expect(await store.getPendingLineAttributions("/repo")).toHaveLength(2)
-		expect(onCommitComparisonCompleted).toHaveBeenCalledTimes(1)
+		expect(onCommitCollected).toHaveBeenCalledTimes(1)
 		expect(await store.getRepoObservedCommit("/repo", "feature/stats")).toBe("def456")
 	})
 
@@ -297,7 +302,7 @@ describe("AiCodeCommitAttributionService", () => {
 		})
 
 		expect(onCommitComparisonCompleted).not.toHaveBeenCalled()
-		expect(await store.getRepoObservedCommit("/repo", "feature/stats")).toBe("head-1")
+		expect(await store.getRepoObservedCommit("/repo", "feature/stats")).toBe("abc123")
 		expect(await store.getPendingLineAttributions("/repo")).toHaveLength(1)
 	})
 
@@ -401,9 +406,79 @@ describe("AiCodeCommitAttributionService", () => {
 		})
 		expect(onCommitCollected.mock.calls[0][0]).toMatchObject({
 			commitHash: "new-amend",
-			previousCommit: "",
+			previousCommit: "same-parent",
 		})
-		expect(loadCommitPatch).toHaveBeenCalledWith("/repo", "", "new-amend")
+		expect(loadCommitPatch).toHaveBeenCalledWith("/repo", "same-parent", "new-amend")
+	})
+
+	it("replays every commit when watcher notifications coalesce a fast-forward range", async () => {
+		const onCommitCollected = vi.fn(async (_payload: any) => {})
+		const loadCommitPatch = vi.fn(async () => "")
+		await store.addPendingLineAttributions([buildPendingLine()])
+		await store.setRepoObservedCommit("/repo", "base", "feature/stats")
+		const service = createService({
+			onCommitCollected,
+			loadCommitPatch,
+			getCurrentCommitSha: async () => "base",
+			listCommitsBetween: async (_repoRoot, fromExclusive, toInclusive) =>
+				fromExclusive === "base" && toInclusive === "tip" ? ["commit-1", "tip"] : [],
+			loadCommitParent: async (_repoRoot, commitHash) =>
+				commitHash === "commit-1" ? "base" : commitHash === "tip" ? "commit-1" : undefined,
+		})
+
+		await service.start()
+		watchers[0].emit({
+			type: "commit",
+			previousCommit: "base",
+			newCommit: "tip",
+			branch: "feature/stats",
+			isBaseBranch: false,
+			watcher: watchers[0],
+			files: [],
+		})
+
+		await vi.waitFor(() => {
+			expect(onCommitCollected).toHaveBeenCalledTimes(2)
+		})
+		expect(onCommitCollected.mock.calls.map(([payload]) => [payload.commitHash, payload.previousCommit])).toEqual([
+			["commit-1", "base"],
+			["tip", "commit-1"],
+		])
+		expect(loadCommitPatch.mock.calls).toEqual([
+			["/repo", "base", "commit-1"],
+			["/repo", "commit-1", "tip"],
+		])
+		expect(await store.getRepoObservedCommit("/repo", "feature/stats")).toBe("tip")
+	})
+
+	it("does not replay side-branch commits when a merge advances the watched branch", async () => {
+		const repoDir = await initRealGitRepo()
+		const mainBranch = (await execFileAsync("git", ["branch", "--show-current"], { cwd: repoDir })).stdout.trim()
+		const baseCommit = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: repoDir })).stdout.trim()
+		await execFileAsync("git", ["checkout", "-b", "feature-side"], { cwd: repoDir })
+		await fs.writeFile(path.join(repoDir, "side.ts"), "export const side = true\n", "utf8")
+		await execFileAsync("git", ["add", "side.ts"], { cwd: repoDir })
+		await execFileAsync("git", ["commit", "-m", "side commit"], { cwd: repoDir })
+		await execFileAsync("git", ["checkout", mainBranch], { cwd: repoDir })
+		await execFileAsync("git", ["merge", "--no-ff", "feature-side", "-m", "merge side"], { cwd: repoDir })
+		const mergeCommit = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: repoDir })).stdout.trim()
+		await store.setRepoObservedCommit(repoDir, baseCommit, mainBranch)
+		const service = createService({
+			isAncestor: undefined,
+			listCommitsBetween: undefined,
+		})
+
+		const commits = await (service as any).resolveCommitEventRewriteReplay(repoDir, {
+			type: "commit",
+			previousCommit: baseCommit,
+			newCommit: mergeCommit,
+			branch: mainBranch,
+		})
+
+		// A first-parent range contains only the merge commit, so the service
+		// preserves the normal one-commit watcher path. Without --first-parent,
+		// this would return the side commit plus the merge for replay.
+		expect(commits).toBeUndefined()
 	})
 
 	it("observes reset rewrite as a strong commits_abandoned lifecycle report", async () => {
@@ -443,6 +518,93 @@ describe("AiCodeCommitAttributionService", () => {
 			replacementCommitHashes: [],
 		})
 		expect(await store.getRepoObservedCommit("/repo", "feature/stats")).toBe("reset-base")
+	})
+
+	it("does not advance the observed cursor when lifecycle persistence fails", async () => {
+		const onCommitLifecycleObserved = vi.fn(async () => {
+			throw new Error("simulated lifecycle outbox failure")
+		})
+		const onCommitCollected = vi.fn(async () => {})
+		await store.addPendingLineAttributions([buildPendingLine()])
+		await store.setRepoObservedCommit("/repo", "old-reset-tip", "feature/stats")
+		const service = createService({
+			onCommitLifecycleObserved,
+			onCommitCollected,
+			getCurrentCommitSha: async () => "old-reset-tip",
+			isAncestor: async (_repoRoot, olderCommit, newerCommit) => {
+				if (olderCommit === "old-reset-tip" && newerCommit === "reset-base") {
+					return false
+				}
+				return olderCommit === "reset-base" && newerCommit === "old-reset-tip"
+			},
+			listCommitsBetween: async () => ["old-reset-tip"],
+		})
+		await service.start()
+
+		watchers[0].emit({
+			type: "commit",
+			previousCommit: "old-reset-tip",
+			newCommit: "reset-base",
+			branch: "feature/stats",
+			isBaseBranch: false,
+			watcher: watchers[0],
+			files: [],
+		})
+
+		await vi.waitFor(() => {
+			expect(onCommitLifecycleObserved).toHaveBeenCalledTimes(1)
+		})
+		expect(onCommitCollected).not.toHaveBeenCalled()
+		expect(await store.getRepoObservedCommit("/repo", "feature/stats")).toBe("old-reset-tip")
+	})
+
+	it("fails closed instead of splitting an oversized strong lifecycle transition", async () => {
+		const onCommitLifecycleObserved = vi.fn(async (_payload: any) => {})
+		const service = createService({ onCommitLifecycleObserved })
+		const oversizedCommitSet = Array.from({ length: 32_769 }, (_, index) => `commit-${index}`)
+
+		await expect(
+			(service as any).emitCommitLifecycleReport({
+				repoRoot: "/repo",
+				pendingLines: [buildPendingLine()],
+				currentBranch: "feature/stats",
+				eventType: "commits_abandoned",
+				reason: "reset",
+				confidence: "strong",
+				oldCommits: oversizedCommitSet,
+				newCommits: [],
+			}),
+		).rejects.toThrow("atomic ingest limit")
+		expect(onCommitLifecycleObserved).not.toHaveBeenCalled()
+	})
+
+	it("fails closed when a lifecycle branch exceeds the backend column contract", async () => {
+		const onCommitLifecycleObserved = vi.fn(async (_payload: any) => {})
+		const service = createService({ onCommitLifecycleObserved })
+
+		await expect(
+			(service as any).emitCommitLifecycleReport({
+				repoRoot: "/repo",
+				pendingLines: [buildPendingLine()],
+				currentBranch: `refs/heads/${"x".repeat(256)}`,
+				eventType: "commits_abandoned",
+				reason: "reset",
+				confidence: "strong",
+				oldCommits: ["old-commit"],
+				newCommits: [],
+			}),
+		).rejects.toThrow("branch exceeds")
+		expect(onCommitLifecycleObserved).not.toHaveBeenCalled()
+	})
+
+	it("rejects a commit timestamp outside the backend database range", async () => {
+		const service = createService({
+			loadCommitTimestamp: async () => Date.parse("1000-01-01T00:00:00.000Z"),
+		})
+
+		await expect((service as any).getCommitOccurredAt("/repo", "commit-outside-range")).rejects.toThrow(
+			"Invalid commit timestamp",
+		)
 	})
 
 	it("observes non-fast-forward branch rewrite as weak diagnostic lifecycle report", async () => {
@@ -547,7 +709,7 @@ describe("AiCodeCommitAttributionService", () => {
 
 		expect(onCommitCollected).not.toHaveBeenCalled()
 		expect(onCommitComparisonCompleted).not.toHaveBeenCalled()
-		expect(await store.getRepoObservedCommit("/repo", "feature/stats")).toBe("head-1")
+		expect(await store.getRepoObservedCommit("/repo", "feature/stats")).toBe("abc123")
 		expect(await store.getPendingLineAttributions("/repo")).toHaveLength(1)
 	})
 })

@@ -38,6 +38,7 @@ import { AiCodeStatsLocalIdentityResolver } from "../AiCodeStatsLocalIdentityRes
 
 describe("AiCodeStatsMetadataResolver", () => {
 	beforeEach(() => {
+		vi.clearAllMocks()
 		mockHasInstance.mockReturnValue(false)
 		mockGetUserInfo.mockReturnValue(undefined)
 		mockIsGitRepository.mockResolvedValue(false)
@@ -122,5 +123,31 @@ describe("AiCodeStatsMetadataResolver", () => {
 		expect(secondMetadata.gitBranch).toBe("codex/add-sql-and-agent")
 		expect(secondMetadata.gitRemoteUrl).toBe("https://github.com/example/repo.git")
 		expect(secondMetadata.projectKey).toBe(firstMetadata.projectKey)
+	})
+
+	it("refreshes project identity when a repository remote is configured or changed", async () => {
+		mockIsGitRepository.mockResolvedValue(true)
+		mockGetRemoteUrl
+			.mockResolvedValueOnce(undefined)
+			.mockResolvedValueOnce("https://github.com/example/repo.git")
+			.mockResolvedValueOnce("https://github.com/example/renamed-repo.git")
+		mockGetCurrentBranch.mockResolvedValue("main")
+
+		const resolver = new AiCodeStatsMetadataResolver({
+			resolveUserName: vi.fn(() => "Local Operator"),
+			resolveSourceIp: vi.fn(() => "10.10.1.8"),
+		} as unknown as AiCodeStatsLocalIdentityResolver)
+
+		const pathOnly = await resolver.resolve("/workspace/project", "/workspace/project/src/index.ts", {})
+		const configured = await resolver.resolve("/workspace/project", "/workspace/project/src/index.ts", {})
+		const changed = await resolver.resolve("/workspace/project", "/workspace/project/src/index.ts", {})
+
+		expect(pathOnly.gitRemoteUrl).toBeUndefined()
+		expect(configured.gitRemoteUrl).toBe("https://github.com/example/repo.git")
+		expect(changed.gitRemoteUrl).toBe("https://github.com/example/renamed-repo.git")
+		expect(configured.projectKey).not.toBe(pathOnly.projectKey)
+		expect(changed.projectKey).not.toBe(configured.projectKey)
+		expect(mockIsGitRepository).toHaveBeenCalledTimes(3)
+		expect(mockGetRemoteUrl).toHaveBeenCalledTimes(3)
 	})
 })

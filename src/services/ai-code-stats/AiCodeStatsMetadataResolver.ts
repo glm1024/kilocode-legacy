@@ -51,7 +51,6 @@ const normalizeLanguage = (value?: string): string | undefined => {
 }
 
 export class AiCodeStatsMetadataResolver {
-	private readonly stableGitMetadataCache = new Map<string, Promise<AiCodeStatsStableGitMetadata>>()
 	constructor(private readonly localIdentityResolver = new AiCodeStatsLocalIdentityResolver()) {}
 
 	async resolve(
@@ -108,15 +107,12 @@ export class AiCodeStatsMetadataResolver {
 
 	private async resolveGitMetadata(repoRoot: string): Promise<AiCodeStatsGitMetadata> {
 		const normalizedRepoRoot = normalizePath(path.resolve(repoRoot))
-		const cached = this.stableGitMetadataCache.get(normalizedRepoRoot)
-		if (cached) {
-			return this.attachCurrentBranch(normalizedRepoRoot, await cached)
-		}
-
-		const pending = this.loadStableGitMetadata(normalizedRepoRoot)
-		this.stableGitMetadataCache.set(normalizedRepoRoot, pending)
-
-		return this.attachCurrentBranch(normalizedRepoRoot, await pending)
+		// Remote configuration is part of the durable project identity. A
+		// process-lifetime cache would keep attributing later events to a
+		// path-derived project after `origin` is configured (or to an obsolete
+		// remote after it changes). Resolve both repository state and remote on
+		// every record, just as the current branch is resolved per record.
+		return this.attachCurrentBranch(normalizedRepoRoot, await this.loadStableGitMetadata(normalizedRepoRoot))
 	}
 
 	private async loadStableGitMetadata(repoRoot: string): Promise<AiCodeStatsStableGitMetadata> {

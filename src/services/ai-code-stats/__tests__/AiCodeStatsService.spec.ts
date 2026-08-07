@@ -2,6 +2,7 @@ import * as fs from "fs/promises"
 import * as os from "os"
 import * as path from "path"
 import { execFile as execFileCallback } from "child_process"
+import { createHash } from "crypto"
 import { promisify } from "util"
 import { gunzip as gunzipCallback } from "zlib"
 
@@ -95,7 +96,7 @@ import { CURRENT_AI_CODE_STATS_SEMANTICS_VERSION, type AiCodeCommitCandidateLine
 const execFileAsync = promisify(execFileCallback)
 const gunzipAsync = promisify(gunzipCallback)
 
-const parseJsonBody = async (body: BodyInit | null | undefined, headers?: Record<string, string>): Promise<any> => {
+const decodeJsonBody = async (body: BodyInit | null | undefined, headers?: Record<string, string>): Promise<Buffer> => {
 	const buffer =
 		body instanceof Uint8Array
 			? Buffer.from(body)
@@ -103,16 +104,46 @@ const parseJsonBody = async (body: BodyInit | null | undefined, headers?: Record
 				? Buffer.from(body)
 				: Buffer.from(body as ArrayBuffer)
 	if (headers?.["Content-Encoding"] === "gzip") {
-		return JSON.parse((await gunzipAsync(buffer)).toString("utf8"))
+		return gunzipAsync(buffer)
 	}
-	return JSON.parse(buffer.toString("utf8"))
+	return buffer
 }
 
-const acceptedIngestResponse = (): Response =>
-	new Response(JSON.stringify({ accepted: true, kind: "commit_report" }), {
-		status: 200,
-		headers: { "Content-Type": "application/json" },
-	})
+const parseJsonBody = async (body: BodyInit | null | undefined, headers?: Record<string, string>): Promise<any> =>
+	JSON.parse((await decodeJsonBody(body, headers)).toString("utf8"))
+
+const acceptedIngestResponseForRequest = async (_url: string, init: RequestInit): Promise<Response> => {
+	const rawBody = await decodeJsonBody(init.body as BodyInit, init.headers as Record<string, string> | undefined)
+	const payload = JSON.parse(rawBody.toString("utf8"))
+	const kind =
+		payload.mode === "commit_report"
+			? "commit_report"
+			: payload.mode === "commit_lifecycle"
+				? "commit_lifecycle"
+				: "envelope"
+	const itemCount =
+		payload.mode === "commit_report"
+			? (payload.generatedBlocks?.length ?? 0) + (payload.acceptedBlocks?.length ?? 0)
+			: payload.mode === "commit_lifecycle"
+				? 1
+				: Array.isArray(payload.events)
+					? payload.events.length
+					: 0
+	return new Response(
+		JSON.stringify({
+			accepted: true,
+			kind,
+			reportId: payload.reportId,
+			insertedEvents: itemCount,
+			duplicateEvents: 0,
+			payloadSha256: createHash("sha256").update(rawBody).digest("hex"),
+		}),
+		{
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		},
+	)
+}
 
 const createGitRepo = async (parentDir?: string, name?: string): Promise<string> => {
 	const repoDir =
@@ -235,7 +266,7 @@ describe("AiCodeStatsService", () => {
 			webhookUrl: "https://example.com/webhook",
 		}))
 
-		const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(acceptedIngestResponse()))
+		const fetchMock = vi.fn(acceptedIngestResponseForRequest)
 		vi.stubGlobal("fetch", fetchMock)
 
 		await service.recordAgentFileWrite({
@@ -247,6 +278,124 @@ describe("AiCodeStatsService", () => {
 		})
 
 		expect(fetchMock).not.toHaveBeenCalled()
+	})
+
+	it("preserves a second targeted retry that arrives while another upload is running", async () => {
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({ enabled: false }))
+		let releaseFirstUpload!: () => void
+		let markFirstUploadStarted!: () => void
+		const firstUploadStarted = new Promise<void>((resolve) => {
+			markFirstUploadStarted = resolve
+		})
+		const firstUploadBlocked = new Promise<void>((resolve) => {
+			releaseFirstUpload = resolve
+		})
+		const performIncrementalUpload = vi
+			.spyOn(service as any, "performIncrementalUpload")
+			.mockImplementationOnce(async () => {
+				markFirstUploadStarted()
+				await firstUploadBlocked
+			})
+			.mockResolvedValue(undefined)
+
+		const firstRequest = (service as any).requestCommitTriggeredUpload("report-a", "retry")
+		await firstUploadStarted
+		const secondRequest = (service as any).requestCommitTriggeredUpload("report-b", "retry")
+		let secondRequestResolved = false
+		void secondRequest.then(() => {
+			secondRequestResolved = true
+		})
+		await Promise.resolve()
+		expect(secondRequestResolved).toBe(false)
+		releaseFirstUpload()
+		await Promise.all([firstRequest, secondRequest])
+
+		expect(performIncrementalUpload.mock.calls).toEqual([
+			["commit", "report-a", "retry"],
+			["commit", "report-b", "retry"],
+		])
+	})
+
+	it("drains the whole outbox when an automatic upload request arrives during a targeted retry", async () => {
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({ enabled: false }))
+		let releaseFirstUpload!: () => void
+		let markFirstUploadStarted!: () => void
+		const firstUploadStarted = new Promise<void>((resolve) => {
+			markFirstUploadStarted = resolve
+		})
+		const firstUploadBlocked = new Promise<void>((resolve) => {
+			releaseFirstUpload = resolve
+		})
+		const performIncrementalUpload = vi
+			.spyOn(service as any, "performIncrementalUpload")
+			.mockImplementationOnce(async () => {
+				markFirstUploadStarted()
+				await firstUploadBlocked
+			})
+			.mockResolvedValue(undefined)
+
+		const firstRequest = (service as any).requestCommitTriggeredUpload("report-a", "retry")
+		await firstUploadStarted
+		const secondRequest = (service as any).requestCommitTriggeredUpload()
+		releaseFirstUpload()
+		await Promise.all([firstRequest, secondRequest])
+
+		expect(performIncrementalUpload.mock.calls).toEqual([
+			["commit", "report-a", "retry"],
+			["commit", undefined, "commit"],
+		])
+	})
+
+	it("drains queued uploads before reconciling server status during maintenance", async () => {
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({ enabled: false }))
+		const callOrder: string[] = []
+		vi.spyOn(service as any, "requestCommitTriggeredUpload").mockImplementation(async () => {
+			callOrder.push("upload")
+		})
+		vi.spyOn(service, "refreshCommitUploadStatus").mockImplementation(async () => {
+			callOrder.push("status")
+			return []
+		})
+
+		await (service as any).runCommitUploadMaintenance()
+
+		expect(callOrder).toEqual(["upload", "status"])
+	})
+
+	it("waits for an in-flight server status reconciliation instead of returning stale records", async () => {
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({ enabled: false }))
+		let releaseScan!: () => void
+		let markScanStarted!: () => void
+		const scanStarted = new Promise<void>((resolve) => {
+			markScanStarted = resolve
+		})
+		const scanBlocked = new Promise<void>((resolve) => {
+			releaseScan = resolve
+		})
+		const scanCommitUploadStatus = vi
+			.spyOn(service as any, "scanCommitUploadStatus")
+			.mockImplementation(async () => {
+				markScanStarted()
+				await scanBlocked
+			})
+
+		const firstRefresh = service.refreshCommitUploadStatus()
+		await scanStarted
+		const secondRefresh = service.refreshCommitUploadStatus()
+		let secondRefreshResolved = false
+		void secondRefresh.then(() => {
+			secondRefreshResolved = true
+		})
+		await Promise.resolve()
+		expect(secondRefreshResolved).toBe(false)
+
+		releaseScan()
+		await Promise.all([firstRefresh, secondRefresh])
+		expect(scanCommitUploadStatus).toHaveBeenCalledTimes(1)
 	})
 
 	it("queues rejected agent suggestions as generated events", async () => {
@@ -454,7 +603,7 @@ describe("AiCodeStatsService", () => {
 			webhookUrl: "https://example.com/webhook",
 			userEmail: "tester@example.com",
 		}))
-		const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(acceptedIngestResponse()))
+		const fetchMock = vi.fn(acceptedIngestResponseForRequest)
 		vi.stubGlobal("fetch", fetchMock)
 
 		await service.recordAgentFileWrite({
@@ -499,7 +648,7 @@ describe("AiCodeStatsService", () => {
 		const service = AiCodeStatsService.initialize(tmpDir, async () => ({
 			webhookUrl: "https://example.com/webhook",
 		}))
-		const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(acceptedIngestResponse()))
+		const fetchMock = vi.fn(acceptedIngestResponseForRequest)
 		vi.stubGlobal("fetch", fetchMock)
 
 		await (service as any).handleCommitCollected({
@@ -1485,7 +1634,7 @@ describe("AiCodeStatsService", () => {
 			if (payload.mode === "commit_report") {
 				uploadedReports.push(payload)
 			}
-			return acceptedIngestResponse()
+			return acceptedIngestResponseForRequest(_url, init!)
 		})
 		vi.stubGlobal("fetch", fetchMock)
 
@@ -1577,7 +1726,7 @@ describe("AiCodeStatsService", () => {
 			if (payload.mode === "commit_report") {
 				uploadedReports.push(payload)
 			}
-			return acceptedIngestResponse()
+			return acceptedIngestResponseForRequest(_url, init!)
 		})
 		vi.stubGlobal("fetch", fetchMock)
 
@@ -1690,7 +1839,7 @@ describe("AiCodeStatsService", () => {
 			if (payload.mode === "commit_report") {
 				uploadedReports.push(payload)
 			}
-			return acceptedIngestResponse()
+			return acceptedIngestResponseForRequest(_url, init!)
 		})
 		vi.stubGlobal("fetch", fetchMock)
 
@@ -2027,7 +2176,7 @@ describe("AiCodeStatsService", () => {
 			newContent: "const a = 1\nconst d = 4\n",
 		})
 
-		const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(acceptedIngestResponse()))
+		const fetchMock = vi.fn(acceptedIngestResponseForRequest)
 		vi.stubGlobal("fetch", fetchMock)
 
 		await (service as any).handleCommitCollected({
@@ -2090,7 +2239,7 @@ describe("AiCodeStatsService", () => {
 			newContent: "const a = 1\nconst branch = true\n",
 		})
 
-		const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(acceptedIngestResponse()))
+		const fetchMock = vi.fn(acceptedIngestResponseForRequest)
 		vi.stubGlobal("fetch", fetchMock)
 
 		await (service as any).handleCommitCollected({
@@ -2143,7 +2292,7 @@ describe("AiCodeStatsService", () => {
 		const fetchMock = vi
 			.fn()
 			.mockResolvedValueOnce(new Response("bad", { status: 400, statusText: "bad request" }))
-			.mockResolvedValueOnce(acceptedIngestResponse())
+			.mockImplementationOnce(acceptedIngestResponseForRequest)
 		vi.stubGlobal("fetch", fetchMock)
 
 		await (service as any).handleCommitCollected({
@@ -2174,6 +2323,84 @@ describe("AiCodeStatsService", () => {
 			commitHash: "commit-partial-fail",
 			encoding: "identity",
 		})
+	})
+
+	it("reports a persisted incremental-event block as a failed upload instead of success", async () => {
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({
+			webhookUrl: "https://example.com/webhook",
+		}))
+		const store = (service as any).store
+		await store.appendEvent({
+			eventId: "service-blocked-without-identity",
+			timestamp: Date.now(),
+			semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
+			sourceType: "agent_insert",
+			ide: "vscode",
+			metricType: "generated",
+			projectKey: "project-key",
+			filePath: "/workspace/project/src/blocked.ts",
+			relativePath: "src/blocked.ts",
+			lineStart: 1,
+			lineEnd: 1,
+			lineCount: 1,
+			codeSnippet: "const blocked = true",
+		})
+		const fetchMock = vi.fn()
+		vi.stubGlobal("fetch", fetchMock)
+
+		await (service as any).performIncrementalUpload("commit")
+
+		expect(fetchMock).not.toHaveBeenCalled()
+		const state = await store.getRawStateForTests()
+		expect(state.lastUpload).toMatchObject({
+			status: "failed",
+			uploadedEvents: 0,
+			eventUploadFailed: true,
+			blockedEvents: 1,
+		})
+		expect(state.lastUpload.eventUploadError).toContain("missing_identity")
+		expect(state.blockedEvents).toMatchObject({
+			"service-blocked-without-identity": expect.objectContaining({
+				category: "missing_identity",
+				retryable: true,
+			}),
+		})
+	})
+
+	it("does not create a second report when the same physical commit is replayed after queue persistence", async () => {
+		mockIsGitRepository.mockResolvedValue(true)
+		mockGetRemoteUrl.mockResolvedValue("https://github.com/example/idempotent-commit.git")
+		mockGetCurrentBranch.mockResolvedValue("main")
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const repoDir = await createGitRepo()
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({ enabled: false }))
+		const relativePath = "src/idempotent.ts"
+		const filePath = path.join(repoDir, relativePath)
+		const originalContent = "const base = 1\n"
+		const aiContent = "const base = 1\nconst idempotent = true\n"
+		await commitFile(repoDir, relativePath, originalContent, "base")
+		await service.recordAgentFileWrite({
+			cwd: repoDir,
+			filePath,
+			relativePath,
+			originalContent,
+			newContent: aiContent,
+			taskId: "task-idempotent-commit",
+		})
+		const commitHash = await commitFile(repoDir, relativePath, aiContent, "idempotent commit")
+		const facts = await (service as any).commitAttributionService.collectCommitFactsForReplay(
+			repoDir,
+			commitHash,
+			"main",
+		)
+
+		await (service as any).handleCommitCollected(facts, { skipImmediateUpload: true })
+		await (service as any).handleCommitCollected(facts, { skipImmediateUpload: true })
+
+		const queuedReports = await (service as any).store.getQueuedReportsForTests()
+		expect(queuedReports).toHaveLength(1)
+		expect(queuedReports[0].report.commitHash).toBe(commitHash)
 	})
 
 	it("automatically replays retained candidates when an observed uploaded commit is missing on the server", async () => {
@@ -2236,7 +2463,7 @@ describe("AiCodeStatsService", () => {
 			if (payload.mode === "commit_report") {
 				uploadedReports.push(payload)
 			}
-			return acceptedIngestResponse()
+			return acceptedIngestResponseForRequest(url, init!)
 		})
 		vi.stubGlobal("fetch", fetchMock)
 
@@ -2330,7 +2557,7 @@ describe("AiCodeStatsService", () => {
 				}
 				uploadedReports.push(payload)
 			}
-			return acceptedIngestResponse()
+			return acceptedIngestResponseForRequest(url, init!)
 		})
 		vi.stubGlobal("fetch", fetchMock)
 
@@ -2344,7 +2571,7 @@ describe("AiCodeStatsService", () => {
 
 		let visibleRecords = await service.refreshCommitUploadStatus()
 		expect(visibleRecords).toHaveLength(0)
-		expect(replayUploadAttempts).toBe(3)
+		expect(replayUploadAttempts).toBe(1)
 		let autoRecord = (await (service as any).store.getCommitUploadRecords()).find(
 			(record: any) => record.commitHash === commitHash && String(record.reportId).startsWith("replay-"),
 		)
@@ -2356,12 +2583,12 @@ describe("AiCodeStatsService", () => {
 
 		visibleRecords = await service.refreshCommitUploadStatus()
 		expect(visibleRecords).toHaveLength(0)
-		expect(replayUploadAttempts).toBe(3)
+		expect(replayUploadAttempts).toBe(1)
 
 		now += 5 * 60 * 1000
 		visibleRecords = await service.refreshCommitUploadStatus()
 		expect(visibleRecords).toHaveLength(0)
-		expect(replayUploadAttempts).toBe(6)
+		expect(replayUploadAttempts).toBe(2)
 		autoRecord = (await (service as any).store.getCommitUploadRecords()).find(
 			(record: any) => record.commitHash === commitHash && String(record.reportId).startsWith("replay-"),
 		)
@@ -2373,7 +2600,7 @@ describe("AiCodeStatsService", () => {
 
 		now += 30 * 60 * 1000
 		visibleRecords = await service.refreshCommitUploadStatus()
-		expect(replayUploadAttempts).toBe(9)
+		expect(replayUploadAttempts).toBe(3)
 		expect(visibleRecords).toHaveLength(1)
 		expect(visibleRecords[0]).toMatchObject({
 			commitHash,
@@ -2430,7 +2657,7 @@ describe("AiCodeStatsService", () => {
 						{ status: 200, headers: { "Content-Type": "application/json" } },
 					)
 				}
-				return acceptedIngestResponse()
+				return acceptedIngestResponseForRequest(url, init!)
 			})
 			vi.stubGlobal("fetch", fetchMock)
 
@@ -2505,7 +2732,7 @@ describe("AiCodeStatsService", () => {
 				}
 				uploadedReports.push(payload)
 			}
-			return acceptedIngestResponse()
+			return acceptedIngestResponseForRequest(url, init!)
 		})
 		vi.stubGlobal("fetch", fetchMock)
 
@@ -2588,7 +2815,7 @@ describe("AiCodeStatsService", () => {
 			if (payload.mode === "commit_lifecycle") {
 				lifecycleUploads.push(payload)
 			}
-			return acceptedIngestResponse()
+			return acceptedIngestResponseForRequest(_url, init!)
 		})
 		vi.stubGlobal("fetch", fetchMock)
 
@@ -2614,7 +2841,7 @@ describe("AiCodeStatsService", () => {
 				oldCommitHash: "old-lifecycle-commit",
 				newCommitHash: commitHash,
 				commitHashes: ["old-lifecycle-commit"],
-				replacementHashes: [commitHash],
+				replacementCommitHashes: [commitHash],
 				eventOccurredAt: Date.now(),
 				reportedAt: Date.now(),
 			},
@@ -2679,7 +2906,7 @@ describe("AiCodeStatsService", () => {
 				}
 				uploadedReports.push(payload)
 			}
-			return acceptedIngestResponse()
+			return acceptedIngestResponseForRequest(url, init!)
 		})
 		vi.stubGlobal("fetch", fetchMock)
 

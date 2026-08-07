@@ -98,9 +98,9 @@ export function countSnapshotLines(content: string): number {
 
 export function buildCompactCommitReportPayload(
 	report: AiCodeCommitReport,
-	fallbackUserEmail: string,
+	fallbackUserEmail?: string,
 ): AiCodeCompactCommitReport {
-	const normalizedFallbackUserEmail = normalizeUserEmail(fallbackUserEmail) ?? fallbackUserEmail
+	const normalizedFallbackUserEmail = normalizeUserEmail(fallbackUserEmail)
 	const defaults = resolveDefaults(report, normalizedFallbackUserEmail)
 	const snapshots = new Map<string, AiCodeSnapshotPayload>()
 
@@ -163,7 +163,7 @@ export function buildCompactCommitReportPayload(
 	return payload
 }
 
-function resolveDefaults(report: AiCodeCommitReport, fallbackUserEmail: string): AiCodeCompactDefaults {
+function resolveDefaults(report: AiCodeCommitReport, fallbackUserEmail?: string): AiCodeCompactDefaults {
 	const firstBlock = report.acceptedBlocks?.[0] ?? report.generatedBlocks?.[0]
 	const firstLine = report.candidateLines?.[0]
 	return {
@@ -190,7 +190,7 @@ function resolveDefaults(report: AiCodeCommitReport, fallbackUserEmail: string):
 function compactBlock(
 	block: AiCodeGeneratedBlock,
 	defaults: AiCodeCompactDefaults,
-	fallbackUserEmail: string,
+	fallbackUserEmail: string | undefined,
 	rememberSnapshot: (content?: string) => string | undefined,
 ): AiCodeCompactBlockPayload {
 	const normalized: AiCodeCompactBlockPayload = {
@@ -250,7 +250,7 @@ function compactChangedFile(
 function compactCandidateLines(
 	lines: AiCodeCommitCandidateLine[] | undefined,
 	defaults: AiCodeCompactDefaults,
-	fallbackUserEmail: string,
+	fallbackUserEmail: string | undefined,
 ): AiCodeCompactCandidateLinePayload[] | undefined {
 	const result = (lines ?? []).map((line) => {
 		const normalized: AiCodeCompactCandidateLinePayload = {

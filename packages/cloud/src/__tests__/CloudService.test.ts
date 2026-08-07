@@ -186,6 +186,48 @@ describe("CloudService", () => {
 				"CloudService instance already created",
 			)
 		})
+
+		it("should not treat an active session without a stable user ID as logout or an account switch", async () => {
+			const cloudService = await CloudService.createInstance(mockContext)
+			const authStateListener = mockAuthService.on.mock.calls.find(
+				(call: unknown[]) => call[0] === "auth-state-changed",
+			)?.[1]
+			const userInfoListener = mockAuthService.on.mock.calls.find(
+				(call: unknown[]) => call[0] === "user-info",
+			)?.[1]
+			expect(authStateListener).toBeTypeOf("function")
+			expect(userInfoListener).toBeTypeOf("function")
+
+			mockAuthService.getUserInfo.mockReturnValue({ id: "user-a" })
+			authStateListener({ state: "active-session", previousState: "attempting-session" })
+			await cloudService.retryQueue!.enqueue(
+				"https://api.example.com/user-a-request",
+				{ method: "POST" },
+				"telemetry",
+			)
+			expect(cloudService.retryQueue!.getCurrentUserId()).toBe("user-a")
+
+			mockAuthService.getState.mockReturnValue("active-session")
+			mockAuthService.getUserInfo.mockReturnValue(undefined)
+			authStateListener({ state: "active-session", previousState: "active-session" })
+
+			expect(cloudService.retryQueue!.isPausedState()).toBe(true)
+			expect(cloudService.retryQueue!.getCurrentUserId()).toBe("user-a")
+			expect(cloudService.retryQueue!.getStats().totalQueued).toBe(1)
+			await expect(
+				cloudService.retryQueue!.enqueue(
+					"https://api.example.com/unknown-owner-request",
+					{ method: "POST" },
+					"telemetry",
+				),
+			).rejects.toThrow("Retry queue owner has not been confirmed")
+			expect(cloudService.retryQueue!.getStats().totalQueued).toBe(1)
+
+			mockAuthService.getUserInfo.mockReturnValue({ id: "user-a" })
+			userInfoListener({ userInfo: { id: "user-a" } })
+			expect(cloudService.retryQueue!.isPausedState()).toBe(false)
+			expect(cloudService.retryQueue!.getStats().totalQueued).toBe(1)
+		})
 	})
 
 	describe("authentication methods", () => {

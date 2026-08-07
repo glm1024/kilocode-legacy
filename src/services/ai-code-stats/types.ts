@@ -260,6 +260,8 @@ export interface AiCodeCommitLifecycleReport {
 export interface AiCodeQueuedCommitLifecycleReport {
 	report: AiCodeCommitLifecycleReport
 	createdAt: number
+	blockedReason?: string
+	blockedAt?: number
 }
 
 export type AiCodePendingCommitMetricBlock = AiCodeGeneratedBlock
@@ -347,6 +349,28 @@ export interface AiCodeStatsFailedReportUpload {
 	targetPath?: string
 }
 
+export type AiCodeStatsEventBlockCategory =
+	| "missing_identity"
+	| "invalid_identity"
+	| "invalid_local_payload"
+	| "payload_too_large"
+
+export interface AiCodeStatsEventUploadBlock {
+	eventId: string
+	category: AiCodeStatsEventBlockCategory
+	reason: string
+	retryable: boolean
+	firstBlockedAt: number
+	updatedAt: number
+}
+
+export interface AiCodeStatsEventBlockSummary {
+	category: AiCodeStatsEventBlockCategory
+	reason: string
+	retryable: boolean
+	count: number
+}
+
 export interface AiCodeStatsLastUpload {
 	status: "idle" | "success" | "failed"
 	timestamp?: number
@@ -357,6 +381,8 @@ export interface AiCodeStatsLastUpload {
 	failedReportErrors?: AiCodeStatsFailedReportUpload[]
 	eventUploadFailed?: boolean
 	eventUploadError?: string
+	blockedEvents?: number
+	blockedEventReasons?: AiCodeStatsEventBlockSummary[]
 	rawPayloadBytes?: number
 	compressedPayloadBytes?: number
 	timeoutMs?: number
@@ -368,6 +394,7 @@ export interface AiCodeStatsPersistedState {
 	version: 1
 	pendingEventIds: string[]
 	supersededEventIds: string[]
+	blockedEvents?: Record<string, Omit<AiCodeStatsEventUploadBlock, "eventId">>
 	repoObservedCommits: Record<string, string>
 	lastUpload: AiCodeStatsLastUpload
 }
@@ -493,6 +520,9 @@ export const toLocalDateKey = (timestamp: number): string => {
 }
 
 export const normalizePath = (value: string): string => value.replace(/\\/g, "/")
+
+export const buildRepoCommitKey = (repoRoot: string, commitHash: string): string =>
+	JSON.stringify([normalizePath(repoRoot).replace(/\/+$/, ""), commitHash.trim().toLowerCase()])
 
 export const normalizeUserEmail = (value?: string): string | undefined => {
 	const normalized = value?.trim().toLowerCase()

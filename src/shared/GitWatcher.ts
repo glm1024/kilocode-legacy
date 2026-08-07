@@ -19,6 +19,7 @@ import { execGetLines } from "./utils/exec"
 import {
 	getCurrentBranch,
 	getCurrentCommitSha,
+	getGitCommonDir,
 	getGitHeadPath,
 	isDetachedHead,
 	getBaseBranch,
@@ -39,6 +40,13 @@ export interface GitWatcherConfig {
 	 * If not provided, will be determined automatically
 	 */
 	defaultBranchOverride?: string
+
+	/**
+	 * Periodic state verification protects commit reporting from dropped or
+	 * unsupported file-system notifications. Set to 0 only in deterministic
+	 * tests that drive changes manually.
+	 */
+	statePollIntervalMs?: number
 }
 
 /**
@@ -131,6 +139,7 @@ export class GitWatcher implements vscode.Disposable {
 	private readonly disposables: vscode.Disposable[] = []
 	private currentState: GitStateSnapshot | null = null
 	private isProcessing = false
+	private hasPendingGitChange = false
 	private defaultBranch: string | null = null
 
 	constructor(public config: GitWatcherConfig) {
@@ -251,11 +260,22 @@ export class GitWatcher implements vscode.Disposable {
 				console.warn("[GitWatcher] Could not watch HEAD:", error)
 			}
 
+			let absoluteGitCommonDir = path.dirname(absoluteGitHeadPath)
+			try {
+				const gitCommonDir = await getGitCommonDir(this.config.cwd)
+				absoluteGitCommonDir = path.isAbsolute(gitCommonDir)
+					? gitCommonDir
+					: path.join(this.config.cwd, gitCommonDir)
+			} catch (error) {
+				// Preserve the legacy single-worktree fallback if an older or
+				// unusual Git installation cannot resolve --git-common-dir.
+				console.warn("[GitWatcher] Could not resolve common Git directory:", error)
+			}
+
 			// Watch branch refs for commits
 			// Use fs.watch here since refs are modified in place, not replaced
 			try {
-				const gitDir = path.dirname(absoluteGitHeadPath)
-				const refsHeadsPath = path.join(gitDir, "refs", "heads")
+				const refsHeadsPath = path.join(absoluteGitCommonDir, "refs", "heads")
 
 				if (fs.existsSync(refsHeadsPath)) {
 					const refsWatcher = fs.watch(refsHeadsPath, { recursive: true }, (eventType, filename) => {
@@ -275,8 +295,7 @@ export class GitWatcher implements vscode.Disposable {
 			// Watch packed-refs
 			// Use fs.watchFile here too since packed-refs can be replaced
 			try {
-				const gitDir = path.dirname(absoluteGitHeadPath)
-				const packedRefsPath = path.join(gitDir, "packed-refs")
+				const packedRefsPath = path.join(absoluteGitCommonDir, "packed-refs")
 
 				if (fs.existsSync(packedRefsPath)) {
 					fs.watchFile(packedRefsPath, { interval: 1000 }, (curr, prev) => {
@@ -293,6 +312,19 @@ export class GitWatcher implements vscode.Disposable {
 			} catch (error) {
 				console.warn("[GitWatcher] Could not watch packed-refs:", error)
 			}
+
+			const statePollIntervalMs = this.config.statePollIntervalMs ?? 5000
+			if (statePollIntervalMs > 0) {
+				const statePoller = setInterval(() => {
+					void this.handleGitChange("poll")
+				}, statePollIntervalMs)
+				statePoller.unref?.()
+				this.disposables.push(
+					new vscode.Disposable(() => {
+						clearInterval(statePoller)
+					}),
+				)
+			}
 		} catch (error) {
 			console.error("[GitWatcher] Failed to setup git watchers:", error)
 		}
@@ -302,13 +334,26 @@ export class GitWatcher implements vscode.Disposable {
 	 * Handle git state changes
 	 */
 	private async handleGitChange(change?: string): Promise<void> {
-		// Prevent concurrent execution - fs.watch can fire multiple times for one git operation
+		// Serialize fs.watch callbacks without dropping a later git state change that arrives
+		// while the current state lookup is still in flight.
 		if (this.isProcessing) {
+			this.hasPendingGitChange = true
 			return
 		}
 
 		this.isProcessing = true
 
+		try {
+			do {
+				this.hasPendingGitChange = false
+				await this.processGitChange(change)
+			} while (this.hasPendingGitChange)
+		} finally {
+			this.isProcessing = false
+		}
+	}
+
+	private async processGitChange(change?: string): Promise<void> {
 		try {
 			// Check for detached HEAD
 			if (await isDetachedHead(this.config.cwd)) {
@@ -374,8 +419,6 @@ export class GitWatcher implements vscode.Disposable {
 			this.currentState = newState
 		} catch (error) {
 			console.error("[GitWatcher] Error handling git change:", error)
-		} finally {
-			this.isProcessing = false
 		}
 	}
 

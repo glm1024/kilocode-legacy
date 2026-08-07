@@ -46,6 +46,7 @@ describe("GitWatcher", () => {
 	let mockExecGetLines: ReturnType<typeof vi.fn>
 	let mockGetCurrentBranch: ReturnType<typeof vi.fn>
 	let mockGetCurrentCommitSha: ReturnType<typeof vi.fn>
+	let mockGetGitCommonDir: ReturnType<typeof vi.fn>
 	let mockGetGitHeadPath: ReturnType<typeof vi.fn>
 	let mockIsDetachedHead: ReturnType<typeof vi.fn>
 	let mockGetBaseBranch: ReturnType<typeof vi.fn>
@@ -54,12 +55,14 @@ describe("GitWatcher", () => {
 	beforeEach(() => {
 		config = {
 			cwd: "/test/repo",
+			statePollIntervalMs: 0,
 		}
 
 		// Setup mocks
 		mockExecGetLines = vi.fn()
 		mockGetCurrentBranch = vi.fn()
 		mockGetCurrentCommitSha = vi.fn()
+		mockGetGitCommonDir = vi.fn()
 		mockGetGitHeadPath = vi.fn()
 		mockIsDetachedHead = vi.fn()
 		mockGetBaseBranch = vi.fn()
@@ -68,6 +71,7 @@ describe("GitWatcher", () => {
 		vi.mocked(exec.execGetLines).mockImplementation(mockExecGetLines)
 		vi.mocked(gitUtils.getCurrentBranch).mockImplementation(mockGetCurrentBranch)
 		vi.mocked(gitUtils.getCurrentCommitSha).mockImplementation(mockGetCurrentCommitSha)
+		vi.mocked(gitUtils.getGitCommonDir).mockImplementation(mockGetGitCommonDir)
 		vi.mocked(gitUtils.getGitHeadPath).mockImplementation(mockGetGitHeadPath)
 		vi.mocked(gitUtils.isDetachedHead).mockImplementation(mockIsDetachedHead)
 		vi.mocked(gitUtils.getBaseBranch).mockImplementation(mockGetBaseBranch)
@@ -77,6 +81,7 @@ describe("GitWatcher", () => {
 		mockIsDetachedHead.mockResolvedValue(false)
 		mockGetCurrentBranch.mockResolvedValue("main")
 		mockGetCurrentCommitSha.mockResolvedValue("abc123")
+		mockGetGitCommonDir.mockResolvedValue(".git")
 		mockGetGitHeadPath.mockResolvedValue(".git/HEAD")
 		mockGetBaseBranch.mockResolvedValue("main")
 	})
@@ -221,6 +226,7 @@ describe("GitWatcher", () => {
 
 			expect(mockGetCurrentBranch).toHaveBeenCalled()
 			expect(mockGetCurrentCommitSha).toHaveBeenCalled()
+			expect(mockGetGitCommonDir).toHaveBeenCalled()
 			expect(mockGetGitHeadPath).toHaveBeenCalled()
 
 			watcher.dispose()
@@ -277,6 +283,48 @@ describe("GitWatcher", () => {
 			// Note: GitWatcher uses fs.watchFile for HEAD and packed-refs (via unwatchFile)
 			// and fs.watch for refs directory, so we expect 1 call to close (for refs watcher)
 			expect(mockClose).toHaveBeenCalledTimes(1)
+		})
+
+		it("watches refs in the common Git directory for linked worktrees", async () => {
+			mockGetGitHeadPath.mockResolvedValue("/repo/.git/worktrees/feature/HEAD")
+			mockGetGitCommonDir.mockResolvedValue("/repo/.git")
+			vi.mocked(fs.existsSync).mockReturnValue(true)
+
+			const watcher = new GitWatcher(config)
+			await watcher.start()
+
+			expect(vi.mocked(fs.watch)).toHaveBeenCalledWith(
+				"/repo/.git/refs/heads",
+				{ recursive: true },
+				expect.any(Function),
+			)
+
+			watcher.dispose()
+		})
+
+		it("periodically verifies Git state when file-system events are missed", async () => {
+			vi.useFakeTimers()
+			try {
+				mockGetCurrentCommitSha.mockResolvedValueOnce("abc123").mockResolvedValueOnce("def456")
+				const watcher = new GitWatcher({ ...config, statePollIntervalMs: 250 })
+				const handler = vi.fn()
+				watcher.onEvent(handler)
+				await watcher.start()
+				handler.mockClear()
+
+				await vi.advanceTimersByTimeAsync(250)
+
+				expect(handler).toHaveBeenCalledWith(
+					expect.objectContaining({
+						type: "commit",
+						previousCommit: "abc123",
+						newCommit: "def456",
+					}),
+				)
+				watcher.dispose()
+			} finally {
+				vi.useRealTimers()
+			}
 		})
 	})
 
@@ -355,7 +403,7 @@ describe("GitWatcher", () => {
 			watcher.dispose()
 		})
 
-		it("should not process changes when already processing", async () => {
+		it("should remember changes that arrive while already processing", async () => {
 			const watcher = new GitWatcher(config)
 
 			// Set processing flag
@@ -366,6 +414,58 @@ describe("GitWatcher", () => {
 
 			// Processing flag should still be true
 			expect((watcher as any).isProcessing).toBe(true)
+			expect((watcher as any).hasPendingGitChange).toBe(true)
+
+			watcher.dispose()
+		})
+
+		it("should recheck git state when a change arrives during an in-flight lookup", async () => {
+			let releaseFirstLookup!: () => void
+			let markFirstLookupStarted!: () => void
+			const firstLookupStarted = new Promise<void>((resolve) => {
+				markFirstLookupStarted = resolve
+			})
+			const firstLookupBlocked = new Promise<void>((resolve) => {
+				releaseFirstLookup = resolve
+			})
+
+			mockGetCurrentCommitSha
+				.mockResolvedValueOnce("abc123")
+				.mockImplementationOnce(async () => {
+					markFirstLookupStarted()
+					await firstLookupBlocked
+					return "def456"
+				})
+				.mockResolvedValueOnce("ghi789")
+
+			const watcher = new GitWatcher(config)
+			const handler = vi.fn()
+			watcher.onEvent(handler)
+			await watcher.start()
+			handler.mockClear()
+
+			const firstChange = (watcher as any).handleGitChange()
+			await firstLookupStarted
+			await (watcher as any).handleGitChange()
+			releaseFirstLookup()
+			await firstChange
+
+			expect(handler).toHaveBeenNthCalledWith(
+				1,
+				expect.objectContaining({
+					type: "commit",
+					previousCommit: "abc123",
+					newCommit: "def456",
+				}),
+			)
+			expect(handler).toHaveBeenNthCalledWith(
+				2,
+				expect.objectContaining({
+					type: "commit",
+					previousCommit: "def456",
+					newCommit: "ghi789",
+				}),
+			)
 
 			watcher.dispose()
 		})

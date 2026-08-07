@@ -21,6 +21,14 @@ import {
 	type AiCodePendingLineAttribution,
 } from "./types"
 
+// The compatibility ingest endpoint deliberately applies one lifecycle event
+// atomically and rejects larger per-side sets. Do not split a strong rewrite
+// into independently visible partial transitions.
+const MAX_COMMIT_LIFECYCLE_HASHES_PER_SIDE = 32_768
+const MAX_COMMIT_LIFECYCLE_BRANCH_CHARS = 255
+const MIN_DATABASE_TIMESTAMP_MILLIS = Date.parse("1000-01-02T00:00:00.000Z")
+const MAX_DATABASE_TIMESTAMP_MILLIS = Date.parse("9999-12-30T23:59:59.999Z")
+
 const execAsync = promisify(execCallback)
 const EXEC_MAX_BUFFER_BYTES = 16 * 1024 * 1024
 const GIT_STDOUT_LIMIT_BYTES = 128 * 1024 * 1024
@@ -222,19 +230,24 @@ const defaultListCommitsBetween = async (
 	fromExclusive: string,
 	toInclusive: string,
 ): Promise<string[]> => {
-	const { stdout } = await execAsync(`git rev-list --reverse ${fromExclusive}..${toInclusive}`, {
-		cwd: repoRoot,
-		maxBuffer: EXEC_MAX_BUFFER_BYTES,
-	})
+	const stdout = await runGitStdout(repoRoot, [
+		"rev-list",
+		"--first-parent",
+		"--reverse",
+		`${fromExclusive}..${toInclusive}`,
+	])
 	return splitGitOutputLines(stdout)
 }
 
 const defaultListCommitsSinceTimestamp = async (repoRoot: string, sinceTs: number): Promise<string[]> => {
-	const sinceIso = JSON.stringify(new Date(sinceTs).toISOString())
-	const { stdout } = await execAsync(`git rev-list --reverse --since=${sinceIso} HEAD`, {
-		cwd: repoRoot,
-		maxBuffer: EXEC_MAX_BUFFER_BYTES,
-	})
+	const sinceIso = new Date(sinceTs).toISOString()
+	const stdout = await runGitStdout(repoRoot, [
+		"rev-list",
+		"--first-parent",
+		"--reverse",
+		`--since=${sinceIso}`,
+		"HEAD",
+	])
 	return splitGitOutputLines(stdout)
 }
 
@@ -470,7 +483,13 @@ export class AiCodeCommitAttributionService {
 			return
 		}
 
-		const rewriteReplayCommits = await this.resolveCommitEventRewriteReplay(repoRoot, event)
+		let rewriteReplayCommits: string[] | null | undefined
+		try {
+			rewriteReplayCommits = await this.resolveCommitEventRewriteReplay(repoRoot, event)
+		} catch (error) {
+			console.error("[AiCodeCommitAttribution] Failed to persist commit lifecycle before replay:", error)
+			return
+		}
 		if (rewriteReplayCommits === null) {
 			return
 		}
@@ -484,13 +503,14 @@ export class AiCodeCommitAttributionService {
 			return
 		}
 
-		await this.notifyCommitComparisonCompleted()
-
-		if (result.remainingPendingLines === 0) {
-			return
+		if (result.remainingPendingLines > 0) {
+			// Advance the durable watcher cursor before announcing completion.
+			// The completion callback may trigger upload work immediately; a
+			// crash in that window must not leave the same commit looking unseen.
+			await this.store.setRepoObservedCommit(repoRoot, event.newCommit, event.branch)
 		}
 
-		await this.store.setRepoObservedCommit(repoRoot, event.newCommit, event.branch)
+		await this.notifyCommitComparisonCompleted()
 	}
 
 	private async resolveCommitEventRewriteReplay(
@@ -498,13 +518,34 @@ export class AiCodeCommitAttributionService {
 		event: Extract<GitWatcherEvent, { type: "commit" }>,
 	): Promise<string[] | null | undefined> {
 		const lastObservedCommit = await this.store.getRepoObservedCommit(repoRoot, event.branch)
-		if (!lastObservedCommit?.trim() || lastObservedCommit === event.newCommit) {
+		if (lastObservedCommit === event.newCommit) {
+			return []
+		}
+
+		const baselineCommit = lastObservedCommit?.trim() || event.previousCommit.trim()
+		if (!baselineCommit) {
 			return undefined
+		}
+		if (baselineCommit === event.newCommit) {
+			return []
 		}
 
 		try {
-			if (await this.isAncestor(repoRoot, lastObservedCommit, event.newCommit)) {
-				return undefined
+			if (await this.isAncestor(repoRoot, baselineCommit, event.newCommit)) {
+				const commits = await this.listCommitsBetween(repoRoot, baselineCommit, event.newCommit)
+				// Preserve the normal one-commit path: its watcher cursor is the
+				// exact first parent and avoids changing existing merge handling.
+				if (
+					commits.length === 1 &&
+					commits[0] === event.newCommit &&
+					baselineCommit === event.previousCommit.trim()
+				) {
+					return undefined
+				}
+				// An empty range for distinct, ancestor-related tips is
+				// inconsistent. Reprocess the tip as one commit instead of
+				// silently advancing the durable cursor.
+				return commits.length > 0 ? commits : [event.newCommit]
 			}
 
 			const pendingLines = await this.store.getPendingLineAttributions(repoRoot)
@@ -516,7 +557,7 @@ export class AiCodeCommitAttributionService {
 			return await this.resolveRewrittenCommitsToReplay(
 				repoRoot,
 				pendingLines,
-				lastObservedCommit,
+				baselineCommit,
 				event.newCommit,
 				event.branch,
 			)
@@ -534,7 +575,8 @@ export class AiCodeCommitAttributionService {
 	): Promise<void> {
 		let replayProcessed = false
 		for (const commitHash of commitsToReplay) {
-			const result = await this.processCommit(repoRoot, branch, commitHash, "")
+			const parentCommit = (await this.loadCommitParent(repoRoot, commitHash)) ?? ""
+			const result = await this.processCommit(repoRoot, branch, commitHash, parentCommit)
 			if (!result.processed) {
 				return
 			}
@@ -747,7 +789,21 @@ export class AiCodeCommitAttributionService {
 		if (oldCommits.length === 0 && newCommits.length === 0) {
 			return
 		}
+		if (
+			oldCommits.length > MAX_COMMIT_LIFECYCLE_HASHES_PER_SIDE ||
+			newCommits.length > MAX_COMMIT_LIFECYCLE_HASHES_PER_SIDE
+		) {
+			throw new Error(
+				`Commit lifecycle exceeds the atomic ingest limit of ${MAX_COMMIT_LIFECYCLE_HASHES_PER_SIDE} hashes per side`,
+			)
+		}
 		const referenceLine = params.pendingLines[0]
+		const gitBranch = params.currentBranch || referenceLine?.gitBranch
+		if (gitBranch && gitBranch.length > MAX_COMMIT_LIFECYCLE_BRANCH_CHARS) {
+			throw new Error(
+				`Commit lifecycle branch exceeds the ingest limit of ${MAX_COMMIT_LIFECYCLE_BRANCH_CHARS} characters`,
+			)
+		}
 		const now = Date.now()
 		const report: AiCodeCommitLifecycleReport = {
 			version: "v1",
@@ -770,7 +826,7 @@ export class AiCodeCommitAttributionService {
 			projectKey: referenceLine?.projectKey,
 			projectName: referenceLine?.projectName,
 			gitRemoteUrl: referenceLine?.gitRemoteUrl,
-			gitBranch: params.currentBranch || referenceLine?.gitBranch,
+			gitBranch,
 			eventType: params.eventType,
 			reason: params.reason,
 			confidence: params.confidence,
@@ -783,6 +839,10 @@ export class AiCodeCommitAttributionService {
 			await this.onCommitLifecycleObserved(report)
 		} catch (error) {
 			console.error("[AiCodeCommitAttribution] Failed to persist commit lifecycle report:", error)
+			// The observed cursor must not advance past a rewrite until its
+			// lifecycle intent is durable. Retrying the same deterministic
+			// eventId is safe once local persistence recovers.
+			throw error
 		}
 	}
 
@@ -825,7 +885,11 @@ export class AiCodeCommitAttributionService {
 
 	private async getCommitOccurredAt(repoRoot: string, commitHash: string): Promise<number> {
 		const commitOccurredAt = await this.loadCommitTimestamp(repoRoot, commitHash)
-		if (!Number.isFinite(commitOccurredAt)) {
+		if (
+			!Number.isSafeInteger(commitOccurredAt) ||
+			commitOccurredAt < MIN_DATABASE_TIMESTAMP_MILLIS ||
+			commitOccurredAt > MAX_DATABASE_TIMESTAMP_MILLIS
+		) {
 			throw new Error(`Invalid commit timestamp for ${commitHash}: ${commitOccurredAt}`)
 		}
 		return commitOccurredAt

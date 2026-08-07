@@ -102,6 +102,17 @@ export class CloudService extends EventEmitter<CloudServiceEvents> implements Di
 		}
 
 		this.authUserInfoListener = (data: AuthUserInfoPayload) => {
+			// kilocode_change start
+			if (this._authService?.getState() === "active-session" && data.userInfo?.id) {
+				// WebAuthService intentionally announces active-session before
+				// its user-info request completes. Re-run owner reconciliation
+				// when that stable identity arrives.
+				this.handleAuthStateChangeForRetryQueue({
+					state: "active-session",
+					previousState: "active-session",
+				})
+			}
+			// kilocode_change end
 			this.emit("user-info", data)
 		}
 
@@ -170,6 +181,15 @@ export class CloudService extends EventEmitter<CloudServiceEvents> implements Di
 			this._shareService = new CloudShareService(this._cloudAPI, this._settingsService, this.log)
 
 			this.isInitialized = true
+			// kilocode_change start
+			// Auth initialization may emit its first state before RetryQueue exists.
+			// Reconcile the durable queue owner with the current state explicitly
+			// so a restored queue never runs before account ownership is checked.
+			this.handleAuthStateChangeForRetryQueue({
+				state: this._authService.getState(),
+				previousState: "initializing",
+			})
+			// kilocode_change end
 		} catch (error) {
 			this.log("[CloudService] Failed to initialize:", error)
 			throw new Error(`Failed to initialize CloudService: ${error}`)
@@ -445,6 +465,18 @@ export class CloudService extends EventEmitter<CloudServiceEvents> implements Di
 		// Handle different auth states
 		switch (newState) {
 			case "active-session": {
+				// kilocode_change start
+				if (!newUserId) {
+					// An active token can be observed briefly before userInfo is
+					// populated. It is neither logout nor a confirmed new
+					// account, so keep the old durable owner untouched and wait
+					// for a later state/user update.
+					this._retryQueue.pauseUntilOwnerConfirmed()
+					this.log("[CloudService] Active session has no stable user ID; retry queue remains paused")
+					break
+				}
+				// kilocode_change end
+
 				// Check if user changed (different user logged in)
 				const wasCleared = this._retryQueue.clearIfUserChanged(newUserId)
 
@@ -463,27 +495,27 @@ export class CloudService extends EventEmitter<CloudServiceEvents> implements Di
 			case "logged-out":
 				// User is logged out, clear the queue
 				this._retryQueue.clearIfUserChanged(undefined)
-				this._retryQueue.pause()
+				this._retryQueue.pauseUntilOwnerConfirmed() // kilocode_change
 				this.log("[CloudService] Pausing and clearing retry queue for logged-out state")
 				break
 
 			case "initializing":
 			case "attempting-session":
 				// Transitional states, pause the queue but don't clear
-				this._retryQueue.pause()
+				this._retryQueue.pauseUntilOwnerConfirmed() // kilocode_change
 				this.log(`[CloudService] Pausing retry queue during ${newState}`)
 				break
 
 			case "inactive-session":
 				// Session is inactive (possibly expired), pause but don't clear
 				// The queue might resume if the session becomes active again
-				this._retryQueue.pause()
+				this._retryQueue.pauseUntilOwnerConfirmed() // kilocode_change
 				this.log("[CloudService] Pausing retry queue for inactive session")
 				break
 
 			default:
 				// Unknown state, pause as a safety measure
-				this._retryQueue.pause()
+				this._retryQueue.pauseUntilOwnerConfirmed() // kilocode_change
 				this.log(`[CloudService] Pausing retry queue for unknown state: ${newState}`)
 		}
 	}

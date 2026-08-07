@@ -329,6 +329,20 @@ export async function getGitHeadPath(workspacePath: string): Promise<string> {
 }
 
 /**
+ * Gets the common Git directory that owns refs and packed-refs.
+ *
+ * In a linked worktree, `--git-dir` points at `.git/worktrees/<name>` while
+ * branch refs still live in the main repository's common directory.
+ */
+export async function getGitCommonDir(workspacePath: string): Promise<string> {
+	try {
+		return await collectOutput("git rev-parse --git-common-dir", workspacePath, "getting common git directory")
+	} catch (error) {
+		throw new Error(`Failed to get common git directory: ${error instanceof Error ? error.message : String(error)}`)
+	}
+}
+
+/**
  * Gets the current git state (branch and commit)
  * @param workspacePath Path to the workspace
  * @returns Object with branch name and commit SHA, or null if detached

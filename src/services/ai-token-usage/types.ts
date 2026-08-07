@@ -1,7 +1,11 @@
+import { createHash } from "crypto"
+
 import { buildEmailUserKey, normalizePath as normalizeFsPath, normalizeUserEmail } from "../ai-code-stats/types"
 
 export type AiTokenUsageIde = "vscode" | "jetbrains" | "unscoped"
 export type AiTokenUsageUploadMode = "incremental"
+export type AiTokenUsageIdentityKind = "anonymous" | "configured"
+export type AiTokenUsageUploadIssueKind = "blocked" | "invalid"
 
 export type AiTokenUsageRange =
 	| { type: "current" }
@@ -54,6 +58,11 @@ export interface AiTokenUsageRecordInput {
 	cacheReadTokens: number
 	cacheWriteTokens: number
 	totalTokens: number
+	/**
+	 * Anonymous rows have never been assigned to a configured enterprise email.
+	 * Only those rows may later be adopted by a configured identity.
+	 */
+	identityKind?: AiTokenUsageIdentityKind
 }
 
 export interface AiTokenUsageAggregateRow extends AiTokenUsageRecordInput {
@@ -63,6 +72,10 @@ export interface AiTokenUsageAggregateRow extends AiTokenUsageRecordInput {
 	lastOccurredAt: number
 	dirty: boolean
 	uploadedAt?: number
+	uploadIssueKind?: AiTokenUsageUploadIssueKind
+	uploadIssueCode?: string
+	uploadIssueReason?: string
+	uploadIssueAt?: number
 }
 
 export interface AiTokenUsagePersistedState {
@@ -122,6 +135,13 @@ export interface AiTokenUsageSummary {
 
 export const AI_TOKEN_USAGE_VERSION = 1 as const
 export const AI_TOKEN_USAGE_RETENTION_DAYS = 180
+// kilocode_change start - keep persisted token usage inside the backend/MySQL-safe timestamp window
+// Keep one UTC day inside MySQL DATETIME's 1000..9999 range so session-timezone
+// conversion cannot cross either edge.
+export const AI_TOKEN_USAGE_MIN_DATABASE_TIMESTAMP_MILLIS = Date.parse("1000-01-02T00:00:00.000Z")
+export const AI_TOKEN_USAGE_MAX_DATABASE_TIMESTAMP_MILLIS = Date.parse("9999-12-30T23:59:59.999Z")
+// kilocode_change end
+export const AI_TOKEN_USAGE_ANONYMOUS_USER_KEY_PREFIX = "anonymous-install:"
 
 export const toLocalDateKey = (timestamp: number): string => {
 	const date = new Date(timestamp)
@@ -142,6 +162,22 @@ export { normalizeUserEmail }
 
 export const buildUserKey = (userEmail: string): string => buildEmailUserKey(userEmail)
 
+export const normalizeConfiguredUserEmail = (value?: string): string | undefined => {
+	const normalized = normalizeUserEmail(value)
+	if (!normalized || normalized.includes(" ")) {
+		return undefined
+	}
+	const at = normalized.indexOf("@")
+	const dot = normalized.lastIndexOf(".")
+	return at > 0 && dot > at + 1 && dot < normalized.length - 1 ? normalized : undefined
+}
+
+export const buildAnonymousUserKey = (installationId: string): string => {
+	const stableSeed = installationId.trim() || "unknown-installation"
+	const digest = createHash("sha256").update(`kilocode-ai-token-usage:${stableSeed}`).digest("hex")
+	return `${AI_TOKEN_USAGE_ANONYMOUS_USER_KEY_PREFIX}${digest.slice(0, 32)}`
+}
+
 export const buildAggregateKey = (
 	dateKey: string,
 	userKey: string,
@@ -149,4 +185,4 @@ export const buildAggregateKey = (
 	ide: AiTokenUsageIde,
 	provider: string,
 	model: string,
-): string => [dateKey, userKey, projectKey, ide, provider, model].join("::")
+): string => JSON.stringify([dateKey, userKey, projectKey, ide, provider, model])

@@ -10,7 +10,11 @@ import { AiTokenUsageMetadataResolver } from "./AiTokenUsageMetadataResolver"
 import { AiTokenUsageStore } from "./AiTokenUsageStore"
 import { AiTokenUsageUploader } from "./AiTokenUsageUploader"
 import {
+	AI_TOKEN_USAGE_MAX_DATABASE_TIMESTAMP_MILLIS,
+	AI_TOKEN_USAGE_MIN_DATABASE_TIMESTAMP_MILLIS,
+	buildAnonymousUserKey,
 	buildUserKey,
+	normalizeConfiguredUserEmail,
 	normalizeDimensionValue,
 	normalizePath,
 	type AiTokenUsageIde,
@@ -22,6 +26,33 @@ import {
 const execAsync = promisify(execCallback)
 const EXEC_MAX_BUFFER_BYTES = 4 * 1024 * 1024
 const TOKEN_USAGE_UPLOAD_DEBOUNCE_MS = 5_000
+const TOKEN_USAGE_UPLOAD_RETRY_INTERVAL_MS = 5 * 60 * 1_000
+
+const normalizeUsageCount = (value: number | undefined): number => {
+	if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+		return 0
+	}
+	return Math.min(Number.MAX_SAFE_INTEGER, Math.trunc(value))
+}
+
+const normalizeOccurredAt = (value: number | undefined): number => {
+	if (typeof value !== "number" || !Number.isFinite(value)) {
+		return Date.now()
+	}
+
+	const occurredAt = Math.trunc(value)
+	if (
+		!Number.isSafeInteger(occurredAt) ||
+		occurredAt < AI_TOKEN_USAGE_MIN_DATABASE_TIMESTAMP_MILLIS ||
+		occurredAt > AI_TOKEN_USAGE_MAX_DATABASE_TIMESTAMP_MILLIS
+	) {
+		return Date.now()
+	}
+	return occurredAt
+}
+
+const safeTokenTotal = (inputTokens: number, outputTokens: number): number =>
+	inputTokens > Number.MAX_SAFE_INTEGER - outputTokens ? Number.MAX_SAFE_INTEGER : inputTokens + outputTokens
 
 const detectIde = (): AiTokenUsageIde => {
 	const wrapper = getKiloCodeWrapperProperties()
@@ -64,7 +95,9 @@ export class AiTokenUsageService {
 	private started = false
 	private isUploading = false
 	private uploadRequestedWhileRunning = false
+	private uploadRunPromise: Promise<void> | undefined
 	private usageUploadTimer: NodeJS.Timeout | undefined
+	private usageRetryTimer: NodeJS.Timeout | undefined
 
 	private constructor(
 		globalStoragePath: string,
@@ -96,15 +129,31 @@ export class AiTokenUsageService {
 	}
 
 	start(): void {
+		if (this.started) {
+			return
+		}
 		this.started = true
 		void this.trackWorkspaceRepositoriesForCommitUpload().catch((error) => {
 			console.error("[AiTokenUsage] Failed to track workspace repositories:", error)
 		})
+		void this.requestUpload().catch((error) => {
+			console.error("[AiTokenUsage] Failed to resume pending token usage upload:", error)
+		})
+		this.usageRetryTimer = setInterval(() => {
+			void this.requestUpload().catch((error) => {
+				console.error("[AiTokenUsage] Failed to retry pending token usage upload:", error)
+			})
+		}, TOKEN_USAGE_UPLOAD_RETRY_INTERVAL_MS)
+		this.usageRetryTimer.unref?.()
 	}
 
 	stop(): void {
 		this.started = false
 		this.clearUsageUploadTimer()
+		if (this.usageRetryTimer) {
+			clearInterval(this.usageRetryTimer)
+			this.usageRetryTimer = undefined
+		}
 		for (const watcher of this.watchers.values()) {
 			watcher.dispose()
 		}
@@ -116,23 +165,21 @@ export class AiTokenUsageService {
 	}
 
 	async recordRequestUsage(record: AiTokenUsageRequestRecord): Promise<void> {
-		const inputTokens = Math.max(0, Math.trunc(record.inputTokens || 0))
-		const outputTokens = Math.max(0, Math.trunc(record.outputTokens || 0))
-		const cacheReadTokens = Math.max(0, Math.trunc(record.cacheReadTokens || 0))
-		const cacheWriteTokens = Math.max(0, Math.trunc(record.cacheWriteTokens || 0))
+		const inputTokens = normalizeUsageCount(record.inputTokens)
+		const outputTokens = normalizeUsageCount(record.outputTokens)
+		const cacheReadTokens = normalizeUsageCount(record.cacheReadTokens)
+		const cacheWriteTokens = normalizeUsageCount(record.cacheWriteTokens)
 		if (inputTokens === 0 && outputTokens === 0 && cacheReadTokens === 0 && cacheWriteTokens === 0) {
 			return
 		}
 
-		const occurredAt = record.occurredAt ?? Date.now()
+		const occurredAt = normalizeOccurredAt(record.occurredAt)
 		const settings = await this.getUploadSettings()
 		const repoRoot = (await resolveGitRepositoryRoot(record.cwd)) ?? normalizePath(path.resolve(record.cwd))
 		const metadata = await this.metadataResolver.resolve(repoRoot, settings)
 		const userName = normalizeDimensionValue(metadata.userName)
-		const userEmail = metadata.userEmail
-		if (!userEmail) {
-			return
-		}
+		const userEmail = normalizeConfiguredUserEmail(metadata.userEmail)
+		const userKey = userEmail ? buildUserKey(userEmail) : buildAnonymousUserKey(vscode.env.machineId)
 		const sourceIp = normalizeDimensionValue(metadata.sourceIp)
 		const provider = normalizeDimensionValue(record.provider, "unknown")
 		const model = normalizeDimensionValue(record.model, "unknown")
@@ -148,7 +195,7 @@ export class AiTokenUsageService {
 			officeName: metadata.officeName,
 			teamName: metadata.teamName,
 			sourceIp,
-			userKey: buildUserKey(userEmail),
+			userKey,
 			organizationId: metadata.organizationId,
 			organizationName: metadata.organizationName,
 			projectKey: metadata.projectKey,
@@ -164,7 +211,8 @@ export class AiTokenUsageService {
 			outputTokens,
 			cacheReadTokens,
 			cacheWriteTokens,
-			totalTokens: inputTokens + outputTokens,
+			totalTokens: safeTokenTotal(inputTokens, outputTokens),
+			identityKind: userEmail ? "configured" : "anonymous",
 		})
 
 		if (!this.started) {
@@ -234,20 +282,29 @@ export class AiTokenUsageService {
 	}
 
 	private async requestUpload(): Promise<void> {
-		if (this.isUploading) {
+		if (this.uploadRunPromise) {
 			this.uploadRequestedWhileRunning = true
-			return
+			return this.uploadRunPromise
 		}
 
 		this.isUploading = true
+		const runPromise = this.runUploadLoop()
+		this.uploadRunPromise = runPromise
 		try {
-			do {
-				this.uploadRequestedWhileRunning = false
-				await this.performIncrementalUpload()
-			} while (this.uploadRequestedWhileRunning)
+			await runPromise
 		} finally {
-			this.isUploading = false
+			if (this.uploadRunPromise === runPromise) {
+				this.uploadRunPromise = undefined
+				this.isUploading = false
+			}
 		}
+	}
+
+	private async runUploadLoop(): Promise<void> {
+		do {
+			this.uploadRequestedWhileRunning = false
+			await this.performIncrementalUpload()
+		} while (this.uploadRequestedWhileRunning)
 	}
 
 	private async performIncrementalUpload(): Promise<void> {
@@ -256,9 +313,14 @@ export class AiTokenUsageService {
 			return
 		}
 
-		await this.uploader.upload(settings, {
+		const result = await this.uploader.upload(settings, {
 			client: this.buildUploadClient(),
 		})
+		if (result.blocked > 0 || result.invalid > 0) {
+			console.warn(
+				`[AiTokenUsage] Retained ${result.blocked} blocked and ${result.invalid} invalid Token usage row(s); inspect the persisted uploadIssueReason diagnostics`,
+			)
+		}
 	}
 
 	private buildUploadClient() {

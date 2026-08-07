@@ -4,6 +4,44 @@ import type { QueuedRequest, QueueStats, RetryQueueConfig, RetryQueueEvents } fr
 
 type AuthHeaderProvider = () => Record<string, string> | undefined
 
+// kilocode_change start
+class RetryQueueAuthUnavailableError extends Error {
+	constructor() {
+		super("Retry queue auth headers are unavailable")
+		this.name = "RetryQueueAuthUnavailableError"
+	}
+}
+
+const DEFAULT_RETRY_AFTER_MS = 60 * 1000
+const MAX_RETRY_AFTER_MS = 24 * 60 * 60 * 1000
+const RETRY_QUEUE_STORAGE_VERSION = 1
+
+interface PersistedRetryQueue {
+	version: typeof RETRY_QUEUE_STORAGE_VERSION
+	ownerKnown: boolean
+	ownerUserId?: string
+	mutationEpoch: number
+	queuePausedUntil?: number
+	requests: QueuedRequest[]
+}
+
+interface PersistenceBarrier {
+	ownershipEpoch: number
+	targetOwnerKnown: boolean
+	targetOwnerUserId?: string
+	emitQueueCleared: boolean
+	resumeRequested: boolean
+	inFlight?: Promise<void>
+}
+
+interface EnqueueOwnerSnapshot {
+	ownershipEpoch: number
+	ownerKnown: boolean
+	ownerUserId?: string
+	requiresOwnerConfirmation: boolean
+}
+// kilocode_change end
+
 export class RetryQueue extends EventEmitter<RetryQueueEvents> {
 	private queue: Map<string, QueuedRequest> = new Map()
 	private context: ExtensionContext
@@ -16,7 +54,16 @@ export class RetryQueue extends EventEmitter<RetryQueueEvents> {
 	private queuePausedUntil?: number // Timestamp when the queue can resume processing
 	private isPaused = false // Manual pause state (e.g., for auth state changes)
 	private currentUserId?: string // Track current user ID for conditional clearing
-	private hasHadUser = false // Track if we've ever had a user (to distinguish from first login)
+	private ownerKnown = false
+	private requiresOwnerConfirmation = false
+	private legacyQueueHasUnknownOwner = false
+	private mutationEpoch = 0
+	private ownershipEpoch = 0
+	private pendingPersistenceBarrier?: PersistenceBarrier
+	private persistenceTail: Promise<void> = Promise.resolve()
+	private enqueueTail: Promise<void> = Promise.resolve()
+	private pendingEnqueueIds = new Set<string>()
+	private concurrentlyEvictedRequestIds = new Set<string>()
 
 	constructor(
 		context: ExtensionContext,
@@ -40,6 +87,12 @@ export class RetryQueue extends EventEmitter<RetryQueueEvents> {
 		}
 
 		this.loadPersistedQueue()
+		if (this.authHeaderProvider) {
+			// Authenticated queues must not process persisted requests until the
+			// current account has been compared with the durable owner.
+			this.requiresOwnerConfirmation = true
+			this.isPaused = true
+		}
 		this.startRetryTimer()
 	}
 
@@ -47,26 +100,220 @@ export class RetryQueue extends EventEmitter<RetryQueueEvents> {
 		if (!this.config.persistQueue) return
 
 		try {
-			const stored = this.context.workspaceState.get<QueuedRequest[]>(this.STORAGE_KEY)
-			if (stored && Array.isArray(stored)) {
-				stored.forEach((request) => {
-					this.queue.set(request.id, request)
-				})
-				this.log(`[RetryQueue] Loaded ${stored.length} persisted requests from workspace storage`)
+			const stored = this.context.workspaceState.get<unknown>(this.STORAGE_KEY)
+			if (Array.isArray(stored)) {
+				// The previous format had no account owner. Sending these requests
+				// with whichever account happens to log in next would cross an auth
+				// boundary, so retain them only in quarantine until an account
+				// transition durably replaces the legacy value.
+				const requests = stored.filter(this.isQueuedRequest)
+				requests.forEach((request) => this.queue.set(request.id, request))
+				this.legacyQueueHasUnknownOwner = requests.length > 0
+				this.requiresOwnerConfirmation = requests.length > 0
+				this.isPaused = requests.length > 0
+				this.log(
+					`[RetryQueue] Loaded ${requests.length} legacy persisted requests with unknown owner; queue is quarantined`,
+				)
+				return
+			}
+
+			if (this.isPersistedRetryQueue(stored)) {
+				stored.requests.forEach((request) => this.queue.set(request.id, request))
+				this.ownerKnown = stored.ownerKnown
+				this.currentUserId = stored.ownerUserId
+				this.mutationEpoch = stored.mutationEpoch
+				this.queuePausedUntil =
+					stored.queuePausedUntil !== undefined && stored.queuePausedUntil > Date.now()
+						? stored.queuePausedUntil
+						: undefined
+				this.legacyQueueHasUnknownOwner = !stored.ownerKnown && stored.requests.length > 0
+				this.requiresOwnerConfirmation = true
+				this.isPaused = true
+				this.log(
+					`[RetryQueue] Loaded ${stored.requests.length} persisted requests for ${
+						stored.ownerKnown ? (stored.ownerUserId ?? "owner-without-id") : "unknown owner"
+					}`,
+				)
+				return
+			}
+
+			if (stored !== undefined) {
+				// Unknown future/corrupt formats are fail-closed. A subsequent
+				// account confirmation will replace them with an empty envelope.
+				this.legacyQueueHasUnknownOwner = true
+				this.requiresOwnerConfirmation = true
+				this.isPaused = true
+				this.log("[RetryQueue] Unsupported persisted queue format; queue is quarantined")
 			}
 		} catch (error) {
 			this.log("[RetryQueue] Failed to load persisted queue:", error)
+			this.legacyQueueHasUnknownOwner = true
+			this.requiresOwnerConfirmation = true
+			this.isPaused = true
 		}
 	}
 
-	private async persistQueue(): Promise<void> {
+	private isPersistedRetryQueue(value: unknown): value is PersistedRetryQueue {
+		if (!value || typeof value !== "object") {
+			return false
+		}
+
+		const candidate = value as Partial<PersistedRetryQueue>
+		return (
+			candidate.version === RETRY_QUEUE_STORAGE_VERSION &&
+			typeof candidate.ownerKnown === "boolean" &&
+			(candidate.ownerUserId === undefined || typeof candidate.ownerUserId === "string") &&
+			Number.isSafeInteger(candidate.mutationEpoch) &&
+			(candidate.mutationEpoch ?? -1) >= 0 &&
+			(candidate.queuePausedUntil === undefined ||
+				(typeof candidate.queuePausedUntil === "number" &&
+					Number.isFinite(candidate.queuePausedUntil) &&
+					candidate.queuePausedUntil >= 0)) &&
+			Array.isArray(candidate.requests) &&
+			candidate.requests.every(this.isQueuedRequest)
+		)
+	}
+
+	private isQueuedRequest(value: unknown): value is QueuedRequest {
+		if (!value || typeof value !== "object") {
+			return false
+		}
+
+		const candidate = value as Partial<QueuedRequest>
+		return (
+			typeof candidate.id === "string" &&
+			typeof candidate.url === "string" &&
+			typeof candidate.timestamp === "number" &&
+			Number.isFinite(candidate.timestamp) &&
+			typeof candidate.retryCount === "number" &&
+			Number.isSafeInteger(candidate.retryCount) &&
+			candidate.retryCount >= 0 &&
+			typeof candidate.type === "string" &&
+			!!candidate.options &&
+			typeof candidate.options === "object"
+		)
+	}
+
+	private cloneRequest(request: QueuedRequest): QueuedRequest {
+		return {
+			...request,
+			options: {
+				...request.options,
+			},
+		}
+	}
+
+	private cloneQueue(requests: Iterable<QueuedRequest> = this.queue.values()): Map<string, QueuedRequest> {
+		return new Map(Array.from(requests, (request) => [request.id, this.cloneRequest(request)]))
+	}
+
+	private createPersistedSnapshot(owner?: { known: boolean; userId?: string }): PersistedRetryQueue {
+		return {
+			version: RETRY_QUEUE_STORAGE_VERSION,
+			ownerKnown: owner?.known ?? this.ownerKnown,
+			ownerUserId: owner ? owner.userId : this.currentUserId,
+			mutationEpoch: this.mutationEpoch,
+			queuePausedUntil: this.queuePausedUntil,
+			requests: Array.from(this.queue.values(), (request) => this.cloneRequest(request)),
+		}
+	}
+
+	private getEffectiveOwner(): { known: boolean; userId?: string } {
+		return this.pendingPersistenceBarrier
+			? {
+					known: this.pendingPersistenceBarrier.targetOwnerKnown,
+					userId: this.pendingPersistenceBarrier.targetOwnerUserId,
+				}
+			: {
+					known: this.ownerKnown,
+					userId: this.currentUserId,
+				}
+	}
+
+	private async persistQueue(owner?: { known: boolean; userId?: string }): Promise<void> {
 		if (!this.config.persistQueue) return
 
+		const snapshot = this.createPersistedSnapshot(owner)
+		const write = this.persistenceTail.then(() => this.context.workspaceState.update(this.STORAGE_KEY, snapshot))
+		// Keep later writes ordered even when an earlier update rejects.
+		this.persistenceTail = write.catch(() => undefined)
+
 		try {
-			const requests = Array.from(this.queue.values())
-			await this.context.workspaceState.update(this.STORAGE_KEY, requests)
+			await write
 		} catch (error) {
 			this.log("[RetryQueue] Failed to persist queue:", error)
+			throw error
+		}
+	}
+
+	private beginPersistenceBarrier(options: {
+		clearQueue: boolean
+		emitQueueCleared: boolean
+		targetOwnerKnown?: boolean
+		targetOwnerUserId?: string
+		resumeAfterPersistence?: boolean
+	}): void {
+		const previousBarrier = this.pendingPersistenceBarrier
+		const effectiveOwnerKnown = previousBarrier?.targetOwnerKnown ?? this.ownerKnown
+		const effectiveOwnerUserId = previousBarrier ? previousBarrier.targetOwnerUserId : this.currentUserId
+		this.ownershipEpoch++
+		this.mutationEpoch++
+		this.queuePausedUntil = undefined
+		this.isPaused = true
+
+		if (options.clearQueue) {
+			this.queue.clear()
+		}
+
+		const barrier: PersistenceBarrier = {
+			ownershipEpoch: this.ownershipEpoch,
+			targetOwnerKnown: options.targetOwnerKnown ?? effectiveOwnerKnown,
+			targetOwnerUserId:
+				options.targetOwnerKnown === undefined ? effectiveOwnerUserId : options.targetOwnerUserId,
+			emitQueueCleared: options.emitQueueCleared || previousBarrier?.emitQueueCleared === true,
+			resumeRequested: options.resumeAfterPersistence ?? previousBarrier?.resumeRequested ?? false,
+		}
+		this.pendingPersistenceBarrier = barrier
+		void this.ensurePersistenceBarrier().catch((error) => {
+			this.log("[RetryQueue] Durable queue transition remains pending:", error)
+		})
+	}
+
+	private async ensurePersistenceBarrier(): Promise<void> {
+		while (this.pendingPersistenceBarrier) {
+			const barrier = this.pendingPersistenceBarrier
+			if (!barrier.inFlight) {
+				barrier.inFlight = this.persistQueue({
+					known: barrier.targetOwnerKnown,
+					userId: barrier.targetOwnerUserId,
+				})
+			}
+
+			try {
+				await barrier.inFlight
+			} catch (error) {
+				barrier.inFlight = undefined
+				if (this.pendingPersistenceBarrier !== barrier || barrier.ownershipEpoch !== this.ownershipEpoch) {
+					continue
+				}
+				this.isPaused = true
+				throw error
+			}
+
+			if (this.pendingPersistenceBarrier !== barrier || barrier.ownershipEpoch !== this.ownershipEpoch) {
+				continue
+			}
+
+			this.pendingPersistenceBarrier = undefined
+			this.ownerKnown = barrier.targetOwnerKnown
+			this.currentUserId = barrier.targetOwnerUserId
+			if (barrier.emitQueueCleared) {
+				this.emit("queue-cleared")
+			}
+			if (barrier.resumeRequested && !this.requiresOwnerConfirmation) {
+				this.isPaused = false
+				this.log("[RetryQueue] Durable queue transition completed; queue resumed")
+			}
 		}
 	}
 
@@ -76,10 +323,52 @@ export class RetryQueue extends EventEmitter<RetryQueueEvents> {
 		type: QueuedRequest["type"] = "other",
 		operation?: string,
 	): Promise<void> {
+		const effectiveOwner = this.getEffectiveOwner()
+		const ownerSnapshot: EnqueueOwnerSnapshot = {
+			ownershipEpoch: this.ownershipEpoch,
+			ownerKnown: effectiveOwner.known,
+			ownerUserId: effectiveOwner.userId,
+			requiresOwnerConfirmation: this.requiresOwnerConfirmation,
+		}
+		const run = this.enqueueTail.then(() => this.enqueueInternal(url, options, type, operation, ownerSnapshot))
+		this.enqueueTail = run.catch(() => undefined)
+		return run
+	}
+
+	private async enqueueInternal(
+		url: string,
+		options: RequestInit,
+		type: QueuedRequest["type"],
+		operation: string | undefined,
+		ownerSnapshot: EnqueueOwnerSnapshot,
+	): Promise<void> {
+		await this.ensurePersistenceBarrier()
+		if (this.authHeaderProvider && (!ownerSnapshot.ownerKnown || ownerSnapshot.requiresOwnerConfirmation)) {
+			throw new Error("Retry queue owner has not been confirmed")
+		}
+		if (
+			this.ownershipEpoch !== ownerSnapshot.ownershipEpoch ||
+			(this.authHeaderProvider &&
+				(!this.ownerKnown ||
+					this.currentUserId !== ownerSnapshot.ownerUserId ||
+					this.requiresOwnerConfirmation))
+		) {
+			throw new Error("Retry queue owner changed before request could be queued")
+		}
+
+		const previousQueue = this.cloneQueue()
+		const previousMutationEpoch = this.mutationEpoch
+		const enqueueOwnershipEpoch = ownerSnapshot.ownershipEpoch
+		let evictedRequest: QueuedRequest | undefined
 		if (this.queue.size >= this.config.maxQueueSize) {
 			const oldestId = Array.from(this.queue.keys())[0]
 			if (oldestId) {
+				const oldestRequest = this.queue.get(oldestId)
+				evictedRequest = oldestRequest ? this.cloneRequest(oldestRequest) : undefined
 				this.queue.delete(oldestId)
+				if (this.isProcessing) {
+					this.concurrentlyEvictedRequestIds.add(oldestId)
+				}
 			}
 		}
 
@@ -94,7 +383,45 @@ export class RetryQueue extends EventEmitter<RetryQueueEvents> {
 		}
 
 		this.queue.set(request.id, request)
-		await this.persistQueue()
+		this.pendingEnqueueIds.add(request.id)
+		this.mutationEpoch++
+		try {
+			await this.persistQueue()
+		} catch (error) {
+			if (this.ownershipEpoch === enqueueOwnershipEpoch) {
+				if (this.mutationEpoch === previousMutationEpoch + 1) {
+					this.queue = previousQueue
+					if (evictedRequest) {
+						this.concurrentlyEvictedRequestIds.delete(evictedRequest.id)
+					}
+				} else {
+					// Another retry mutation may have completed while this write
+					// was pending. Remove only the request that was never durably
+					// accepted instead of rewinding unrelated newer state.
+					this.queue.delete(request.id)
+					if (evictedRequest && !this.queue.has(evictedRequest.id)) {
+						this.queue = new Map([
+							[evictedRequest.id, this.cloneRequest(evictedRequest)],
+							...this.queue.entries(),
+						])
+						this.concurrentlyEvictedRequestIds.delete(evictedRequest.id)
+					}
+				}
+				this.mutationEpoch++
+				try {
+					await this.persistQueue()
+				} catch (rollbackError) {
+					this.log("[RetryQueue] Failed to persist enqueue rollback:", rollbackError)
+				}
+			}
+			throw error
+		} finally {
+			this.pendingEnqueueIds.delete(request.id)
+		}
+
+		if (this.ownershipEpoch !== enqueueOwnershipEpoch || !this.queue.has(request.id)) {
+			return
+		}
 
 		this.emit("request-queued", request)
 		this.log(`[RetryQueue] Queued request: ${url}`)
@@ -105,25 +432,41 @@ export class RetryQueue extends EventEmitter<RetryQueueEvents> {
 			this.log("[RetryQueue] Already processing, skipping retry cycle")
 			return
 		}
+		this.isProcessing = true
+
+		try {
+			await this.ensurePersistenceBarrier()
+		} catch (error) {
+			// A failed owner/clear transition is retried by later timer cycles.
+			// Until it is durable the queue must remain fail-closed.
+			this.isProcessing = false
+			throw error
+		}
 
 		// Check if the queue is manually paused (e.g., due to auth state)
-		if (this.isPaused) {
+		if (this.isPaused || this.requiresOwnerConfirmation || this.legacyQueueHasUnknownOwner) {
 			this.log("[RetryQueue] Queue is manually paused")
+			this.isProcessing = false
 			return
 		}
 
 		// Check if the entire queue is paused due to rate limiting
 		if (this.queuePausedUntil && Date.now() < this.queuePausedUntil) {
 			this.log(`[RetryQueue] Queue is paused until ${new Date(this.queuePausedUntil).toISOString()}`)
+			this.isProcessing = false
 			return
 		}
 
-		const requests = Array.from(this.queue.values())
+		const requests = Array.from(this.queue.values()).filter((request) => !this.pendingEnqueueIds.has(request.id))
 		if (requests.length === 0) {
+			this.isProcessing = false
 			return
 		}
 
-		this.isProcessing = true
+		const retryOwnershipEpoch = this.ownershipEpoch
+		const previousRequests = this.cloneQueue(requests)
+		const deferredEvents: Array<() => void> = []
+		let stateChanged = false
 
 		try {
 			// Sort by timestamp to process in FIFO order (oldest first)
@@ -131,42 +474,31 @@ export class RetryQueue extends EventEmitter<RetryQueueEvents> {
 
 			// Process all requests in FIFO order
 			for (const request of requests) {
-				try {
-					const response = await this.retryRequest(request)
+				if (
+					this.isPaused ||
+					this.requiresOwnerConfirmation ||
+					this.legacyQueueHasUnknownOwner ||
+					this.ownershipEpoch !== retryOwnershipEpoch ||
+					this.queue.get(request.id) !== request
+				) {
+					break
+				}
 
-					// Check if we got a 429 rate limiting response
-					if (response && response.status === 429) {
-						const retryAfter = response.headers.get("Retry-After")
-						if (retryAfter) {
-							// Parse Retry-After (could be seconds or a date)
-							let delayMs: number
-							const retryAfterSeconds = parseInt(retryAfter, 10)
-							if (!isNaN(retryAfterSeconds)) {
-								delayMs = retryAfterSeconds * 1000
-							} else {
-								// Try parsing as a date
-								const retryDate = new Date(retryAfter)
-								if (!isNaN(retryDate.getTime())) {
-									delayMs = retryDate.getTime() - Date.now()
-								} else {
-									delayMs = 60000 // Default to 1 minute if we can't parse
-								}
-							}
-							// Pause the entire queue
-							this.queuePausedUntil = Date.now() + delayMs
-							this.log(`[RetryQueue] Rate limited, pausing entire queue for ${delayMs}ms`)
-							// Keep the request in the queue for later retry
-							this.queue.set(request.id, request)
-							// Stop processing further requests since the queue is paused
-							break
-						}
+				let response: Response
+				try {
+					response = await this.retryRequest(request)
+				} catch (error) {
+					if (this.ownershipEpoch !== retryOwnershipEpoch || this.queue.get(request.id) !== request) {
+						break
+					}
+					if (error instanceof RetryQueueAuthUnavailableError) {
+						this.log("[RetryQueue] Auth headers are unavailable; leaving queued requests untouched")
+						break
 					}
 
-					this.queue.delete(request.id)
-					this.emit("request-retry-success", request)
-				} catch (error) {
 					request.retryCount++
 					request.lastError = error instanceof Error ? error.message : String(error)
+					stateChanged = true
 
 					// Check if we've exceeded max retries
 					if (this.config.maxRetries > 0 && request.retryCount >= this.config.maxRetries) {
@@ -174,22 +506,106 @@ export class RetryQueue extends EventEmitter<RetryQueueEvents> {
 							`[RetryQueue] Max retries (${this.config.maxRetries}) reached for request: ${request.url}`,
 						)
 						this.queue.delete(request.id)
-						this.emit("request-max-retries-exceeded", request, error as Error)
+						deferredEvents.push(() => this.emit("request-max-retries-exceeded", request, error as Error))
 					} else {
 						this.queue.set(request.id, request)
-						this.emit("request-retry-failed", request, error as Error)
+						deferredEvents.push(() => this.emit("request-retry-failed", request, error as Error))
 					}
 
 					// Add a small delay between retry attempts
 					await this.delay(100)
+					continue
 				}
+
+				if (this.ownershipEpoch !== retryOwnershipEpoch || this.queue.get(request.id) !== request) {
+					break
+				}
+
+				// Check if we got a 429 rate limiting response
+				if (response.status === 429) {
+					// kilocode_change start
+					const retryAfter = response.headers.get("Retry-After")
+					const delayMs = this.parseRetryAfterDelay(retryAfter)
+					// Retry-After is optional, so use a conservative default instead of dropping the request.
+					this.queuePausedUntil = Date.now() + delayMs
+					stateChanged = true
+					this.log(`[RetryQueue] Rate limited, pausing entire queue for ${delayMs}ms`)
+					break
+					// kilocode_change end
+				}
+
+				this.queue.delete(request.id)
+				stateChanged = true
+				deferredEvents.push(() => this.emit("request-retry-success", request))
 			}
 
-			await this.persistQueue()
+			if (this.ownershipEpoch !== retryOwnershipEpoch || !stateChanged) {
+				return
+			}
+
+			this.mutationEpoch++
+			try {
+				await this.persistQueue()
+			} catch (error) {
+				if (this.ownershipEpoch === retryOwnershipEpoch) {
+					for (const previousRequest of previousRequests.values()) {
+						if (!this.concurrentlyEvictedRequestIds.has(previousRequest.id)) {
+							this.queue.set(previousRequest.id, this.cloneRequest(previousRequest))
+						}
+					}
+					this.mutationEpoch++
+					try {
+						// A later concurrent enqueue may already have queued a
+						// persistence write. Reconcile after it so the durable and
+						// in-memory queues both retain the retry-cycle snapshot.
+						await this.persistQueue()
+					} catch (rollbackError) {
+						this.log("[RetryQueue] Failed to persist retry rollback:", rollbackError)
+					}
+				}
+				throw error
+			}
+
+			deferredEvents.forEach((emitEvent) => emitEvent())
 		} finally {
 			// Always reset the processing flag, even if an error occurs
 			this.isProcessing = false
+			this.concurrentlyEvictedRequestIds.clear()
 		}
+	}
+
+	private parseRetryAfterDelay(retryAfter: string | null): number {
+		const normalized = retryAfter?.trim()
+		if (!normalized) {
+			return DEFAULT_RETRY_AFTER_MS
+		}
+
+		let delayMs: number | undefined
+		if (/^\d+$/.test(normalized)) {
+			const seconds = Number(normalized)
+			delayMs = Number.isFinite(seconds) ? seconds * 1000 : seconds > 0 ? MAX_RETRY_AFTER_MS : 0
+		} else if (this.isHttpDate(normalized)) {
+			const retryAt = Date.parse(normalized)
+			if (Number.isFinite(retryAt)) {
+				delayMs = retryAt - Date.now()
+			}
+		}
+
+		if (delayMs === undefined || Number.isNaN(delayMs)) {
+			return DEFAULT_RETRY_AFTER_MS
+		}
+		if (!Number.isFinite(delayMs)) {
+			return delayMs > 0 ? MAX_RETRY_AFTER_MS : 0
+		}
+		return Math.min(MAX_RETRY_AFTER_MS, Math.max(0, delayMs))
+	}
+
+	private isHttpDate(value: string): boolean {
+		return (
+			/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/i.test(value) ||
+			/^[A-Z][a-z]+, \d{2}-[A-Z][a-z]{2}-\d{2} \d{2}:\d{2}:\d{2} GMT$/i.test(value) ||
+			/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) [A-Z][a-z]{2} {1,2}\d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/i.test(value)
+		)
 	}
 
 	private async retryRequest(request: QueuedRequest): Promise<Response> {
@@ -198,11 +614,12 @@ export class RetryQueue extends EventEmitter<RetryQueueEvents> {
 		let headers = { ...request.options.headers }
 		if (this.authHeaderProvider) {
 			const freshAuthHeaders = this.authHeaderProvider()
-			if (freshAuthHeaders) {
-				headers = {
-					...headers,
-					...freshAuthHeaders,
-				}
+			if (!freshAuthHeaders) {
+				throw new RetryQueueAuthUnavailableError()
+			}
+			headers = {
+				...headers,
+				...freshAuthHeaders,
 			}
 		}
 
@@ -290,11 +707,12 @@ export class RetryQueue extends EventEmitter<RetryQueueEvents> {
 	}
 
 	public clear(): void {
-		this.queue.clear()
-		this.persistQueue().catch((error) => {
-			this.log("[RetryQueue] Failed to persist after clear:", error)
+		const shouldResume = !this.isPaused && !this.requiresOwnerConfirmation && !this.legacyQueueHasUnknownOwner
+		this.beginPersistenceBarrier({
+			clearQueue: true,
+			emitQueueCleared: true,
+			resumeAfterPersistence: shouldResume ? true : undefined,
 		})
-		this.emit("queue-cleared")
 	}
 
 	/**
@@ -303,13 +721,41 @@ export class RetryQueue extends EventEmitter<RetryQueueEvents> {
 	 */
 	public pause(): void {
 		this.isPaused = true
+		if (this.pendingPersistenceBarrier) {
+			this.pendingPersistenceBarrier.resumeRequested = false
+		}
 		this.log("[RetryQueue] Queue paused")
 	}
+
+	// kilocode_change start
+	/**
+	 * Pause retries and require a stable account ID before accepting or sending
+	 * authenticated work again.
+	 */
+	public pauseUntilOwnerConfirmed(): void {
+		if (this.authHeaderProvider) {
+			this.requiresOwnerConfirmation = true
+		}
+		this.pause()
+	}
+	// kilocode_change end
 
 	/**
 	 * Resume the retry queue. Retries will be processed again on the next interval.
 	 */
 	public resume(): void {
+		if (this.requiresOwnerConfirmation || this.legacyQueueHasUnknownOwner || this.pendingPersistenceBarrier) {
+			this.isPaused = true
+			if (this.pendingPersistenceBarrier) {
+				this.pendingPersistenceBarrier.resumeRequested = true
+				void this.ensurePersistenceBarrier().catch((error) => {
+					this.log("[RetryQueue] Queue remains paused until durable transition succeeds:", error)
+				})
+			}
+			this.log("[RetryQueue] Queue resume deferred until owner and storage are durable")
+			return
+		}
+
 		this.isPaused = false
 		this.log("[RetryQueue] Queue resumed")
 	}
@@ -326,6 +772,9 @@ export class RetryQueue extends EventEmitter<RetryQueueEvents> {
 	 */
 	public setCurrentUserId(userId: string | undefined): void {
 		this.currentUserId = userId
+		if (userId !== undefined) {
+			this.ownerKnown = true
+		}
 	}
 
 	/**
@@ -341,21 +790,44 @@ export class RetryQueue extends EventEmitter<RetryQueueEvents> {
 	 * Returns true if queue was cleared, false otherwise.
 	 */
 	public clearIfUserChanged(newUserId: string | undefined): boolean {
-		// First time ever setting a user (initial login)
-		if (!this.hasHadUser && newUserId !== undefined) {
-			this.currentUserId = newUserId
-			this.hasHadUser = true
+		this.requiresOwnerConfirmation = false
+		const effectiveOwner = this.getEffectiveOwner()
+
+		if (!effectiveOwner.known) {
+			if (this.legacyQueueHasUnknownOwner) {
+				this.log("[RetryQueue] Discarding legacy requests because their account owner is unknown")
+				this.legacyQueueHasUnknownOwner = false
+				this.beginPersistenceBarrier({
+					clearQueue: true,
+					emitQueueCleared: true,
+					targetOwnerKnown: true,
+					targetOwnerUserId: newUserId,
+				})
+				return true
+			}
+
+			// Even an empty/new queue must durably record its owner before it can
+			// be resumed. This makes a later failed account-switch clear
+			// detectable after restart.
+			this.beginPersistenceBarrier({
+				clearQueue: false,
+				emitQueueCleared: false,
+				targetOwnerKnown: true,
+				targetOwnerUserId: newUserId,
+			})
 			return false
 		}
 
 		// If user IDs are different (including logout case where newUserId is undefined)
-		if (this.currentUserId !== newUserId) {
-			this.log(`[RetryQueue] User changed from ${this.currentUserId} to ${newUserId}, clearing queue`)
-			this.clear()
-			this.currentUserId = newUserId
-			if (newUserId !== undefined) {
-				this.hasHadUser = true
-			}
+		if (effectiveOwner.userId !== newUserId) {
+			this.log(`[RetryQueue] User changed from ${effectiveOwner.userId} to ${newUserId}, clearing queue`)
+			this.legacyQueueHasUnknownOwner = false
+			this.beginPersistenceBarrier({
+				clearQueue: true,
+				emitQueueCleared: true,
+				targetOwnerKnown: true,
+				targetOwnerUserId: newUserId,
+			})
 			return true
 		}
 

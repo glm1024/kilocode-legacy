@@ -2,19 +2,30 @@ import type { ExtensionContext } from "vscode"
 import { RetryQueue } from "../RetryQueue.js"
 import type { QueuedRequest } from "../types.js"
 
-// Mock ExtensionContext
-const createMockContext = (): ExtensionContext => {
-	const storage = new Map<string, unknown>()
-
+// Mock ExtensionContext. Clone values to model VS Code's durable serialization
+// rather than letting in-memory request mutations alter the persisted snapshot.
+const createMockContext = (storage = new Map<string, unknown>()): ExtensionContext => {
 	return {
 		workspaceState: {
-			get: vi.fn((key: string) => storage.get(key)),
+			get: vi.fn((key: string) => {
+				const value = storage.get(key)
+				return value === undefined ? undefined : structuredClone(value)
+			}),
 			update: vi.fn(async (key: string, value: unknown) => {
-				storage.set(key, value)
+				storage.set(key, structuredClone(value))
 			}),
 		},
 	} as unknown as ExtensionContext
 }
+
+const createQueuedRequest = (id: string, url = `https://api.example.com/${id}`): QueuedRequest => ({
+	id,
+	url,
+	options: { method: "POST" },
+	timestamp: Date.now(),
+	retryCount: 0,
+	type: "telemetry",
+})
 
 describe("RetryQueue", () => {
 	let mockContext: ExtensionContext
@@ -54,6 +65,143 @@ describe("RetryQueue", () => {
 			const stats = retryQueue.getStats()
 			expect(stats.totalQueued).toBe(3) // Should only have 3 items (oldest was evicted)
 		})
+
+		it("should reject and restore the in-memory queue when initial persistence fails", async () => {
+			await retryQueue.enqueue("https://api.example.com/existing", { method: "POST" }, "telemetry")
+			const queuedListener = vi.fn()
+			retryQueue.on("request-queued", queuedListener)
+			vi.mocked(mockContext.workspaceState.update).mockRejectedValueOnce(new Error("disk unavailable"))
+
+			await expect(
+				retryQueue.enqueue("https://api.example.com/not-persisted", { method: "POST" }, "api-call"),
+			).rejects.toThrow("disk unavailable")
+
+			expect(retryQueue.getStats()).toMatchObject({
+				totalQueued: 1,
+				byType: { telemetry: 1 },
+			})
+			expect(queuedListener).not.toHaveBeenCalled()
+		})
+
+		it("should restore a FIFO-evicted request when a concurrent enqueue cannot persist", async () => {
+			const storage = new Map<string, unknown>()
+			mockContext = createMockContext(storage)
+			retryQueue = new RetryQueue(mockContext, { maxQueueSize: 2 })
+			await retryQueue.enqueue("https://api.example.com/first", { method: "POST" }, "telemetry")
+			await retryQueue.enqueue("https://api.example.com/second", { method: "POST" }, "telemetry")
+
+			const fetchMock = vi.fn().mockRejectedValue(new Error("network unavailable"))
+			global.fetch = fetchMock
+			const retry = retryQueue.retryAll()
+			await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+
+			let rejectEnqueueWrite!: (error: Error) => void
+			vi.mocked(mockContext.workspaceState.update).mockImplementationOnce(
+				() =>
+					new Promise<void>((_resolve, reject) => {
+						rejectEnqueueWrite = reject
+					}),
+			)
+			const enqueue = retryQueue.enqueue("https://api.example.com/third", { method: "POST" }, "telemetry")
+			await vi.waitFor(() => expect(mockContext.workspaceState.update).toHaveBeenCalledTimes(3))
+			await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+			await vi.waitFor(() => expect(Reflect.get(retryQueue, "mutationEpoch")).toBe(4))
+
+			rejectEnqueueWrite(new Error("storage unavailable"))
+
+			await expect(enqueue).rejects.toThrow("storage unavailable")
+			await retry
+			expect(retryQueue.getStats()).toMatchObject({
+				totalQueued: 2,
+				totalRetries: 2,
+			})
+			expect(storage.get("roo.retryQueue")).toMatchObject({
+				requests: [
+					expect.objectContaining({ url: "https://api.example.com/first", retryCount: 1 }),
+					expect.objectContaining({ url: "https://api.example.com/second", retryCount: 1 }),
+				],
+			})
+		})
+
+		it("should not move an enqueue waiting in the local tail to a different account", async () => {
+			const storage = new Map<string, unknown>()
+			mockContext = createMockContext(storage)
+			const authHeaderProvider = vi.fn().mockReturnValue({
+				Authorization: "Bearer current-token",
+			})
+			retryQueue = new RetryQueue(mockContext, {}, undefined, authHeaderProvider)
+			expect(retryQueue.clearIfUserChanged("user-a")).toBe(false)
+			retryQueue.resume()
+			await vi.waitFor(() => expect(retryQueue.getCurrentUserId()).toBe("user-a"))
+
+			let resolveFirstWrite!: () => void
+			vi.mocked(mockContext.workspaceState.update).mockImplementationOnce(
+				() =>
+					new Promise<void>((resolve) => {
+						resolveFirstWrite = resolve
+					}),
+			)
+			const first = retryQueue.enqueue("https://api.example.com/user-a-first", { method: "POST" }, "telemetry")
+			await vi.waitFor(() => expect(mockContext.workspaceState.update).toHaveBeenCalledTimes(2))
+			const waiting = retryQueue.enqueue(
+				"https://api.example.com/user-a-waiting",
+				{ method: "POST" },
+				"telemetry",
+			)
+
+			expect(retryQueue.clearIfUserChanged("user-b")).toBe(true)
+			retryQueue.resume()
+			resolveFirstWrite()
+
+			await first
+			await expect(waiting).rejects.toThrow("Retry queue owner changed before request could be queued")
+			await retryQueue.retryAll()
+
+			expect(retryQueue.getCurrentUserId()).toBe("user-b")
+			expect(retryQueue.getStats().totalQueued).toBe(0)
+			expect(storage.get("roo.retryQueue")).toMatchObject({
+				ownerUserId: "user-b",
+				requests: [],
+			})
+		})
+
+		it("should not resurrect a durably evicted request when retry persistence rolls back", async () => {
+			const storage = new Map<string, unknown>()
+			mockContext = createMockContext(storage)
+			retryQueue = new RetryQueue(mockContext, { maxQueueSize: 2 })
+			await retryQueue.enqueue("https://api.example.com/first", { method: "POST" }, "telemetry")
+			await retryQueue.enqueue("https://api.example.com/second", { method: "POST" }, "telemetry")
+
+			let rejectSecondRetry!: (error: Error) => void
+			const fetchMock = vi
+				.fn()
+				.mockRejectedValueOnce(new Error("first network failure"))
+				.mockReturnValueOnce(
+					new Promise((_resolve, reject) => {
+						rejectSecondRetry = reject
+					}),
+				)
+			global.fetch = fetchMock
+			const retry = retryQueue.retryAll()
+			await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+
+			await retryQueue.enqueue("https://api.example.com/third", { method: "POST" }, "telemetry")
+			await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+			vi.mocked(mockContext.workspaceState.update).mockRejectedValueOnce(new Error("storage unavailable"))
+			rejectSecondRetry(new Error("second network failure"))
+
+			await expect(retry).rejects.toThrow("storage unavailable")
+			expect(retryQueue.getStats()).toMatchObject({
+				totalQueued: 2,
+				totalRetries: 0,
+			})
+			expect(storage.get("roo.retryQueue")).toMatchObject({
+				requests: [
+					expect.objectContaining({ url: "https://api.example.com/second", retryCount: 0 }),
+					expect.objectContaining({ url: "https://api.example.com/third", retryCount: 0 }),
+				],
+			})
+		})
 	})
 
 	describe("persistence", () => {
@@ -62,41 +210,61 @@ describe("RetryQueue", () => {
 
 			expect(mockContext.workspaceState.update).toHaveBeenCalledWith(
 				"roo.retryQueue",
-				expect.arrayContaining([
-					expect.objectContaining({
-						url: "https://api.example.com/test",
-						type: "telemetry",
-					}),
-				]),
+				expect.objectContaining({
+					version: 1,
+					ownerKnown: false,
+					mutationEpoch: 1,
+					requests: expect.arrayContaining([
+						expect.objectContaining({
+							url: "https://api.example.com/test",
+							type: "telemetry",
+						}),
+					]),
+				}),
 			)
 		})
 
 		it("should load persisted queue on initialization", () => {
-			const persistedRequests: QueuedRequest[] = [
-				{
-					id: "test-1",
-					url: "https://api.example.com/test1",
-					options: { method: "POST" },
-					timestamp: Date.now(),
-					retryCount: 0,
-					type: "telemetry",
-				},
-			]
+			const persistedRequests: QueuedRequest[] = [createQueuedRequest("test-1")]
 
 			// Set up mock to return persisted data
 			const storage = new Map([["roo.retryQueue", persistedRequests]])
-			mockContext = {
-				workspaceState: {
-					get: vi.fn((key: string) => storage.get(key)),
-					update: vi.fn(),
-				},
-			} as unknown as ExtensionContext
+			mockContext = createMockContext(storage)
 
 			retryQueue = new RetryQueue(mockContext)
 
 			const stats = retryQueue.getStats()
 			expect(stats.totalQueued).toBe(1)
 			expect(mockContext.workspaceState.get).toHaveBeenCalledWith("roo.retryQueue")
+		})
+
+		it("should quarantine legacy array storage until its unknown owner is discarded", async () => {
+			const storage = new Map<string, unknown>([["roo.retryQueue", [createQueuedRequest("legacy")]]])
+			mockContext = createMockContext(storage)
+			const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 })
+			global.fetch = fetchMock
+			retryQueue = new RetryQueue(mockContext, {}, undefined, () => ({
+				Authorization: "Bearer user-b",
+			}))
+
+			retryQueue.resume()
+			await retryQueue.retryAll()
+
+			expect(retryQueue.isPausedState()).toBe(true)
+			expect(fetchMock).not.toHaveBeenCalled()
+			expect(retryQueue.clearIfUserChanged("user-b")).toBe(true)
+			retryQueue.resume()
+			await retryQueue.retryAll()
+
+			expect(retryQueue.getStats().totalQueued).toBe(0)
+			expect(retryQueue.getCurrentUserId()).toBe("user-b")
+			expect(fetchMock).not.toHaveBeenCalled()
+			expect(storage.get("roo.retryQueue")).toMatchObject({
+				version: 1,
+				ownerKnown: true,
+				ownerUserId: "user-b",
+				requests: [],
+			})
 		})
 	})
 
@@ -112,6 +280,18 @@ describe("RetryQueue", () => {
 
 			stats = retryQueue.getStats()
 			expect(stats.totalQueued).toBe(0)
+		})
+
+		it("should resume after a running queue is durably cleared", async () => {
+			const clearListener = vi.fn()
+			retryQueue.on("queue-cleared", clearListener)
+			await retryQueue.enqueue("https://api.example.com/test", { method: "POST" }, "telemetry")
+
+			retryQueue.clear()
+
+			expect(retryQueue.isPausedState()).toBe(true)
+			await vi.waitFor(() => expect(clearListener).toHaveBeenCalledTimes(1))
+			expect(retryQueue.isPausedState()).toBe(false)
 		})
 	})
 
@@ -150,13 +330,14 @@ describe("RetryQueue", () => {
 			)
 		})
 
-		it("should emit queue-cleared event when clearing", () => {
+		it("should emit queue-cleared event only after clearing is durable", async () => {
 			const listener = vi.fn()
 			retryQueue.on("queue-cleared", listener)
 
 			retryQueue.clear()
 
-			expect(listener).toHaveBeenCalled()
+			expect(listener).not.toHaveBeenCalled()
+			await vi.waitFor(() => expect(listener).toHaveBeenCalled())
 		})
 	})
 
@@ -229,7 +410,8 @@ describe("RetryQueue", () => {
 			expect(wasCleared).toBe(true)
 			stats = retryQueue.getStats()
 			expect(stats.totalQueued).toBe(0)
-			expect(retryQueue.getCurrentUserId()).toBe("user_456")
+			expect(retryQueue.getCurrentUserId()).toBe("user_123")
+			await vi.waitFor(() => expect(retryQueue.getCurrentUserId()).toBe("user_456"))
 		})
 
 		it("should clear queue on logout (undefined user)", async () => {
@@ -248,7 +430,8 @@ describe("RetryQueue", () => {
 			expect(wasCleared).toBe(true)
 			stats = retryQueue.getStats()
 			expect(stats.totalQueued).toBe(0)
-			expect(retryQueue.getCurrentUserId()).toBeUndefined()
+			expect(retryQueue.getCurrentUserId()).toBe("user_123")
+			await vi.waitFor(() => expect(retryQueue.getCurrentUserId()).toBeUndefined())
 		})
 
 		it("should not clear on first login (no previous user)", async () => {
@@ -264,7 +447,7 @@ describe("RetryQueue", () => {
 			expect(wasCleared).toBe(false)
 			stats = retryQueue.getStats()
 			expect(stats.totalQueued).toBe(2)
-			expect(retryQueue.getCurrentUserId()).toBe("user_123")
+			await vi.waitFor(() => expect(retryQueue.getCurrentUserId()).toBe("user_123"))
 		})
 
 		it("should handle multiple user transitions correctly", async () => {
@@ -278,13 +461,13 @@ describe("RetryQueue", () => {
 			// User logs out
 			const clearedOnLogout = retryQueue.clearIfUserChanged(undefined)
 			expect(clearedOnLogout).toBe(true)
-			expect(clearListener).toHaveBeenCalledTimes(1)
+			await vi.waitFor(() => expect(clearListener).toHaveBeenCalledTimes(1))
 
 			// Different user logs in
 			await retryQueue.enqueue("https://api.example.com/user2-req", { method: "POST" }, "telemetry")
 			const clearedOnNewUser = retryQueue.clearIfUserChanged("user_456")
 			expect(clearedOnNewUser).toBe(true)
-			expect(clearListener).toHaveBeenCalledTimes(2)
+			await vi.waitFor(() => expect(clearListener).toHaveBeenCalledTimes(2))
 
 			// Same user logs back in
 			await retryQueue.enqueue("https://api.example.com/user2-req2", { method: "POST" }, "telemetry")
@@ -294,6 +477,88 @@ describe("RetryQueue", () => {
 
 			const stats = retryQueue.getStats()
 			expect(stats.totalQueued).toBe(1) // Only the last request remains
+		})
+
+		it("should remain paused and keep the durable owner when account-switch clearing cannot persist", async () => {
+			const storage = new Map<string, unknown>()
+			mockContext = createMockContext(storage)
+			const authHeaderProvider = vi.fn().mockReturnValue({
+				Authorization: "Bearer current-token",
+			})
+			retryQueue = new RetryQueue(mockContext, {}, undefined, authHeaderProvider)
+			expect(retryQueue.clearIfUserChanged("user-a")).toBe(false)
+			retryQueue.resume()
+			await retryQueue.enqueue("https://api.example.com/user-a-request", { method: "POST" }, "telemetry")
+
+			vi.mocked(mockContext.workspaceState.update).mockRejectedValue(new Error("storage unavailable"))
+			expect(retryQueue.clearIfUserChanged("user-b")).toBe(true)
+			retryQueue.resume()
+
+			await expect(retryQueue.retryAll()).rejects.toThrow("storage unavailable")
+			expect(retryQueue.isPausedState()).toBe(true)
+			expect(retryQueue.getCurrentUserId()).toBe("user-a")
+			expect(retryQueue.getStats().totalQueued).toBe(0)
+			expect(storage.get("roo.retryQueue")).toMatchObject({
+				ownerUserId: "user-a",
+				requests: [expect.objectContaining({ url: "https://api.example.com/user-a-request" })],
+			})
+
+			// Simulate a crash/restart after the failed clear. The old envelope is
+			// loaded as user-a, compared with user-b, and cleared before any retry.
+			retryQueue.dispose()
+			const restartedContext = createMockContext(storage)
+			const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 })
+			global.fetch = fetchMock
+			retryQueue = new RetryQueue(restartedContext, {}, undefined, authHeaderProvider)
+			expect(retryQueue.clearIfUserChanged("user-b")).toBe(true)
+			retryQueue.resume()
+			await retryQueue.retryAll()
+
+			expect(fetchMock).not.toHaveBeenCalled()
+			expect(retryQueue.isPausedState()).toBe(false)
+			expect(retryQueue.getCurrentUserId()).toBe("user-b")
+			expect(retryQueue.getStats().totalQueued).toBe(0)
+			expect(storage.get("roo.retryQueue")).toMatchObject({
+				ownerUserId: "user-b",
+				requests: [],
+			})
+		})
+
+		it("should let a newer active-session owner supersede an in-flight logout transition", async () => {
+			const storage = new Map<string, unknown>()
+			mockContext = createMockContext(storage)
+			const authHeaderProvider = vi.fn().mockReturnValue({
+				Authorization: "Bearer user-a-token",
+			})
+			retryQueue = new RetryQueue(mockContext, {}, undefined, authHeaderProvider)
+			expect(retryQueue.clearIfUserChanged("user-a")).toBe(false)
+			retryQueue.resume()
+			await retryQueue.enqueue("https://api.example.com/user-a-request", { method: "POST" }, "telemetry")
+
+			let resolveLogoutWrite!: () => void
+			vi.mocked(mockContext.workspaceState.update).mockImplementationOnce(
+				() =>
+					new Promise<void>((resolve) => {
+						resolveLogoutWrite = resolve
+					}),
+			)
+			expect(retryQueue.clearIfUserChanged(undefined)).toBe(true)
+			retryQueue.pauseUntilOwnerConfirmed()
+			await vi.waitFor(() => expect(mockContext.workspaceState.update).toHaveBeenCalledTimes(3))
+
+			expect(retryQueue.clearIfUserChanged("user-a")).toBe(true)
+			retryQueue.resume()
+			resolveLogoutWrite()
+			await retryQueue.retryAll()
+
+			expect(retryQueue.isPausedState()).toBe(false)
+			expect(retryQueue.getCurrentUserId()).toBe("user-a")
+			expect(retryQueue.getStats().totalQueued).toBe(0)
+			expect(storage.get("roo.retryQueue")).toMatchObject({
+				ownerKnown: true,
+				ownerUserId: "user-a",
+				requests: [],
+			})
 		})
 	})
 
@@ -336,6 +601,141 @@ describe("RetryQueue", () => {
 			// Queue should be empty after successful retries
 			const stats = retryQueue.getStats()
 			expect(stats.totalQueued).toBe(0)
+		})
+
+		it("should restore and durably retain successful requests when deleting them cannot persist", async () => {
+			const storage = new Map<string, unknown>()
+			mockContext = createMockContext(storage)
+			retryQueue = new RetryQueue(mockContext)
+			retryQueue.setCurrentUserId("user-a")
+			await retryQueue.enqueue("https://api.example.com/restart-safe", { method: "POST" }, "telemetry")
+			const successListener = vi.fn()
+			retryQueue.on("request-retry-success", successListener)
+			fetchMock.mockResolvedValue({ ok: true, status: 200 })
+			vi.mocked(mockContext.workspaceState.update).mockRejectedValueOnce(new Error("storage unavailable"))
+
+			await expect(retryQueue.retryAll()).rejects.toThrow("storage unavailable")
+
+			expect(successListener).not.toHaveBeenCalled()
+			expect(retryQueue.getStats().totalQueued).toBe(1)
+			expect(storage.get("roo.retryQueue")).toMatchObject({
+				ownerUserId: "user-a",
+				requests: [expect.objectContaining({ url: "https://api.example.com/restart-safe" })],
+			})
+
+			retryQueue.dispose()
+			mockContext = createMockContext(storage)
+			retryQueue = new RetryQueue(mockContext)
+			expect(retryQueue.clearIfUserChanged("user-a")).toBe(false)
+			retryQueue.resume()
+			await retryQueue.retryAll()
+
+			expect(fetchMock).toHaveBeenCalledTimes(2)
+			expect(retryQueue.getStats().totalQueued).toBe(0)
+		})
+
+		it("should not publish or retain retry-count mutations that failed to persist", async () => {
+			const storage = new Map<string, unknown>()
+			mockContext = createMockContext(storage)
+			retryQueue = new RetryQueue(mockContext)
+			retryQueue.setCurrentUserId("user-a")
+			await retryQueue.enqueue("https://api.example.com/retry-count", { method: "POST" }, "telemetry")
+			const failedListener = vi.fn()
+			retryQueue.on("request-retry-failed", failedListener)
+			fetchMock.mockRejectedValue(new Error("network unavailable"))
+			vi.mocked(mockContext.workspaceState.update).mockRejectedValueOnce(new Error("storage unavailable"))
+
+			await expect(retryQueue.retryAll()).rejects.toThrow("storage unavailable")
+
+			expect(failedListener).not.toHaveBeenCalled()
+			expect(retryQueue.getStats()).toMatchObject({
+				totalQueued: 1,
+				totalRetries: 0,
+				failedRetries: 0,
+			})
+			expect(storage.get("roo.retryQueue")).toMatchObject({
+				requests: [
+					expect.objectContaining({
+						url: "https://api.example.com/retry-count",
+						retryCount: 0,
+					}),
+				],
+			})
+		})
+
+		it("should restore a durably persisted retry count without sending before owner confirmation", async () => {
+			const storage = new Map<string, unknown>()
+			mockContext = createMockContext(storage)
+			const authHeaderProvider = vi.fn().mockReturnValue({
+				Authorization: "Bearer user-a-token",
+			})
+			retryQueue = new RetryQueue(mockContext, {}, undefined, authHeaderProvider)
+			expect(retryQueue.clearIfUserChanged("user-a")).toBe(false)
+			retryQueue.resume()
+			await retryQueue.enqueue("https://api.example.com/retry-after-restart", { method: "POST" }, "telemetry")
+			fetchMock.mockRejectedValueOnce(new Error("network unavailable"))
+			await retryQueue.retryAll()
+			expect(storage.get("roo.retryQueue")).toMatchObject({
+				ownerUserId: "user-a",
+				requests: [
+					expect.objectContaining({
+						url: "https://api.example.com/retry-after-restart",
+						retryCount: 1,
+					}),
+				],
+			})
+
+			retryQueue.dispose()
+			mockContext = createMockContext(storage)
+			retryQueue = new RetryQueue(mockContext, {}, undefined, authHeaderProvider)
+			fetchMock.mockClear()
+			await retryQueue.retryAll()
+
+			expect(fetchMock).not.toHaveBeenCalled()
+			expect(retryQueue.getStats()).toMatchObject({
+				totalQueued: 1,
+				totalRetries: 1,
+				failedRetries: 1,
+			})
+
+			expect(retryQueue.clearIfUserChanged("user-a")).toBe(false)
+			retryQueue.resume()
+			fetchMock.mockResolvedValueOnce({ ok: true, status: 200 })
+			await retryQueue.retryAll()
+
+			expect(fetchMock).toHaveBeenCalledTimes(1)
+			expect(retryQueue.getStats().totalQueued).toBe(0)
+		})
+
+		it("should discard an in-flight old-owner result when the account changes", async () => {
+			const storage = new Map<string, unknown>()
+			mockContext = createMockContext(storage)
+			retryQueue = new RetryQueue(mockContext)
+			retryQueue.setCurrentUserId("user-a")
+			await retryQueue.enqueue("https://api.example.com/user-a-in-flight", { method: "POST" }, "telemetry")
+			const successListener = vi.fn()
+			retryQueue.on("request-retry-success", successListener)
+			let resolveRequest!: (response: { ok: boolean; status: number }) => void
+			fetchMock.mockReturnValue(
+				new Promise((resolve) => {
+					resolveRequest = resolve
+				}),
+			)
+
+			const retry = retryQueue.retryAll()
+			await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+			expect(retryQueue.clearIfUserChanged("user-b")).toBe(true)
+			retryQueue.resume()
+			resolveRequest({ ok: true, status: 200 })
+			await retry
+			await vi.waitFor(() => expect(retryQueue.getCurrentUserId()).toBe("user-b"))
+
+			expect(successListener).not.toHaveBeenCalled()
+			expect(retryQueue.getStats().totalQueued).toBe(0)
+			expect(storage.get("roo.retryQueue")).toMatchObject({
+				ownerUserId: "user-b",
+				requests: [],
+			})
 		})
 
 		it("should handle failed retries and increment retry count", async () => {
@@ -432,6 +832,8 @@ describe("RetryQueue", () => {
 			})
 
 			retryQueue = new RetryQueue(mockContext, {}, undefined, authHeaderProvider)
+			expect(retryQueue.clearIfUserChanged("user_123")).toBe(false)
+			retryQueue.resume()
 
 			await retryQueue.enqueue(
 				"https://api.example.com/test",
@@ -459,6 +861,51 @@ describe("RetryQueue", () => {
 			)
 
 			expect(authHeaderProvider).toHaveBeenCalled()
+		})
+
+		it("should not send or consume retry budget when fresh auth headers are unavailable", async () => {
+			const authHeaderProvider = vi.fn().mockReturnValue(undefined)
+			retryQueue = new RetryQueue(mockContext, {}, undefined, authHeaderProvider)
+			expect(retryQueue.clearIfUserChanged("user_123")).toBe(false)
+			retryQueue.resume()
+			await retryQueue.enqueue("https://api.example.com/test", { method: "POST" }, "telemetry")
+
+			await retryQueue.retryAll()
+
+			expect(fetchMock).not.toHaveBeenCalled()
+			expect(retryQueue.getStats()).toMatchObject({
+				totalQueued: 1,
+				totalRetries: 0,
+				failedRetries: 0,
+			})
+		})
+
+		it("should stop before the next request when authenticated ownership becomes unknown", async () => {
+			const authHeaderProvider = vi.fn().mockReturnValue({
+				Authorization: "Bearer user-a-token",
+			})
+			retryQueue = new RetryQueue(mockContext, {}, undefined, authHeaderProvider)
+			expect(retryQueue.clearIfUserChanged("user-a")).toBe(false)
+			retryQueue.resume()
+			await retryQueue.enqueue("https://api.example.com/first", { method: "POST" }, "telemetry")
+			await retryQueue.enqueue("https://api.example.com/second", { method: "POST" }, "telemetry")
+
+			let resolveFirst!: (response: { ok: boolean; status: number }) => void
+			fetchMock.mockReturnValueOnce(
+				new Promise((resolve) => {
+					resolveFirst = resolve
+				}),
+			)
+			const retry = retryQueue.retryAll()
+			await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+
+			retryQueue.pauseUntilOwnerConfirmed()
+			resolveFirst({ ok: true, status: 200 })
+			await retry
+
+			expect(fetchMock).toHaveBeenCalledTimes(1)
+			expect(retryQueue.isPausedState()).toBe(true)
+			expect(retryQueue.getStats().totalQueued).toBe(1)
 		})
 
 		it("should respect configurable timeout", async () => {
@@ -564,6 +1011,85 @@ describe("RetryQueue", () => {
 			// No fetch calls should be made because the entire queue is paused
 			expect(fetchMock).not.toHaveBeenCalled()
 		})
+
+		// kilocode_change start
+		it("should keep the request queued when a 429 response omits Retry-After", async () => {
+			const successListener = vi.fn()
+			retryQueue.on("request-retry-success", successListener)
+
+			await retryQueue.enqueue("https://api.example.com/test", { method: "POST" }, "telemetry")
+
+			fetchMock.mockResolvedValueOnce({
+				ok: false,
+				status: 429,
+				headers: { get: vi.fn().mockReturnValue(null) },
+			})
+
+			await retryQueue.retryAll()
+
+			expect(retryQueue.getStats().totalQueued).toBe(1)
+			expect(successListener).not.toHaveBeenCalled()
+		})
+
+		it("should preserve a future Retry-After pause across restart", async () => {
+			const storage = new Map<string, unknown>()
+			mockContext = createMockContext(storage)
+			const authHeaderProvider = vi.fn().mockReturnValue({
+				Authorization: "Bearer user-a-token",
+			})
+			retryQueue = new RetryQueue(mockContext, {}, undefined, authHeaderProvider)
+			expect(retryQueue.clearIfUserChanged("user-a")).toBe(false)
+			retryQueue.resume()
+			await retryQueue.enqueue("https://api.example.com/rate-limited", { method: "POST" }, "telemetry")
+			fetchMock.mockResolvedValueOnce({
+				ok: false,
+				status: 429,
+				headers: { get: vi.fn().mockReturnValue("60") },
+			})
+
+			await retryQueue.retryAll()
+
+			const persistedPause = (storage.get("roo.retryQueue") as { queuePausedUntil?: number }).queuePausedUntil
+			expect(persistedPause).toBeGreaterThan(Date.now())
+			retryQueue.dispose()
+
+			mockContext = createMockContext(storage)
+			retryQueue = new RetryQueue(mockContext, {}, undefined, authHeaderProvider)
+			expect(retryQueue.clearIfUserChanged("user-a")).toBe(false)
+			retryQueue.resume()
+			fetchMock.mockClear()
+			await retryQueue.retryAll()
+
+			expect(fetchMock).not.toHaveBeenCalled()
+			expect(retryQueue.getStats().totalQueued).toBe(1)
+		})
+
+		it.each([
+			["an invalid value", "not-a-retry-date", 60 * 1000],
+			["an invalid decimal value", "1.5", 60 * 1000],
+			["an overflowing seconds value", "9".repeat(400), 24 * 60 * 60 * 1000],
+			["a negative seconds value", "-30", 60_000],
+			["a far-future date", "Fri, 31 Dec 9999 23:59:59 GMT", 24 * 60 * 60 * 1000],
+		])("bounds Retry-After when the server returns %s", async (_label, retryAfter, expectedDelayMs) => {
+			await retryQueue.enqueue("https://api.example.com/test", { method: "POST" }, "telemetry")
+			fetchMock.mockResolvedValueOnce({
+				ok: false,
+				status: 429,
+				headers: { get: vi.fn().mockReturnValue(retryAfter) },
+			})
+			const before = Date.now()
+
+			await retryQueue.retryAll()
+
+			const pausedUntil = Reflect.get(retryQueue, "queuePausedUntil") as number
+			const observedDelay = pausedUntil - before
+			expect(Number.isFinite(pausedUntil)).toBe(true)
+			expect(() => new Date(pausedUntil).toISOString()).not.toThrow()
+			expect(observedDelay).toBeGreaterThanOrEqual(expectedDelayMs)
+			expect(observedDelay).toBeLessThanOrEqual(expectedDelayMs + 250)
+			expect(retryQueue.getStats().totalQueued).toBe(1)
+		})
+		// kilocode_change end
 
 		it("should process all requests after rate limit period expires", async () => {
 			// Add multiple requests

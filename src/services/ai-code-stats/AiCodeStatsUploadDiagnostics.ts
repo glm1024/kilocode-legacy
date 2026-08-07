@@ -6,6 +6,7 @@ export type AiCodeUploadErrorCategory =
 	| "server_unreachable"
 	| "timeout"
 	| "payload_too_large"
+	| "invalid_local_payload"
 	| "rate_limited"
 	| "auth_error"
 	| "server_error"
@@ -102,6 +103,8 @@ export const buildUploadFailureUserMessage = (
 			return "连接上报服务器超时，请检查网络或后台服务状态。"
 		case "payload_too_large":
 			return "上报包过大，请导出诊断并联系管理员处理。"
+		case "invalid_local_payload":
+			return "本地保留的上报事实不符合当前服务端协议，已停止自动重试；请导出诊断并联系管理员处理。"
 		case "rate_limited":
 			return "上报请求被限流，请稍后重试。"
 		case "auth_error":
