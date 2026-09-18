@@ -6,11 +6,14 @@ import { resolveAiTokenUsageWebhookUrl } from "./AiTokenUsageWebhookUrl"
 import {
 	AI_TOKEN_USAGE_MAX_DATABASE_TIMESTAMP_MILLIS,
 	AI_TOKEN_USAGE_MIN_DATABASE_TIMESTAMP_MILLIS,
+	buildUserKey,
 	type AiTokenUsageAggregateRow,
 	type AiTokenUsageAggregateUploadRow,
 	type AiTokenUsageUploadClient,
 	type AiTokenUsageUploadEnvelope,
 	type AiTokenUsageUploadSettings,
+	isPersistedIdentityEmailMissing,
+	isReassignableAnonymousIdentity,
 	normalizeConfiguredUserEmail,
 } from "./types"
 
@@ -39,8 +42,9 @@ export class AiTokenUsageUploader {
 		settings: AiTokenUsageUploadSettings,
 		context: AiTokenUsageUploadContext,
 	): Promise<AiTokenUsageUploadResult> {
+		const quarantinedRowCount = await this.store.getQuarantinedRowCount()
 		if (!settings.webhookUrl?.trim()) {
-			return { uploaded: 0, blocked: 0, invalid: 0 }
+			return { uploaded: 0, blocked: 0, invalid: quarantinedRowCount }
 		}
 		const configuredUserEmail = normalizeConfiguredUserEmail(settings.userEmail)
 		if (configuredUserEmail) {
@@ -65,11 +69,11 @@ export class AiTokenUsageUploader {
 		const generatedAt = Date.now()
 		const pendingRows = await this.store.getPendingUploadRows()
 		if (pendingRows.length === 0) {
-			return { uploaded: 0, blocked: 0, invalid: 0 }
+			return { uploaded: 0, blocked: 0, invalid: quarantinedRowCount }
 		}
 
 		let blocked = 0
-		let invalid = 0
+		let invalid = quarantinedRowCount
 		const readyRows: AiTokenUsageAggregateRow[] = []
 		const issueUpdates: Array<{
 			key: string
@@ -78,14 +82,27 @@ export class AiTokenUsageUploader {
 			reason: string
 		}> = []
 		for (const row of pendingRows) {
-			if (row.uploadIssueKind === "invalid") {
+			const userEmail = normalizeConfiguredUserEmail(row.userEmail)
+			if (!userEmail && !isPersistedIdentityEmailMissing(row.userEmail)) {
+				invalid++
+				issueUpdates.push({
+					key: row.key,
+					kind: "invalid",
+					code: "invalid_persisted_user_email",
+					reason: "Persisted Token usage has a non-empty invalid email, so automatic reassignment is unsafe",
+				})
+				continue
+			}
+			// Older builds incorrectly persisted an adjustable envelope budget as
+			// permanent. Re-evaluate that one legacy issue so a corrected budget can
+			// unblock the retained fact.
+			if (row.uploadIssueKind === "invalid" && row.uploadIssueCode !== "row_exceeds_envelope_budget") {
 				invalid++
 				continue
 			}
 
-			const userEmail = normalizeConfiguredUserEmail(row.userEmail)
 			if (!userEmail) {
-				if (row.identityKind === "anonymous") {
+				if (isReassignableAnonymousIdentity(row)) {
 					blocked++
 					issueUpdates.push({
 						key: row.key,
@@ -105,24 +122,36 @@ export class AiTokenUsageUploader {
 				continue
 			}
 
-			const permanentIssue = this.getPermanentInvalidIssue(row)
+			const uploadRow: AiTokenUsageAggregateRow = {
+				...row,
+				userEmail,
+				userKey: buildUserKey(userEmail),
+			}
+			const permanentIssue = this.getPermanentInvalidIssue(uploadRow)
 			if (permanentIssue) {
 				invalid++
 				issueUpdates.push({ key: row.key, kind: "invalid", ...permanentIssue })
 				continue
 			}
-			const singleRowBytes = this.envelopeByteLength([row], context.client, generatedAt)
+			const singleRowBytes = this.envelopeByteLength([uploadRow], context.client, generatedAt)
 			if (singleRowBytes > maxPayloadBytes) {
-				invalid++
+				const exceedsProtocolMaximum = singleRowBytes > DEFAULT_MAX_PAYLOAD_BYTES
+				if (exceedsProtocolMaximum) {
+					invalid++
+				} else {
+					blocked++
+				}
 				issueUpdates.push({
 					key: row.key,
-					kind: "invalid",
-					code: "row_exceeds_envelope_budget",
+					kind: exceedsProtocolMaximum ? "invalid" : "blocked",
+					code: exceedsProtocolMaximum
+						? "row_exceeds_protocol_envelope_limit"
+						: "row_exceeds_current_envelope_budget",
 					reason: `Single Token usage row requires ${singleRowBytes} bytes, exceeding the ${maxPayloadBytes}-byte envelope budget`,
 				})
 				continue
 			}
-			readyRows.push(row)
+			readyRows.push(uploadRow)
 		}
 
 		await this.store.markRowsUploadIssues(issueUpdates)
@@ -307,6 +336,8 @@ export class AiTokenUsageUploader {
 			inputTokens: row.inputTokens,
 			outputTokens: row.outputTokens,
 			cacheReadTokens: row.cacheReadTokens,
+			cacheReadObservedRequestCount: row.cacheReadObservedRequestCount ?? 0,
+			cacheReadObservedInputTokens: row.cacheReadObservedInputTokens ?? 0,
 			cacheWriteTokens: row.cacheWriteTokens,
 			totalTokens: row.totalTokens,
 			firstOccurredAt: row.firstOccurredAt,
@@ -329,43 +360,57 @@ export class AiTokenUsageUploader {
 				reason: `Token usage dateKey is outside the supported protocol: ${row.dateKey}`,
 			}
 		}
-		const requiredColumns: Array<[unknown, string]> = [
-			[row.projectKey, "projectKey"],
-			[row.ide, "ide"],
-			[row.provider, "provider"],
-			[row.model, "model"],
+		const stringColumns: Array<{
+			value: unknown
+			maxChars: number
+			name: string
+			required?: boolean
+		}> = [
+			{ value: row.timezone, maxChars: 64, name: "timezone" },
+			{ value: row.userName, maxChars: 255, name: "userName" },
+			{ value: row.userEmail, maxChars: 255, name: "userEmail", required: true },
+			{ value: row.departmentName, maxChars: 255, name: "departmentName" },
+			{ value: row.officeName, maxChars: 255, name: "officeName" },
+			{ value: row.teamName, maxChars: 255, name: "teamName" },
+			{ value: row.sourceIp, maxChars: 64, name: "sourceIp" },
+			{ value: row.userKey, maxChars: 261, name: "userKey", required: true },
+			{ value: row.organizationId, maxChars: 128, name: "organizationId" },
+			{ value: row.organizationName, maxChars: 255, name: "organizationName" },
+			{ value: row.projectKey, maxChars: 64, name: "projectKey", required: true },
+			{ value: row.projectName, maxChars: 255, name: "projectName" },
+			{ value: row.repoRoot, maxChars: MAX_TOKEN_PATH_CHARS, name: "repoRoot" },
+			{ value: row.gitRemoteUrl, maxChars: MAX_TOKEN_PATH_CHARS, name: "gitRemoteUrl" },
+			{ value: row.ide, maxChars: 32, name: "ide", required: true },
+			{ value: row.provider, maxChars: 128, name: "provider", required: true },
+			{ value: row.model, maxChars: 255, name: "model", required: true },
 		]
-		const missingRequired = requiredColumns.find(([value]) => typeof value !== "string" || !value.trim())
-		if (missingRequired) {
-			return {
-				code: "missing_required_dimension",
-				reason: `Token usage ${missingRequired[1]} is required by the upload protocol`,
+		for (const column of stringColumns) {
+			if (column.value === undefined || column.value === null) {
+				if (column.required) {
+					return {
+						code: "missing_required_dimension",
+						reason: `Token usage ${column.name} is required by the upload protocol`,
+					}
+				}
+				continue
 			}
-		}
-		const finiteColumns: Array<[unknown, number, string]> = [
-			[row.timezone, 64, "timezone"],
-			[row.userName, 255, "userName"],
-			[row.userEmail, 255, "userEmail"],
-			[row.departmentName, 255, "departmentName"],
-			[row.officeName, 255, "officeName"],
-			[row.teamName, 255, "teamName"],
-			[row.organizationId, 128, "organizationId"],
-			[row.organizationName, 255, "organizationName"],
-			[row.projectKey, 64, "projectKey"],
-			[row.projectName, 255, "projectName"],
-			[row.repoRoot, MAX_TOKEN_PATH_CHARS, "repoRoot"],
-			[row.gitRemoteUrl, MAX_TOKEN_PATH_CHARS, "gitRemoteUrl"],
-			[row.ide, 32, "ide"],
-			[row.provider, 128, "provider"],
-			[row.model, 255, "model"],
-		]
-		const overlongColumn = finiteColumns.find(
-			([value, maxChars]) => typeof value === "string" && Array.from(value.trim()).length > maxChars,
-		)
-		if (overlongColumn) {
-			return {
-				code: "dimension_exceeds_protocol_limit",
-				reason: `Token usage ${overlongColumn[2]} exceeds the ${overlongColumn[1]}-character protocol limit`,
+			if (typeof column.value !== "string") {
+				return {
+					code: "invalid_string_dimension",
+					reason: `Token usage ${column.name} must be a string when present`,
+				}
+			}
+			if (column.required && !column.value.trim()) {
+				return {
+					code: "missing_required_dimension",
+					reason: `Token usage ${column.name} is required by the upload protocol`,
+				}
+			}
+			if (Array.from(column.value.trim()).length > column.maxChars) {
+				return {
+					code: "dimension_exceeds_protocol_limit",
+					reason: `Token usage ${column.name} exceeds the ${column.maxChars}-character protocol limit`,
+				}
 			}
 		}
 		const numericValues = [
@@ -373,6 +418,8 @@ export class AiTokenUsageUploader {
 			row.inputTokens,
 			row.outputTokens,
 			row.cacheReadTokens,
+			row.cacheReadObservedRequestCount ?? 0,
+			row.cacheReadObservedInputTokens ?? 0,
 			row.cacheWriteTokens,
 			row.totalTokens,
 			row.firstOccurredAt,
@@ -389,6 +436,8 @@ export class AiTokenUsageUploader {
 			row.inputTokens,
 			row.outputTokens,
 			row.cacheReadTokens,
+			row.cacheReadObservedRequestCount ?? 0,
+			row.cacheReadObservedInputTokens ?? 0,
 			row.cacheWriteTokens,
 			row.totalTokens,
 		]
@@ -396,6 +445,15 @@ export class AiTokenUsageUploader {
 			return {
 				code: "negative_token_counter",
 				reason: "Token usage counters must be non-negative",
+			}
+		}
+		if (
+			(row.cacheReadObservedRequestCount ?? 0) > row.requestCount ||
+			(row.cacheReadObservedInputTokens ?? 0) > row.inputTokens
+		) {
+			return {
+				code: "invalid_cache_observation_coverage",
+				reason: "Token cache observation coverage cannot exceed the corresponding request or input totals",
 			}
 		}
 		if (

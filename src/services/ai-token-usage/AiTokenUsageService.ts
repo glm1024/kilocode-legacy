@@ -1,4 +1,4 @@
-import { exec as execCallback } from "child_process"
+import { execFile as execFileCallback } from "child_process"
 import * as path from "path"
 import { promisify } from "util"
 import * as vscode from "vscode"
@@ -23,7 +23,7 @@ import {
 	type AiTokenUsageUploadSettings,
 } from "./types"
 
-const execAsync = promisify(execCallback)
+const execFileAsync = promisify(execFileCallback)
 const EXEC_MAX_BUFFER_BYTES = 4 * 1024 * 1024
 const TOKEN_USAGE_UPLOAD_DEBOUNCE_MS = 5_000
 const TOKEN_USAGE_UPLOAD_RETRY_INTERVAL_MS = 5 * 60 * 1_000
@@ -61,7 +61,7 @@ const detectIde = (): AiTokenUsageIde => {
 
 const resolveGitRepositoryRoot = async (cwd: string): Promise<string | undefined> => {
 	try {
-		const { stdout } = await execAsync("git rev-parse --show-toplevel", {
+		const { stdout } = await execFileAsync("git", ["rev-parse", "--show-toplevel"], {
 			cwd,
 			maxBuffer: EXEC_MAX_BUFFER_BYTES,
 		})
@@ -80,6 +80,7 @@ export interface AiTokenUsageRequestRecord {
 	inputTokens: number
 	outputTokens: number
 	cacheReadTokens?: number
+	cacheReadTokensAvailable?: boolean
 	cacheWriteTokens?: number
 	occurredAt?: number
 }
@@ -169,6 +170,7 @@ export class AiTokenUsageService {
 		const outputTokens = normalizeUsageCount(record.outputTokens)
 		const cacheReadTokens = normalizeUsageCount(record.cacheReadTokens)
 		const cacheWriteTokens = normalizeUsageCount(record.cacheWriteTokens)
+		const cacheReadTokensAvailable = record.cacheReadTokensAvailable === true
 		if (inputTokens === 0 && outputTokens === 0 && cacheReadTokens === 0 && cacheWriteTokens === 0) {
 			return
 		}
@@ -210,6 +212,8 @@ export class AiTokenUsageService {
 			inputTokens,
 			outputTokens,
 			cacheReadTokens,
+			cacheReadObservedRequestCount: cacheReadTokensAvailable ? 1 : 0,
+			cacheReadObservedInputTokens: cacheReadTokensAvailable ? inputTokens : 0,
 			cacheWriteTokens,
 			totalTokens: safeTokenTotal(inputTokens, outputTokens),
 			identityKind: userEmail ? "configured" : "anonymous",
@@ -309,16 +313,12 @@ export class AiTokenUsageService {
 
 	private async performIncrementalUpload(): Promise<void> {
 		const settings = await this.getUploadSettings()
-		if (!settings.webhookUrl?.trim()) {
-			return
-		}
-
 		const result = await this.uploader.upload(settings, {
 			client: this.buildUploadClient(),
 		})
 		if (result.blocked > 0 || result.invalid > 0) {
 			console.warn(
-				`[AiTokenUsage] Retained ${result.blocked} blocked and ${result.invalid} invalid Token usage row(s); inspect the persisted uploadIssueReason diagnostics`,
+				`[AiTokenUsage] Retained ${result.blocked} blocked and ${result.invalid} invalid Token usage row(s); inspect the persisted Token state diagnostics`,
 			)
 		}
 	}

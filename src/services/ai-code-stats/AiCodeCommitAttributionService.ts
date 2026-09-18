@@ -1,9 +1,8 @@
 // kilocode_change - new file
 
 import crypto from "crypto"
-import { exec as execCallback, spawn } from "child_process"
+import { spawn } from "child_process"
 import * as path from "path"
-import { promisify } from "util"
 
 import { GitWatcher, type GitWatcherEvent } from "../../shared/GitWatcher"
 import { getCurrentBranch, isDetachedHead } from "../code-index/managed/git-utils"
@@ -29,10 +28,9 @@ const MAX_COMMIT_LIFECYCLE_BRANCH_CHARS = 255
 const MIN_DATABASE_TIMESTAMP_MILLIS = Date.parse("1000-01-02T00:00:00.000Z")
 const MAX_DATABASE_TIMESTAMP_MILLIS = Date.parse("9999-12-30T23:59:59.999Z")
 
-const execAsync = promisify(execCallback)
-const EXEC_MAX_BUFFER_BYTES = 16 * 1024 * 1024
 const GIT_STDOUT_LIMIT_BYTES = 128 * 1024 * 1024
 const GIT_FILE_DIFF_STDOUT_LIMIT_BYTES = 32 * 1024 * 1024
+const FULL_GIT_OBJECT_ID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i
 
 interface AiCodeCommitWatcher {
 	onEvent(handler: (event: GitWatcherEvent) => void): void
@@ -65,6 +63,14 @@ export interface AiCodeCommitAttributionServiceOptions {
 
 const defaultCreateWatcher = (repoRoot: string): AiCodeCommitWatcher => new GitWatcher({ cwd: repoRoot })
 
+const assertFullGitObjectId = (value: string, field: string): string => {
+	const normalized = value.trim()
+	if (!FULL_GIT_OBJECT_ID_PATTERN.test(normalized)) {
+		throw new Error(`${field} is not a full Git object id`)
+	}
+	return normalized
+}
+
 const runGitStdout = async (repoRoot: string, args: string[], stdoutLimit = GIT_STDOUT_LIMIT_BYTES): Promise<string> =>
 	new Promise((resolve, reject) => {
 		const child = spawn("git", args, { cwd: repoRoot })
@@ -91,7 +97,11 @@ const runGitStdout = async (repoRoot: string, args: string[], stdoutLimit = GIT_
 			}
 			if (code !== 0) {
 				const stderr = Buffer.concat(stderrChunks).toString("utf8").trim()
-				reject(new Error(`git ${args.join(" ")} failed with code ${code}${stderr ? `: ${stderr}` : ""}`))
+				const error = new Error(
+					`git ${args.join(" ")} failed with code ${code}${stderr ? `: ${stderr}` : ""}`,
+				) as Error & { code?: number | null }
+				error.code = code
+				reject(error)
 				return
 			}
 			resolve(Buffer.concat(stdoutChunks).toString("utf8"))
@@ -115,30 +125,38 @@ const listCommitChangedPaths = async (
 	previousCommit: string,
 	newCommit: string,
 ): Promise<string[]> => {
-	const stdout = previousCommit.trim()
+	const newObjectId = assertFullGitObjectId(newCommit, "new commit")
+	const previousObjectId = previousCommit.trim()
+		? assertFullGitObjectId(previousCommit, "previous commit")
+		: undefined
+	const stdout = previousObjectId
 		? await runGitStdout(
 				repoRoot,
-				["diff", "--name-only", "-z", "--find-renames", previousCommit, newCommit],
+				["diff", "--name-only", "-z", "--find-renames", previousObjectId, newObjectId, "--"],
 				GIT_STDOUT_LIMIT_BYTES,
 			)
 		: await runGitStdout(
 				repoRoot,
-				["show", "--format=", "--name-only", "-z", "--find-renames", newCommit],
+				["show", "--format=", "--name-only", "-z", "--find-renames", newObjectId, "--"],
 				GIT_STDOUT_LIMIT_BYTES,
 			)
 	return [...new Set(splitGitOutputNul(stdout).map((filePath) => normalizePath(filePath)))]
 }
 
 const defaultLoadCommitPatch = async (repoRoot: string, previousCommit: string, newCommit: string): Promise<string> => {
-	const changedPaths = await listCommitChangedPaths(repoRoot, previousCommit, newCommit)
+	const newObjectId = assertFullGitObjectId(newCommit, "new commit")
+	const previousObjectId = previousCommit.trim()
+		? assertFullGitObjectId(previousCommit, "previous commit")
+		: undefined
+	const changedPaths = await listCommitChangedPaths(repoRoot, previousObjectId ?? "", newObjectId)
 	if (changedPaths.length === 0) {
 		return ""
 	}
 	const patchParts: string[] = []
 	for (const changedPath of changedPaths) {
-		const args = previousCommit.trim()
-			? ["diff", "--find-renames", "--unified=0", previousCommit, newCommit, "--", changedPath]
-			: ["show", "--format=", "--find-renames", "--unified=0", newCommit, "--", changedPath]
+		const args = previousObjectId
+			? ["diff", "--find-renames", "--unified=0", previousObjectId, newObjectId, "--", changedPath]
+			: ["show", "--format=", "--find-renames", "--unified=0", newObjectId, "--", changedPath]
 		const patchPart = await runGitStdout(repoRoot, args, GIT_FILE_DIFF_STDOUT_LIMIT_BYTES)
 		if (patchPart.trim()) {
 			patchParts.push(patchPart)
@@ -148,10 +166,8 @@ const defaultLoadCommitPatch = async (repoRoot: string, previousCommit: string, 
 }
 
 const defaultLoadCommitTimestamp = async (repoRoot: string, commitHash: string): Promise<number> => {
-	const { stdout } = await execAsync(`git show --format=%ct --no-patch ${commitHash}`, {
-		cwd: repoRoot,
-		maxBuffer: EXEC_MAX_BUFFER_BYTES,
-	})
+	const objectId = assertFullGitObjectId(commitHash, "commit hash")
+	const stdout = await runGitStdout(repoRoot, ["show", "--format=%ct", "--no-patch", objectId, "--"])
 	const trimmed = stdout.trim()
 	const seconds = Number.parseInt(trimmed, 10)
 	if (!/^\d+$/.test(trimmed) || !Number.isFinite(seconds)) {
@@ -175,7 +191,8 @@ const trimIdentityField = (value?: string): string | undefined => {
 }
 
 const defaultLoadCommitIdentity = async (repoRoot: string, commitHash: string): Promise<AiCodeCommitIdentity> => {
-	const stdout = await runGitStdout(repoRoot, ["show", "-s", "--format=%an%x1f%ae%x1f%cn%x1f%ce", commitHash])
+	const objectId = assertFullGitObjectId(commitHash, "commit hash")
+	const stdout = await runGitStdout(repoRoot, ["show", "-s", "--format=%an%x1f%ae%x1f%cn%x1f%ce", objectId, "--"])
 	const parts = stdout.trimEnd().split(GIT_IDENTITY_SEPARATOR)
 	return {
 		authorName: trimIdentityField(parts[0]),
@@ -190,8 +207,9 @@ const defaultLoadCommitFileContent = async (
 	commitHash: string,
 	repoRelativePath: string,
 ): Promise<string | undefined> => {
+	const objectId = assertFullGitObjectId(commitHash, "commit hash")
 	try {
-		return await runGitStdout(repoRoot, ["show", `${commitHash}:${normalizePath(repoRelativePath)}`])
+		return await runGitStdout(repoRoot, ["show", `${objectId}:${normalizePath(repoRelativePath)}`])
 	} catch (error) {
 		console.warn(
 			`[AiCodeCommitAttribution] Failed to load committed file snapshot for ${repoRelativePath} at ${commitHash}:`,
@@ -202,19 +220,15 @@ const defaultLoadCommitFileContent = async (
 }
 
 const defaultGetCurrentCommitSha = async (repoRoot: string): Promise<string> => {
-	const { stdout } = await execAsync("git rev-parse HEAD", {
-		cwd: repoRoot,
-		maxBuffer: EXEC_MAX_BUFFER_BYTES,
-	})
-	return stdout.trim()
+	const stdout = await runGitStdout(repoRoot, ["rev-parse", "--verify", "HEAD"])
+	return assertFullGitObjectId(stdout, "current commit")
 }
 
 const defaultIsAncestor = async (repoRoot: string, olderCommit: string, newerCommit: string): Promise<boolean> => {
+	const olderObjectId = assertFullGitObjectId(olderCommit, "older commit")
+	const newerObjectId = assertFullGitObjectId(newerCommit, "newer commit")
 	try {
-		await execAsync(`git merge-base --is-ancestor ${olderCommit} ${newerCommit}`, {
-			cwd: repoRoot,
-			maxBuffer: EXEC_MAX_BUFFER_BYTES,
-		})
+		await runGitStdout(repoRoot, ["merge-base", "--is-ancestor", olderObjectId, newerObjectId])
 		return true
 	} catch (error) {
 		if (typeof error === "object" && error && "code" in error && error.code === 1) {
@@ -230,11 +244,14 @@ const defaultListCommitsBetween = async (
 	fromExclusive: string,
 	toInclusive: string,
 ): Promise<string[]> => {
+	const fromObjectId = assertFullGitObjectId(fromExclusive, "range start commit")
+	const toObjectId = assertFullGitObjectId(toInclusive, "range end commit")
 	const stdout = await runGitStdout(repoRoot, [
 		"rev-list",
 		"--first-parent",
 		"--reverse",
-		`${fromExclusive}..${toInclusive}`,
+		`${fromObjectId}..${toObjectId}`,
+		"--",
 	])
 	return splitGitOutputLines(stdout)
 }
@@ -247,14 +264,16 @@ const defaultListCommitsSinceTimestamp = async (repoRoot: string, sinceTs: numbe
 		"--reverse",
 		`--since=${sinceIso}`,
 		"HEAD",
+		"--",
 	])
 	return splitGitOutputLines(stdout)
 }
 
 const defaultLoadCommitParent = async (repoRoot: string, commitHash: string): Promise<string | undefined> => {
+	const objectId = assertFullGitObjectId(commitHash, "commit hash")
 	try {
-		const stdout = await runGitStdout(repoRoot, ["rev-parse", `${commitHash}^`])
-		return stdout.trim() || undefined
+		const stdout = await runGitStdout(repoRoot, ["rev-parse", "--verify", `${objectId}^`])
+		return assertFullGitObjectId(stdout, "parent commit")
 	} catch {
 		return undefined
 	}
@@ -265,9 +284,11 @@ const defaultMergeBase = async (
 	leftCommit: string,
 	rightCommit: string,
 ): Promise<string | undefined> => {
+	const leftObjectId = assertFullGitObjectId(leftCommit, "left commit")
+	const rightObjectId = assertFullGitObjectId(rightCommit, "right commit")
 	try {
-		const stdout = await runGitStdout(repoRoot, ["merge-base", leftCommit, rightCommit])
-		return stdout.trim() || undefined
+		const stdout = await runGitStdout(repoRoot, ["merge-base", leftObjectId, rightObjectId])
+		return assertFullGitObjectId(stdout, "merge-base commit")
 	} catch {
 		return undefined
 	}

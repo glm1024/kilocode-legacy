@@ -2,8 +2,8 @@ import { createHash } from "crypto"
 
 import {
 	CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
+	classifyUserEmail,
 	normalizePath,
-	normalizeUserEmail,
 	type AiCodeCommitCandidateLine,
 	type AiCodeCommitChangedFile,
 	type AiCodeCommitReport,
@@ -100,7 +100,11 @@ export function buildCompactCommitReportPayload(
 	report: AiCodeCommitReport,
 	fallbackUserEmail?: string,
 ): AiCodeCompactCommitReport {
-	const normalizedFallbackUserEmail = normalizeUserEmail(fallbackUserEmail)
+	const normalizedFallbackUserEmail = normalizePersistedUserEmailOrThrow(
+		fallbackUserEmail,
+		undefined,
+		"fallbackUserEmail",
+	)
 	const defaults = resolveDefaults(report, normalizedFallbackUserEmail)
 	const snapshots = new Map<string, AiCodeSnapshotPayload>()
 
@@ -173,7 +177,11 @@ function resolveDefaults(report: AiCodeCommitReport, fallbackUserEmail?: string)
 		departmentName: firstBlock?.departmentName ?? firstLine?.departmentName,
 		officeName: firstBlock?.officeName ?? firstLine?.officeName,
 		teamName: firstBlock?.teamName ?? firstLine?.teamName,
-		userEmail: normalizeUserEmail(firstBlock?.userEmail ?? firstLine?.userEmail) ?? fallbackUserEmail,
+		userEmail: normalizePersistedUserEmailOrThrow(
+			firstBlock?.userEmail ?? firstLine?.userEmail,
+			fallbackUserEmail,
+			"defaults.userEmail",
+		),
 		organizationId: firstBlock?.organizationId ?? firstLine?.organizationId,
 		organizationName: firstBlock?.organizationName ?? firstLine?.organizationName,
 		sourceIp: firstBlock?.sourceIp ?? firstLine?.sourceIp,
@@ -205,7 +213,11 @@ function compactBlock(
 		departmentName: block.departmentName,
 		officeName: block.officeName,
 		teamName: block.teamName,
-		userEmail: normalizeUserEmail(block.userEmail) ?? fallbackUserEmail,
+		userEmail: normalizePersistedUserEmailOrThrow(
+			block.userEmail,
+			fallbackUserEmail,
+			`generated block ${block.generatedBlockId} userEmail`,
+		),
 		organizationId: block.organizationId,
 		organizationName: block.organizationName,
 		sourceIp: block.sourceIp,
@@ -257,7 +269,11 @@ function compactCandidateLines(
 			...line,
 			sourceType: "agent_insert",
 			ide: line.ide || defaults.ide || "unknown",
-			userEmail: normalizeUserEmail(line.userEmail) ?? fallbackUserEmail,
+			userEmail: normalizePersistedUserEmailOrThrow(
+				line.userEmail,
+				fallbackUserEmail,
+				`candidate line ${line.clientLineId} userEmail`,
+			),
 			filePath: normalizePath(line.filePath),
 			relativePath: normalizePath(line.relativePath),
 			repoRoot: normalizePath(line.repoRoot),
@@ -267,6 +283,18 @@ function compactCandidateLines(
 		return dropUndefined(normalized) as unknown as AiCodeCompactCandidateLinePayload
 	})
 	return result.length > 0 ? result : undefined
+}
+
+function normalizePersistedUserEmailOrThrow(
+	value: unknown,
+	fallbackUserEmail: string | undefined,
+	field: string,
+): string | undefined {
+	const identity = classifyUserEmail(value)
+	if (identity.kind === "invalid") {
+		throw new Error(`AI code commit report has invalid persisted identity at ${field}`)
+	}
+	return identity.kind === "valid" ? identity.userEmail : fallbackUserEmail
 }
 
 function omitDefaults(target: object, defaults: AiCodeCompactDefaults): void {

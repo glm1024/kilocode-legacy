@@ -77,6 +77,258 @@ describe("AiCodeUploadEventQueue", () => {
 		).toEqual(["event-3"])
 	})
 
+	it("fsyncs an appended record before publishing its new segment directory entry", async () => {
+		const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-upload-queue-append-sync-"))
+		const operations: string[] = []
+		const originalOpen = fs.open.bind(fs)
+		const openFile = (async (...args: Parameters<typeof fs.open>) => {
+			const targetPath = path.resolve(String(args[0]))
+			const handle = await originalOpen(...args)
+			const label = path.basename(targetPath)
+			const originalWriteFile = handle.writeFile.bind(handle)
+			const originalSync = handle.sync.bind(handle)
+			;(handle as any).writeFile = async (...writeArgs: unknown[]) => {
+				operations.push(`write:${label}`)
+				return (originalWriteFile as any)(...writeArgs)
+			}
+			;(handle as any).sync = async () => {
+				operations.push(`sync:${label}`)
+				return originalSync()
+			}
+			return handle
+		}) as typeof fs.open
+		const queue = new AiCodeUploadEventQueue(baseDir, {
+			open: openFile,
+			syncDirectory: async () => {
+				operations.push("sync:dir")
+				return true
+			},
+		})
+
+		await queue.append([buildEvent("event-durable-append", Date.now())])
+
+		const recordWrite = operations.findIndex(
+			(operation) => operation.startsWith("write:") && operation.endsWith(".ndjson"),
+		)
+		const recordSync = operations.findIndex(
+			(operation) => operation.startsWith("sync:") && operation.endsWith(".ndjson"),
+		)
+		const directorySync = operations.indexOf("sync:dir")
+		expect(recordWrite).toBeGreaterThanOrEqual(0)
+		expect(recordSync).toBeGreaterThan(recordWrite)
+		expect(directorySync).toBeGreaterThan(recordSync)
+	})
+
+	it("keeps later appends unproven while a new segment directory entry is not durable", async () => {
+		const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-upload-queue-unproven-"))
+		const queue = new AiCodeUploadEventQueue(baseDir, {
+			syncDirectory: async () => false,
+		})
+		const timestamp = new Date("2026-03-19T12:00:00.000Z").getTime()
+		const firstEvent = buildEvent("unproven-first", timestamp)
+		const secondEvent = buildEvent("unproven-second", timestamp + 1)
+
+		await expect(queue.append([firstEvent])).resolves.toBe(false)
+		await expect(queue.append([secondEvent])).resolves.toBe(false)
+
+		// A fresh queue no longer has same-process unproven state and can de-duplicate
+		// the observed records. The store still requires confirmDirectoryDurability
+		// before clearing its journal; if the entry was lost, appendUnique recreates
+		// it and returns false again.
+		const duplicateSegmentSyncs: string[] = []
+		const originalOpen = fs.open.bind(fs)
+		const restartedOpen = (async (...args: Parameters<typeof fs.open>) => {
+			const handle = await originalOpen(...args)
+			if (String(args[0]).endsWith(".ndjson") && args[1] === "r+") {
+				const originalSync = handle.sync.bind(handle)
+				;(handle as any).sync = async () => {
+					duplicateSegmentSyncs.push(path.basename(String(args[0])))
+					return originalSync()
+				}
+			}
+			return handle
+		}) as typeof fs.open
+		const restartedQueue = new AiCodeUploadEventQueue(baseDir, {
+			open: restartedOpen,
+			syncDirectory: async () => false,
+		})
+		await expect(restartedQueue.appendUnique([firstEvent, secondEvent])).resolves.toBe(true)
+		expect(duplicateSegmentSyncs).toHaveLength(1)
+	})
+
+	it("publishes fsynced compacted segments before unlinking the old recovery copy", async () => {
+		const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-upload-queue-compact-sync-"))
+		const queueDir = path.join(baseDir, "upload-events")
+		const queue = new AiCodeUploadEventQueue(baseDir)
+		const timestamp = new Date("2026-03-19T12:00:00.000Z").getTime()
+		await queue.append([buildEvent("delivered", timestamp), buildEvent("pending", timestamp + 1)])
+		const originalSegment = (await fs.readdir(queueDir)).find((name) => name.endsWith(".ndjson"))!
+
+		const operations: string[] = []
+		const originalOpen = fs.open.bind(fs)
+		const openFile = (async (...args: Parameters<typeof fs.open>) => {
+			const targetPath = path.resolve(String(args[0]))
+			const handle = await originalOpen(...args)
+			const label = path.basename(targetPath)
+			const originalWriteFile = handle.writeFile.bind(handle)
+			const originalSync = handle.sync.bind(handle)
+			;(handle as any).writeFile = async (...writeArgs: unknown[]) => {
+				operations.push(`write:${label}`)
+				return (originalWriteFile as any)(...writeArgs)
+			}
+			;(handle as any).sync = async () => {
+				operations.push(`sync:${label}`)
+				return originalSync()
+			}
+			return handle
+		}) as typeof fs.open
+		const originalRename = fs.rename.bind(fs)
+		const renameFile = (async (oldPath, newPath) => {
+			operations.push(`rename:${path.basename(String(oldPath))}->${path.basename(String(newPath))}`)
+			return originalRename(oldPath, newPath)
+		}) as typeof fs.rename
+		const originalUnlink = fs.unlink.bind(fs)
+		const unlinkFile = (async (filePath) => {
+			operations.push(`unlink:${path.basename(String(filePath))}`)
+			return originalUnlink(filePath)
+		}) as typeof fs.unlink
+		const instrumentedQueue = new AiCodeUploadEventQueue(baseDir, {
+			open: openFile,
+			rename: renameFile,
+			unlink: unlinkFile,
+			syncDirectory: async () => {
+				operations.push("sync:dir")
+				return true
+			},
+		})
+
+		await instrumentedQueue.pruneDeliveredSegments(new Set(["pending"]))
+
+		const tempSync = operations.findIndex(
+			(operation) =>
+				operation.startsWith("sync:") && operation.includes(".compact-") && operation.endsWith(".tmp"),
+		)
+		const rename = operations.findIndex((operation) => operation.startsWith("rename:"))
+		const publishDirectorySync = operations.findIndex(
+			(operation, index) => index > rename && operation === "sync:dir",
+		)
+		const unlink = operations.findIndex((operation) => operation === `unlink:${originalSegment}`)
+		const deleteDirectorySync = operations.findIndex(
+			(operation, index) => index > unlink && operation === "sync:dir",
+		)
+		expect(tempSync).toBeGreaterThanOrEqual(0)
+		expect(rename).toBeGreaterThan(tempSync)
+		expect(publishDirectorySync).toBeGreaterThan(rename)
+		expect(unlink).toBeGreaterThan(publishDirectorySync)
+		expect(deleteDirectorySync).toBeGreaterThan(unlink)
+	})
+
+	it("retains the old segment when directory fsync is unsupported", async () => {
+		const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-upload-queue-degraded-"))
+		const queueDir = path.join(baseDir, "upload-events")
+		const queue = new AiCodeUploadEventQueue(baseDir)
+		const timestamp = Date.now()
+		await queue.append([buildEvent("delivered", timestamp), buildEvent("pending", timestamp + 1)])
+		const originalSegments = (await fs.readdir(queueDir)).filter((name) => name.endsWith(".ndjson"))
+		const renameCalls: string[] = []
+		const unlinkCalls: string[] = []
+		const degradedQueue = new AiCodeUploadEventQueue(baseDir, {
+			rename: (async (oldPath, newPath) => {
+				renameCalls.push(`${String(oldPath)}->${String(newPath)}`)
+				return fs.rename(oldPath, newPath)
+			}) as typeof fs.rename,
+			unlink: (async (filePath) => {
+				unlinkCalls.push(String(filePath))
+				return fs.unlink(filePath)
+			}) as typeof fs.unlink,
+			syncDirectory: async () => false,
+		})
+
+		await degradedQueue.pruneDeliveredSegments(new Set(["pending"]))
+
+		expect(renameCalls).toEqual([])
+		expect(unlinkCalls).toEqual([])
+		expect((await fs.readdir(queueDir)).filter((name) => name.endsWith(".ndjson"))).toEqual(originalSegments)
+		expect(
+			(await queue.getPendingEvents(new Set(["delivered", "pending"]), new Set())).map((event) => event.eventId),
+		).toEqual(["delivered", "pending"])
+	})
+
+	it("deletes fully delivered segments but retains pending segments when directory fsync is unsupported", async () => {
+		const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-upload-queue-degraded-delete-"))
+		const queue = new AiCodeUploadEventQueue(baseDir)
+		await queue.append([
+			buildEvent("delivered", new Date("2026-03-18T12:00:00.000Z").getTime()),
+			buildEvent("pending", new Date("2026-03-19T12:00:00.000Z").getTime()),
+		])
+		const degradedQueue = new AiCodeUploadEventQueue(baseDir, {
+			syncDirectory: async () => false,
+		})
+
+		await degradedQueue.pruneDeliveredSegments(new Set(["pending"]))
+
+		expect(
+			(await queue.getPendingEvents(new Set(["delivered", "pending"]), new Set())).map((event) => event.eventId),
+		).toEqual(["pending"])
+	})
+
+	it("prunes old delivered segments without deleting old pending evidence in degraded mode", async () => {
+		const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-upload-queue-degraded-retention-"))
+		const queue = new AiCodeUploadEventQueue(baseDir)
+		await queue.append([
+			buildEvent("old-delivered", new Date("2026-03-17T12:00:00.000Z").getTime()),
+			buildEvent("old-pending", new Date("2026-03-18T12:00:00.000Z").getTime()),
+		])
+		const degradedQueue = new AiCodeUploadEventQueue(baseDir, {
+			syncDirectory: async () => false,
+		})
+
+		await expect(degradedQueue.pruneBefore("2026-03-20", new Set(["old-pending"]))).resolves.toEqual([
+			"old-delivered",
+		])
+		expect(
+			(await queue.getPendingEvents(new Set(["old-delivered", "old-pending"]), new Set())).map(
+				(event) => event.eventId,
+			),
+		).toEqual(["old-pending"])
+	})
+
+	it("keeps the old segment and published duplicates when the post-rename directory sync fails", async () => {
+		const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-upload-queue-sync-failure-"))
+		const queueDir = path.join(baseDir, "upload-events")
+		const queue = new AiCodeUploadEventQueue(baseDir)
+		const timestamp = Date.now()
+		await queue.append([buildEvent("delivered", timestamp), buildEvent("pending", timestamp + 1)])
+		const originalSegment = (await fs.readdir(queueDir)).find((name) => name.endsWith(".ndjson"))!
+		let directorySyncCount = 0
+		const unlinkedPaths: string[] = []
+		const faultingQueue = new AiCodeUploadEventQueue(baseDir, {
+			unlink: (async (filePath) => {
+				unlinkedPaths.push(String(filePath))
+				return fs.unlink(filePath)
+			}) as typeof fs.unlink,
+			syncDirectory: async () => {
+				directorySyncCount += 1
+				if (directorySyncCount === 2) {
+					const error = new Error("directory sync I/O failure") as NodeJS.ErrnoException
+					error.code = "EIO"
+					throw error
+				}
+				return true
+			},
+		})
+
+		await expect(faultingQueue.pruneDeliveredSegments(new Set(["pending"]))).rejects.toThrow(
+			"directory sync I/O failure",
+		)
+
+		expect(unlinkedPaths.some((filePath) => path.basename(filePath) === originalSegment)).toBe(false)
+		expect((await fs.readdir(queueDir)).filter((name) => name.endsWith(".ndjson")).length).toBeGreaterThan(1)
+		expect((await queue.getPendingEvents(new Set(["pending"]), new Set())).map((event) => event.eventId)).toEqual([
+			"pending",
+		])
+	})
+
 	it("returns a bounded prefix from a 100,000-record legacy segment", async () => {
 		const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-upload-queue-large-"))
 		const queueDir = path.join(baseDir, "upload-events")

@@ -115,6 +115,55 @@ describe("AiTokenUsageStore", () => {
 		expect(await store.getPendingUploadRows()).toHaveLength(0)
 	})
 
+	it("aggregates cache observation coverage without treating legacy missing fields as known zero", async () => {
+		const occurredAt = new Date("2026-03-19T09:00:00.000Z").getTime()
+		await store.recordUsage({
+			occurredAt,
+			timezone: "Asia/Shanghai",
+			userName: "glm7",
+			userEmail: "glm7@example.com",
+			sourceIp: "127.0.0.1",
+			userKey: "email:glm7@example.com",
+			projectKey: "project-alpha",
+			projectName: "project-alpha",
+			ide: "vscode",
+			provider: "openai",
+			model: "gpt-5.4",
+			requestCount: 1,
+			inputTokens: 40,
+			outputTokens: 10,
+			cacheReadTokens: 0,
+			cacheReadObservedRequestCount: 1,
+			cacheReadObservedInputTokens: 40,
+			cacheWriteTokens: 0,
+			totalTokens: 50,
+		})
+		await recordUsage("2026-03-19T09:00:05.000Z", { input: 20, output: 5 })
+
+		const [row] = await store.getPendingUploadRows()
+		expect(row).toMatchObject({
+			requestCount: 2,
+			inputTokens: 60,
+			cacheReadObservedRequestCount: 1,
+			cacheReadObservedInputTokens: 40,
+		})
+
+		const statePath = path.join(tmpDir, "ai-token-usage", "v1", "state.json")
+		const persisted = JSON.parse(await fs.readFile(statePath, "utf8")) as {
+			rows: Record<string, Record<string, unknown>>
+		}
+		const persistedRow = Object.values(persisted.rows)[0]
+		delete persistedRow.cacheReadObservedRequestCount
+		delete persistedRow.cacheReadObservedInputTokens
+		await fs.writeFile(statePath, JSON.stringify(persisted), "utf8")
+
+		const [legacyRow] = await new AiTokenUsageStore(tmpDir).getPendingUploadRows()
+		expect(legacyRow).toMatchObject({
+			cacheReadObservedRequestCount: 0,
+			cacheReadObservedInputTokens: 0,
+		})
+	})
+
 	it("atomically assigns and merges only explicitly anonymous rows into a configured identity", async () => {
 		await recordUsage("2026-03-19T09:00:00.000Z", { input: 40, output: 10 })
 		await store.recordUsage({
@@ -160,6 +209,200 @@ describe("AiTokenUsageStore", () => {
 				dirty: true,
 			}),
 		])
+	})
+
+	it("quarantines an object-email target without merging it into a configured identity", async () => {
+		const occurredAt = new Date("2026-03-19T09:00:00.000Z").getTime()
+		const sharedDimensions = {
+			occurredAt,
+			timezone: "Asia/Shanghai",
+			sourceIp: "127.0.0.1",
+			projectKey: "project-collision",
+			projectName: "project-collision",
+			repoRoot: "/workspace/project-collision",
+			ide: "vscode" as const,
+			provider: "openai",
+			model: "gpt-5.4",
+			requestCount: 1,
+			inputTokens: 20,
+			outputTokens: 5,
+			cacheReadTokens: 0,
+			cacheWriteTokens: 0,
+			totalTokens: 25,
+		}
+		await store.recordUsage({
+			...sharedDimensions,
+			userName: "Configured B",
+			userEmail: "configured.b@example.com",
+			userKey: "email:configured.b@example.com",
+			identityKind: "configured",
+		})
+		await store.recordUsage({
+			...sharedDimensions,
+			userName: "Anonymous",
+			userEmail: undefined,
+			userKey: "anonymous-install:collision-source",
+			identityKind: "anonymous",
+		})
+		const statePath = path.join(tmpDir, "ai-token-usage", "v1", "state.json")
+		const persisted = JSON.parse(await fs.readFile(statePath, "utf8")) as {
+			rows: Record<string, { userKey: string; userEmail?: unknown }>
+		}
+		const collisionTarget = Object.values(persisted.rows).find(
+			(row) => row.userKey === "email:configured.b@example.com",
+		)
+		expect(collisionTarget).toBeDefined()
+		collisionTarget!.userEmail = { legacyOwner: "unknown" }
+		await fs.writeFile(statePath, JSON.stringify(persisted), "utf8")
+		store = new AiTokenUsageStore(tmpDir)
+
+		await expect(
+			store.assignAnonymousRowsToConfiguredIdentity({ userEmail: "configured.b@example.com" }),
+		).resolves.toBe(1)
+		const rows = await store.getPendingUploadRows()
+		expect(rows).toEqual([
+			expect.objectContaining({
+				userKey: "email:configured.b@example.com",
+				userEmail: "configured.b@example.com",
+				identityKind: "configured",
+				requestCount: 1,
+				totalTokens: 25,
+			}),
+		])
+		expect(await store.getQuarantinedRows()).toEqual([
+			expect.objectContaining({
+				issueCode: "invalid_persisted_row_structure",
+				raw: expect.objectContaining({
+					userKey: "email:configured.b@example.com",
+					userEmail: { legacyOwner: "unknown" },
+					requestCount: 1,
+					totalTokens: 25,
+				}),
+			}),
+		])
+		expect(await new AiTokenUsageStore(tmpDir).getPendingUploadRows()).toEqual(rows)
+	})
+
+	it("does not let a later anonymous fact wash a poisoned identity into the current configured user", async () => {
+		const occurredAt = new Date("2026-03-19T09:00:00.000Z").getTime()
+		const anonymousRecord = {
+			occurredAt,
+			timezone: "Asia/Shanghai",
+			userName: "Anonymous",
+			userEmail: undefined,
+			sourceIp: "127.0.0.1",
+			userKey: "anonymous-install:poisoned-history",
+			identityKind: "anonymous" as const,
+			projectKey: "project-poison",
+			projectName: "project-poison",
+			repoRoot: "/workspace/project-poison",
+			ide: "vscode" as const,
+			provider: "openai",
+			model: "gpt-5.4",
+			requestCount: 1,
+			inputTokens: 20,
+			outputTokens: 5,
+			cacheReadTokens: 0,
+			cacheWriteTokens: 0,
+			totalTokens: 25,
+		}
+		await store.recordUsage(anonymousRecord)
+
+		const statePath = path.join(tmpDir, "ai-token-usage", "v1", "state.json")
+		const persisted = JSON.parse(await fs.readFile(statePath, "utf8")) as {
+			rows: Record<string, { userEmail?: unknown }>
+		}
+		Object.values(persisted.rows)[0].userEmail = { legacyOwner: "unknown" }
+		await fs.writeFile(statePath, JSON.stringify(persisted), "utf8")
+
+		store = new AiTokenUsageStore(tmpDir)
+		await store.recordUsage({
+			...anonymousRecord,
+			occurredAt: occurredAt + 5_000,
+			inputTokens: 7,
+			outputTokens: 3,
+			totalTokens: 10,
+		})
+
+		await expect(
+			store.assignAnonymousRowsToConfiguredIdentity({ userEmail: "current-b@example.com" }),
+		).resolves.toBe(1)
+		const rows = await store.getPendingUploadRows()
+		expect(rows).toEqual([
+			expect.objectContaining({
+				userEmail: "current-b@example.com",
+				userKey: "email:current-b@example.com",
+				requestCount: 1,
+				totalTokens: 10,
+				identityKind: "configured",
+			}),
+		])
+		expect(await store.getQuarantinedRows()).toEqual([
+			expect.objectContaining({
+				issueCode: "invalid_persisted_row_structure",
+				raw: expect.objectContaining({
+					userEmail: { legacyOwner: "unknown" },
+					userKey: "anonymous-install:poisoned-history",
+					requestCount: 1,
+					totalTokens: 25,
+				}),
+			}),
+		])
+	})
+
+	it("isolates a newly recorded invalid identity without poisoning an existing anonymous aggregate", async () => {
+		const occurredAt = new Date("2026-03-19T09:00:00.000Z").getTime()
+		const anonymousRecord = {
+			occurredAt,
+			timezone: "Asia/Shanghai",
+			userName: "Anonymous",
+			userEmail: undefined,
+			sourceIp: "127.0.0.1",
+			userKey: "anonymous-install:healthy-history",
+			identityKind: "anonymous" as const,
+			projectKey: "project-poison-input",
+			projectName: "project-poison-input",
+			ide: "vscode" as const,
+			provider: "openai",
+			model: "gpt-5.4",
+			requestCount: 1,
+			inputTokens: 20,
+			outputTokens: 5,
+			cacheReadTokens: 0,
+			cacheWriteTokens: 0,
+			totalTokens: 25,
+		}
+		await store.recordUsage(anonymousRecord)
+		await store.recordUsage({
+			...anonymousRecord,
+			occurredAt: occurredAt + 5_000,
+			userEmail: { malformed: true } as unknown as string,
+			inputTokens: 7,
+			outputTokens: 3,
+			totalTokens: 10,
+		})
+
+		await expect(
+			store.assignAnonymousRowsToConfiguredIdentity({ userEmail: "current-b@example.com" }),
+		).resolves.toBe(1)
+		const rows = await store.getPendingUploadRows()
+		expect(rows).toHaveLength(2)
+		expect(rows).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					userEmail: "current-b@example.com",
+					requestCount: 1,
+					totalTokens: 25,
+				}),
+				expect.objectContaining({
+					userEmail: { malformed: true },
+					requestCount: 1,
+					totalTokens: 10,
+					uploadIssueKind: "invalid",
+					uploadIssueCode: "invalid_persisted_user_email",
+				}),
+			]),
+		)
 	})
 
 	it("never changes a configured A identity when asked to assign anonymous facts to B", async () => {
@@ -245,6 +488,76 @@ describe("AiTokenUsageStore", () => {
 		persistState.mockRestore()
 
 		expect(await store.getPendingUploadRows()).toHaveLength(0)
+	})
+
+	it("durably quarantines null, primitive, and field-type poison rows while retaining healthy rows", async () => {
+		await recordUsage("2026-03-19T09:00:00.000Z", { input: 40, output: 60 })
+		const statePath = path.join(tmpDir, "ai-token-usage", "v1", "state.json")
+		const persisted = JSON.parse(await fs.readFile(statePath, "utf8")) as {
+			rows: Record<string, unknown>
+			quarantinedRows?: Record<string, unknown>
+		}
+		const healthyRow = Object.values(persisted.rows)[0] as Record<string, unknown>
+		persisted.rows["null-row"] = null
+		persisted.rows["primitive-row"] = "legacy-poison"
+		persisted.rows["object-email-row"] = {
+			...healthyRow,
+			key: "object-email-row",
+			userName: "Historical A",
+			userEmail: { historicalOwner: "user-a@example.com" },
+			userKey: "anonymous-install:historical-a",
+			identityKind: "anonymous",
+		}
+		persisted.rows["numeric-type-row"] = {
+			...healthyRow,
+			key: "numeric-type-row",
+			requestCount: "1",
+		}
+		await fs.writeFile(statePath, JSON.stringify(persisted), "utf8")
+
+		let recoveredStore = new AiTokenUsageStore(tmpDir)
+		expect(await recoveredStore.getPendingUploadRows()).toEqual([
+			expect.objectContaining({ projectKey: "project-alpha", inputTokens: 40, totalTokens: 100 }),
+		])
+		expect(await recoveredStore.getSummaryForRange({ type: "all" })).toEqual({
+			inputTokens: 40,
+			outputTokens: 60,
+			totalTokens: 100,
+		})
+		const quarantinedRows = await recoveredStore.getQuarantinedRows()
+		expect(quarantinedRows).toHaveLength(4)
+		expect(quarantinedRows).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ sourceKey: "null-row", raw: null }),
+				expect.objectContaining({ sourceKey: "primitive-row", raw: "legacy-poison" }),
+				expect.objectContaining({
+					sourceKey: "object-email-row",
+					issueCode: "invalid_persisted_row_structure",
+					raw: expect.objectContaining({
+						userEmail: { historicalOwner: "user-a@example.com" },
+						userKey: "anonymous-install:historical-a",
+					}),
+				}),
+				expect.objectContaining({
+					sourceKey: "numeric-type-row",
+					raw: expect.objectContaining({ requestCount: "1" }),
+				}),
+			]),
+		)
+		expect(await recoveredStore.assignAnonymousRowsToConfiguredIdentity({ userEmail: "user-b@example.com" })).toBe(
+			0,
+		)
+
+		const normalized = JSON.parse(await fs.readFile(statePath, "utf8")) as {
+			rows: Record<string, unknown>
+			quarantinedRows: Record<string, unknown>
+		}
+		expect(Object.keys(normalized.rows)).toHaveLength(1)
+		expect(Object.keys(normalized.quarantinedRows)).toHaveLength(4)
+
+		recoveredStore = new AiTokenUsageStore(tmpDir)
+		expect(await recoveredStore.getQuarantinedRows()).toEqual(quarantinedRows)
+		expect(await recoveredStore.getQuarantinedRowCount()).toBe(4)
 	})
 
 	it("archives a corrupt state file instead of overwriting the only recovery evidence", async () => {

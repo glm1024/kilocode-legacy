@@ -106,13 +106,15 @@ export class OpenAiNativeHandler extends BaseProvider implements SingleCompletio
 		// Extract cache information from details with better readability
 		const hasCachedTokens = typeof inputDetails?.cached_tokens === "number"
 		const hasCacheMissTokens = typeof inputDetails?.cache_miss_tokens === "number"
-		const cachedFromDetails = hasCachedTokens ? inputDetails.cached_tokens : 0
-		const missFromDetails = hasCacheMissTokens ? inputDetails.cache_miss_tokens : 0
+		// kilocode_change start: preserve explicit zero vs missing cache-read metadata
+		const cachedFromDetails = hasCachedTokens ? inputDetails.cached_tokens : undefined
+		const missFromDetails = hasCacheMissTokens ? inputDetails.cache_miss_tokens : undefined
+		// kilocode_change end
 
 		// If total input tokens are missing but we have details, derive from them
 		let totalInputTokens = usage.input_tokens ?? usage.prompt_tokens ?? 0
-		if (totalInputTokens === 0 && inputDetails && (cachedFromDetails > 0 || missFromDetails > 0)) {
-			totalInputTokens = cachedFromDetails + missFromDetails
+		if (totalInputTokens === 0 && inputDetails && ((cachedFromDetails ?? 0) > 0 || (missFromDetails ?? 0) > 0)) {
+			totalInputTokens = (cachedFromDetails ?? 0) + (missFromDetails ?? 0)
 		}
 
 		const totalOutputTokens = usage.output_tokens ?? usage.completion_tokens ?? 0
@@ -123,7 +125,7 @@ export class OpenAiNativeHandler extends BaseProvider implements SingleCompletio
 		const cacheWriteTokens = usage.cache_creation_input_tokens ?? usage.cache_write_tokens ?? 0
 
 		const cacheReadTokens =
-			usage.cache_read_input_tokens ?? usage.cache_read_tokens ?? usage.cached_tokens ?? cachedFromDetails ?? 0
+			usage.cache_read_input_tokens ?? usage.cache_read_tokens ?? usage.cached_tokens ?? cachedFromDetails // kilocode_change: leave missing cache-read metadata undefined
 
 		// Resolve effective tier: prefer actual tier from response; otherwise requested tier
 		const effectiveTier =

@@ -4,27 +4,45 @@ import * as fs from "fs/promises"
 import * as path from "path"
 import * as readline from "readline"
 
+import { syncDirectory } from "../../utils/safeWriteJson"
 import { CURRENT_AI_CODE_STATS_SEMANTICS_VERSION, normalizePath, toLocalDateKey, type AiCodeStatsEvent } from "./types"
 
 const MAX_SEGMENT_BYTES = 4 * 1024 * 1024
 
+interface AiCodeUploadEventQueueOptions {
+	open?: typeof fs.open
+	rename?: typeof fs.rename
+	unlink?: typeof fs.unlink
+	syncDirectory?: typeof syncDirectory
+}
+
 export class AiCodeUploadEventQueue {
 	private readonly queueDir: string
+	private readonly openFile: typeof fs.open
+	private readonly renameFile: typeof fs.rename
+	private readonly unlinkFile: typeof fs.unlink
+	private readonly syncQueueDirectory: typeof syncDirectory
+	private readonly unprovenSegmentPaths = new Set<string>()
+	private warnedAboutDirectoryDurability = false
 
-	constructor(baseDir: string) {
+	constructor(baseDir: string, options: AiCodeUploadEventQueueOptions = {}) {
 		this.queueDir = path.join(baseDir, "upload-events")
+		this.openFile = options.open ?? fs.open
+		this.renameFile = options.rename ?? fs.rename
+		this.unlinkFile = options.unlink ?? fs.unlink
+		this.syncQueueDirectory = options.syncDirectory ?? syncDirectory
 	}
 
 	async ensureReady(): Promise<void> {
 		await fs.mkdir(this.queueDir, { recursive: true })
 	}
 
-	async append(events: AiCodeStatsEvent[]): Promise<void> {
-		await this.appendInternal(events, false)
+	async append(events: AiCodeStatsEvent[]): Promise<boolean> {
+		return this.appendInternal(events, false)
 	}
 
-	async appendUnique(events: AiCodeStatsEvent[]): Promise<void> {
-		await this.appendInternal(events, true)
+	async appendUnique(events: AiCodeStatsEvent[]): Promise<boolean> {
+		return this.appendInternal(events, true)
 	}
 
 	async getAllEventIds(): Promise<string[]> {
@@ -37,23 +55,39 @@ export class AiCodeUploadEventQueue {
 		return [...eventIds]
 	}
 
-	private async appendInternal(events: AiCodeStatsEvent[], deduplicatePersistedEvents: boolean): Promise<void> {
+	async confirmDirectoryDurability(): Promise<boolean> {
+		await this.ensureReady()
+		const durable = await this.syncQueueDirectory(this.queueDir)
+		if (!durable) {
+			this.warnDirectoryDurabilityDegraded()
+		}
+		return durable
+	}
+
+	private async appendInternal(events: AiCodeStatsEvent[], deduplicatePersistedEvents: boolean): Promise<boolean> {
 		const normalizedEvents = events.flatMap((event) => {
 			const normalizedEvent = this.normalizeEvent(event)
 			return normalizedEvent ? [normalizedEvent] : []
 		})
 		if (normalizedEvents.length === 0) {
-			return
+			return true
 		}
 		await this.ensureReady()
-		const existingEventIds = deduplicatePersistedEvents
-			? await this.findPersistedEventIds(new Set(normalizedEvents.map((event) => event.eventId)))
-			: new Set<string>()
+		const persistedEventSegments = deduplicatePersistedEvents
+			? await this.findPersistedEventSegments(new Set(normalizedEvents.map((event) => event.eventId)))
+			: new Map<string, string>()
+		// A successful write() from the interrupted process is not itself a
+		// durability proof. Re-open every segment that lets replay skip an event
+		// and establish the same file-content fsync barrier used by normal appends.
+		// Directory fsync below is a separate metadata barrier and cannot replace it.
+		for (const filePath of new Set(persistedEventSegments.values())) {
+			await this.syncExistingSegment(filePath)
+		}
 		const seenInputIds = new Set<string>()
 
 		const dateBuckets = new Map<string, AiCodeStatsEvent[]>()
 		for (const normalizedEvent of normalizedEvents) {
-			if (existingEventIds.has(normalizedEvent.eventId) || seenInputIds.has(normalizedEvent.eventId)) {
+			if (persistedEventSegments.has(normalizedEvent.eventId) || seenInputIds.has(normalizedEvent.eventId)) {
 				continue
 			}
 			seenInputIds.add(normalizedEvent.eventId)
@@ -63,6 +97,11 @@ export class AiCodeUploadEventQueue {
 			dateBuckets.set(dateKey, bucket)
 		}
 
+		// A replay may find every event already present and therefore perform no
+		// append. It must still report an earlier unproven segment so the store does
+		// not clear its recovery journal merely because event-id de-duplication was
+		// successful in the same process.
+		let directoryDurabilitySupported = this.unprovenSegmentPaths.size === 0
 		for (const [dateKey, bucket] of dateBuckets.entries()) {
 			let filePath = await this.getWritableSegmentPath(dateKey)
 			let currentBytes = await this.fileSize(filePath)
@@ -80,11 +119,13 @@ export class AiCodeUploadEventQueue {
 				// event on a fresh line or the corrupt tail and valid replay
 				// would merge into one permanently unreadable record.
 				const boundary = needsRecordBoundary ? "\n" : ""
-				await fs.appendFile(filePath, `${boundary}${record}`, "utf8")
+				const appendDirectoryDurable = await this.appendRecordDurably(filePath, `${boundary}${record}`)
+				directoryDurabilitySupported &&= appendDirectoryDurable
 				currentBytes += Buffer.byteLength(boundary, "utf8") + recordBytes
 				needsRecordBoundary = false
 			}
 		}
+		return directoryDurabilitySupported
 	}
 
 	async getPendingEvents(
@@ -139,7 +180,14 @@ export class AiCodeUploadEventQueue {
 				continue
 			}
 			prunedEventIds.push(...events.map((event) => event.eventId))
-			await fs.unlink(filePath).catch(() => undefined)
+			await this.unlinkFile(filePath).catch((error) => {
+				if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") {
+					throw error
+				}
+			})
+			if (!(await this.syncQueueDirectory(this.queueDir))) {
+				this.warnDirectoryDurabilityDegraded()
+			}
 		}
 		return prunedEventIds
 	}
@@ -175,11 +223,23 @@ export class AiCodeUploadEventQueue {
 				continue
 			}
 			if (protectedEvents.length === 0) {
-				await fs.unlink(filePath).catch((error) => {
+				await this.unlinkFile(filePath).catch((error) => {
 					if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") {
 						throw error
 					}
 				})
+				// A fully delivered segment is no longer the only recovery copy of
+				// pending data. Windows may leave it behind after a crash, but unlinking
+				// it cannot make an undelivered event disappear.
+				if (!(await this.syncQueueDirectory(this.queueDir))) {
+					this.warnDirectoryDurabilityDegraded()
+				}
+				continue
+			}
+			// Partial replacement must retain the old segment unless directory
+			// metadata can be durably ordered. On Windows, skip this rewrite so the
+			// pending event body remains recoverable.
+			if (!(await this.canDurablyMutateDirectory())) {
 				continue
 			}
 			await this.replaceSegmentWithProtectedEvents(filePath, protectedEvents)
@@ -206,15 +266,15 @@ export class AiCodeUploadEventQueue {
 			.map((name) => path.join(this.queueDir, name))
 	}
 
-	private async findPersistedEventIds(candidateIds: Set<string>): Promise<Set<string>> {
-		const persisted = new Set<string>()
+	private async findPersistedEventSegments(candidateIds: Set<string>): Promise<Map<string, string>> {
+		const persisted = new Map<string, string>()
 		if (candidateIds.size === 0) {
 			return persisted
 		}
 		for (const filePath of await this.getFilesSorted()) {
 			for await (const event of this.readFile(filePath)) {
-				if (candidateIds.has(event.eventId)) {
-					persisted.add(event.eventId)
+				if (candidateIds.has(event.eventId) && !persisted.has(event.eventId)) {
+					persisted.set(event.eventId, filePath)
 					if (persisted.size === candidateIds.size) {
 						return persisted
 					}
@@ -222,6 +282,18 @@ export class AiCodeUploadEventQueue {
 			}
 		}
 		return persisted
+	}
+
+	private async syncExistingSegment(filePath: string): Promise<void> {
+		let handle: fs.FileHandle | undefined
+		try {
+			// Windows may reject FlushFileBuffers for read-only handles. Queue
+			// segments are writer-owned, so match safeWriteJson's recovery barrier.
+			handle = await this.openFile(filePath, "r+")
+			await handle.sync()
+		} finally {
+			await handle?.close()
+		}
 	}
 
 	private async getWritableSegmentPath(dateKey: string): Promise<string> {
@@ -251,7 +323,7 @@ export class AiCodeUploadEventQueue {
 	private async needsRecordBoundary(filePath: string): Promise<boolean> {
 		let handle: fs.FileHandle | undefined
 		try {
-			handle = await fs.open(filePath, "r")
+			handle = await this.openFile(filePath, "r")
 			const stat = await handle.stat()
 			if (stat.size === 0) {
 				return false
@@ -333,7 +405,7 @@ export class AiCodeUploadEventQueue {
 			const tempPath = path.join(this.queueDir, `.${suffix}.tmp`)
 			const finalPath = path.join(this.queueDir, `${suffix}.ndjson`)
 			tempPaths.push(tempPath)
-			await fs.writeFile(tempPath, `${currentRecords.join("\n")}\n`, "utf8")
+			await this.writeFileDurably(tempPath, `${currentRecords.join("\n")}\n`)
 			finalPaths.push(finalPath)
 			currentRecords = []
 			currentBytes = 0
@@ -352,13 +424,94 @@ export class AiCodeUploadEventQueue {
 			}
 			await flush()
 			for (let index = 0; index < tempPaths.length; index += 1) {
-				await fs.rename(tempPaths[index], finalPaths[index])
+				await this.renameFile(tempPaths[index], finalPaths[index])
 			}
-			await fs.unlink(filePath)
+			// The old segment remains the last known-good copy until every replacement
+			// rename is durably published. A crash before this barrier may leave
+			// duplicates, which eventId de-duplication already tolerates.
+			if (!(await this.syncQueueDirectory(this.queueDir))) {
+				this.warnDirectoryDurabilityDegraded()
+				return
+			}
+			await this.unlinkFile(filePath)
+			await this.syncQueueDirectory(this.queueDir)
 		} catch (error) {
-			await Promise.all(tempPaths.map((tempPath) => fs.unlink(tempPath).catch(() => undefined)))
+			// Never delete already-renamed replacements on failure: together with the
+			// untouched old segment they are conservative duplicate recovery evidence.
+			await Promise.all(tempPaths.map((tempPath) => this.unlinkFile(tempPath).catch(() => undefined)))
 			throw error
 		}
+	}
+
+	private async appendRecordDurably(filePath: string, record: string): Promise<boolean> {
+		const fileExisted = await this.pathExists(filePath)
+		const segmentWasUnproven = this.unprovenSegmentPaths.has(filePath)
+		let handle: fs.FileHandle | undefined
+		try {
+			handle = await this.openFile(filePath, "a", 0o600)
+			await handle.writeFile(record, "utf8")
+			await handle.sync()
+		} finally {
+			await handle?.close()
+		}
+		if (fileExisted && !segmentWasUnproven) {
+			return true
+		}
+		const directoryDurable = await this.syncQueueDirectory(this.queueDir)
+		if (directoryDurable) {
+			this.unprovenSegmentPaths.delete(filePath)
+		} else {
+			// Keep reporting every later append to this segment as unproven. The
+			// store transaction journal must retain all of those event bodies, not
+			// only the first record that created the directory entry. Recovery keeps
+			// the transaction evidence until the directory itself can be synced; if
+			// the entry was lost, replay creates it again and remains unproven.
+			this.unprovenSegmentPaths.add(filePath)
+			this.warnDirectoryDurabilityDegraded()
+		}
+		return directoryDurable
+	}
+
+	private async writeFileDurably(filePath: string, content: string): Promise<void> {
+		let handle: fs.FileHandle | undefined
+		try {
+			handle = await this.openFile(filePath, "wx", 0o600)
+			await handle.writeFile(content, "utf8")
+			await handle.sync()
+		} finally {
+			await handle?.close()
+		}
+	}
+
+	private async pathExists(filePath: string): Promise<boolean> {
+		try {
+			await fs.access(filePath)
+			return true
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+				return false
+			}
+			throw error
+		}
+	}
+
+	private async canDurablyMutateDirectory(): Promise<boolean> {
+		await this.ensureReady()
+		const supported = await this.syncQueueDirectory(this.queueDir)
+		if (!supported) {
+			this.warnDirectoryDurabilityDegraded()
+		}
+		return supported
+	}
+
+	private warnDirectoryDurabilityDegraded(): void {
+		if (this.warnedAboutDirectoryDurability) {
+			return
+		}
+		this.warnedAboutDirectoryDurability = true
+		console.warn(
+			"[AiCodeStats] Directory fsync is unavailable; retaining upload queue recovery artifacts and using degraded atomic durability",
+		)
 	}
 
 	private normalizeEvent(event: AiCodeStatsEvent): AiCodeStatsEvent | undefined {
@@ -385,10 +538,10 @@ export class AiCodeUploadEventQueue {
 			model: event.model,
 			projectKey: event.projectKey,
 			projectName: event.projectName,
-			repoRoot: event.repoRoot ? normalizePath(event.repoRoot) : undefined,
-			repoRelativePath: event.repoRelativePath ? normalizePath(event.repoRelativePath) : undefined,
-			filePath: normalizePath(event.filePath ?? ""),
-			relativePath: normalizePath(event.relativePath ?? ""),
+			repoRoot: this.normalizePersistedPath(event.repoRoot) as string | undefined,
+			repoRelativePath: this.normalizePersistedPath(event.repoRelativePath) as string | undefined,
+			filePath: this.normalizePersistedPath(event.filePath, "") as string,
+			relativePath: this.normalizePersistedPath(event.relativePath, "") as string,
 			language: event.language,
 			gitRemoteUrl: event.gitRemoteUrl,
 			gitBranch: event.gitBranch,
@@ -400,17 +553,26 @@ export class AiCodeUploadEventQueue {
 						? event.lineStart
 						: 1,
 			lineCount: typeof event.lineCount === "number" ? event.lineCount : 0,
-			codeSnippet: typeof event.codeSnippet === "string" ? event.codeSnippet : "",
-			fileSnapshotContent: typeof event.fileSnapshotContent === "string" ? event.fileSnapshotContent : undefined,
+			codeSnippet: (event.codeSnippet === undefined ? "" : event.codeSnippet) as string,
+			fileSnapshotContent: event.fileSnapshotContent,
 			fileSnapshotHash: event.fileSnapshotHash,
 			taskId: event.taskId,
 			commitHash: event.commitHash,
 			commitOccurredAt: event.commitOccurredAt,
 			generatedBlockId:
-				typeof event.generatedBlockId === "string" && event.generatedBlockId.trim()
-					? event.generatedBlockId
-					: undefined,
+				typeof event.generatedBlockId === "string"
+					? event.generatedBlockId.trim()
+						? event.generatedBlockId
+						: undefined
+					: event.generatedBlockId,
 		}
+	}
+
+	private normalizePersistedPath(value: unknown, missingValue?: string): unknown {
+		if (typeof value === "string") {
+			return normalizePath(value)
+		}
+		return value === undefined ? missingValue : value
 	}
 
 	private dateKeyFromFilePath(filePath: string): string {

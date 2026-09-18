@@ -14,6 +14,7 @@ import { AiCodeStatsUploader } from "../AiCodeStatsUploader"
 import {
 	CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
 	buildRepoCommitKey,
+	type AiCodeCommitCandidateLine,
 	type AiCodeCommitLifecycleReport,
 	type AiCodeCommitReport,
 	type AiCodeQueuedCommitLifecycleReport,
@@ -154,6 +155,7 @@ const buildQueuedReport = (overrides: Partial<AiCodeQueuedCommitReport> = {}): A
 	report: overrides.report ?? buildCommitReport(),
 	createdAt: overrides.createdAt ?? Date.now(),
 	generatedBlockIds: overrides.generatedBlockIds ?? ["generated-1"],
+	boundUserEmail: overrides.boundUserEmail,
 })
 
 const buildLifecycleReport = (overrides: Partial<AiCodeCommitLifecycleReport> = {}): AiCodeCommitLifecycleReport => ({
@@ -527,6 +529,450 @@ describe("AiCodeStatsUploader", () => {
 		)
 		expect(body.defaults.userEmail).toBe("persisted.user@example.com")
 		expect(await store.getQueuedReportsForTests()).toHaveLength(0)
+	})
+
+	it("durably binds a missing report identity before upload and keeps it after a lost acknowledgement", async () => {
+		await store.queueCommitReport(
+			buildQueuedReport({
+				report: buildCommitReport({
+					reportId: "report-bound-after-ack-loss",
+					commitHash: "commit-bound-after-ack-loss",
+				}),
+			}),
+		)
+		const uploadedEmails: string[] = []
+		const fetchMock = vi
+			.fn()
+			.mockImplementationOnce(async (_url: string, init: RequestInit) => {
+				const body = await parseJsonBody(init.body as BodyInit, init.headers as Record<string, string>)
+				uploadedEmails.push(body.defaults.userEmail)
+				return acceptedIngestResponseForRequestWith(init, { payloadSha256: "0".repeat(64) })
+			})
+			.mockImplementationOnce(async (_url: string, init: RequestInit) => {
+				const body = await parseJsonBody(init.body as BodyInit, init.headers as Record<string, string>)
+				uploadedEmails.push(body.defaults.userEmail)
+				return acceptedIngestResponseForRequestWith(init)
+			})
+		vi.stubGlobal("fetch", fetchMock)
+
+		expect(
+			await uploader.uploadQueuedReports(
+				{
+					enabled: true,
+					webhookUrl: "https://example.com/webhook",
+					userEmail: "owner.a@example.com",
+				},
+				{ requestRetries: 0 },
+			),
+		).toMatchObject({ uploadedReports: 0, failedReports: 1 })
+		expect((await store.getQueuedReportsForTests())[0].boundUserEmail).toBe("owner.a@example.com")
+
+		expect(
+			await uploader.uploadQueuedReports(
+				{
+					enabled: true,
+					webhookUrl: "https://example.com/webhook",
+					userEmail: "owner.b@example.com",
+				},
+				{ requestRetries: 0 },
+			),
+		).toMatchObject({ uploadedReports: 1, failedReports: 0 })
+		expect(uploadedEmails).toEqual(["owner.a@example.com", "owner.a@example.com"])
+	})
+
+	it("keeps a bound report identity when local outbox acknowledgement persistence fails", async () => {
+		await store.queueCommitReport(
+			buildQueuedReport({
+				report: buildCommitReport({
+					reportId: "report-bound-before-local-ack",
+					commitHash: "commit-bound-before-local-ack",
+				}),
+			}),
+		)
+		const uploadedEmails: string[] = []
+		const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
+			const body = await parseJsonBody(init.body as BodyInit, init.headers as Record<string, string>)
+			uploadedEmails.push(body.defaults.userEmail)
+			return acceptedIngestResponseForRequestWith(init)
+		})
+		vi.stubGlobal("fetch", fetchMock)
+		vi.spyOn(store, "acknowledgeQueuedCommitReport").mockRejectedValueOnce(new Error("outbox fsync failed"))
+
+		await expect(
+			uploader.uploadQueuedReports(
+				{
+					enabled: true,
+					webhookUrl: "https://example.com/webhook",
+					userEmail: "owner.a@example.com",
+				},
+				{ requestRetries: 0 },
+			),
+		).rejects.toThrow("outbox fsync failed")
+
+		expect(
+			await uploader.uploadQueuedReports(
+				{
+					enabled: true,
+					webhookUrl: "https://example.com/webhook",
+					userEmail: "owner.b@example.com",
+				},
+				{ requestRetries: 0 },
+			),
+		).toMatchObject({ uploadedReports: 1, failedReports: 0 })
+		expect(uploadedEmails).toEqual(["owner.a@example.com", "owner.a@example.com"])
+	})
+
+	it("never binds a current profile over a non-empty invalid report identity", async () => {
+		const invalidIdentityBlock = {
+			...buildCommitReport().acceptedBlocks![0],
+			userEmail: "persisted-owner-without-domain",
+		}
+		await store.queueCommitReport(
+			buildQueuedReport({
+				report: buildCommitReport({
+					reportId: "report-invalid-persisted-identity",
+					commitHash: "commit-invalid-persisted-identity",
+					acceptedBlocks: [invalidIdentityBlock],
+				}),
+			}),
+		)
+		const fetchMock = vi.fn(acceptedIngestResponseForRequest)
+		vi.stubGlobal("fetch", fetchMock)
+
+		expect(
+			await uploader.uploadQueuedReports({
+				enabled: true,
+				webhookUrl: "https://example.com/webhook",
+				userEmail: "different.current@example.com",
+			}),
+		).toMatchObject({ uploadedReports: 0, failedReports: 1 })
+		expect(fetchMock).not.toHaveBeenCalled()
+		expect((await store.getQueuedReportsForTests())[0].boundUserEmail).toBeUndefined()
+	})
+
+	it("keeps a bound identity object report across restart while uploading a later valid report", async () => {
+		await store.queueCommitReport(
+			buildQueuedReport({
+				createdAt: 1,
+				boundUserEmail: { legacyOwner: "unknown" },
+				report: buildCommitReport({
+					reportId: "report-bound-object",
+					commitHash: "commit-bound-object",
+				}),
+			}),
+		)
+		await store.queueCommitReport(
+			buildQueuedReport({
+				createdAt: 2,
+				report: buildCommitReport({
+					reportId: "report-valid-after-bound-object",
+					commitHash: "commit-valid-after-bound-object",
+					acceptedBlocks: [
+						{
+							...buildCommitReport().acceptedBlocks![0],
+							userEmail: "valid.persisted@example.com",
+						},
+					],
+				}),
+			}),
+		)
+		store = new AiCodeStatsStore(tmpDir)
+		uploader = new AiCodeStatsUploader(store)
+		const fetchMock = vi.fn(acceptedIngestResponseForRequest)
+		vi.stubGlobal("fetch", fetchMock)
+
+		const result = await uploader.uploadQueuedReports({
+			enabled: true,
+			webhookUrl: "https://example.com/webhook",
+			userEmail: "current.user@example.com",
+		})
+
+		expect(result).toMatchObject({ uploadedReports: 1, failedReports: 1 })
+		expect(result.failedReportErrors[0]).toMatchObject({
+			reportId: "report-bound-object",
+			errorCategory: "invalid_local_payload",
+		})
+		expect(fetchMock).toHaveBeenCalledTimes(1)
+		expect((await store.getQueuedReportsForTests()).map((queued) => queued.report.reportId)).toEqual([
+			"report-bound-object",
+		])
+		expect((await store.getQueuedReportsForTests())[0].boundUserEmail).toEqual({ legacyOwner: "unknown" })
+		const storeFiles = await fs.readdir(path.join(tmpDir, "ai-code-stats", "v1"))
+		expect(storeFiles.some((name) => name.startsWith("queued-reports.json.corrupt-"))).toBe(false)
+	})
+
+	it("uploads a healthy commit report after disk restart while preserving one path-poisoned raw report", async () => {
+		await store.getRawStateForTests()
+		const baseDir = path.join(tmpDir, "ai-code-stats", "v1")
+		const poisonedSnapshotHash = "poisoned-commit-report-snapshot"
+		const healthy = buildQueuedReport({
+			createdAt: 2,
+			boundUserEmail: "valid.persisted@example.com",
+			report: buildCommitReport({ reportId: "healthy-disk-report", commitHash: "healthy-disk-commit" }),
+		})
+		const poisoned = {
+			...buildQueuedReport({
+				createdAt: 1,
+				boundUserEmail: "valid.persisted@example.com",
+				report: buildCommitReport({ reportId: "poisoned-disk-report", commitHash: "poisoned-disk-commit" }),
+			}),
+			report: {
+				...buildCommitReport({ reportId: "poisoned-disk-report", commitHash: "poisoned-disk-commit" }),
+				repoRoot: { invalid: "non-string-path" },
+				changedFiles: [
+					{
+						relativePath: "src/poisoned.ts",
+						filePath: "/workspace/project/src/poisoned.ts",
+						committedSnapshotHash: poisonedSnapshotHash,
+						changedBlocks: [],
+					},
+				],
+			},
+		}
+		await fs.writeFile(path.join(baseDir, "queued-reports.json"), JSON.stringify([poisoned, healthy]), "utf8")
+		await fs.writeFile(
+			path.join(baseDir, "snapshot-store.json"),
+			JSON.stringify({
+				[poisonedSnapshotHash]: {
+					contentHash: poisonedSnapshotHash,
+					content: "const poisonedCommit = true\n",
+					length: 28,
+					lineCount: 1,
+					createdAt: 1,
+					lastUsedAt: 1,
+				},
+			}),
+			"utf8",
+		)
+
+		store = new AiCodeStatsStore(tmpDir)
+		uploader = new AiCodeStatsUploader(store)
+		const fetchMock = vi.fn(acceptedIngestResponseForRequest)
+		vi.stubGlobal("fetch", fetchMock)
+
+		const result = await uploader.uploadQueuedReports({
+			enabled: true,
+			webhookUrl: "https://example.com/webhook",
+			userEmail: "current.user@example.com",
+		})
+
+		expect(result).toMatchObject({ uploadedReports: 1, failedReports: 0 })
+		expect(fetchMock).toHaveBeenCalledTimes(1)
+		expect(await store.getQueuedReportsForTests()).toEqual([])
+		expect((await store.getCommitUploadDiagnostics()).quarantinedOutboxRecords).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					kind: "commit_report",
+					reportId: "poisoned-disk-report",
+					commitHash: "poisoned-disk-commit",
+				}),
+			]),
+		)
+		expect((await store.getSnapshotsForTests())[poisonedSnapshotHash]).toBeDefined()
+
+		store = new AiCodeStatsStore(tmpDir)
+		expect(await store.getQueuedReportsForTests()).toEqual([])
+		expect((await store.getCommitUploadDiagnostics()).quarantinedOutboxRecords).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ kind: "commit_report", reportId: "poisoned-disk-report" }),
+			]),
+		)
+		const persisted = JSON.parse(await fs.readFile(path.join(baseDir, "queued-reports.json"), "utf8"))
+		expect(persisted).toEqual([
+			expect.objectContaining({
+				report: expect.objectContaining({
+					reportId: "poisoned-disk-report",
+					repoRoot: { invalid: "non-string-path" },
+				}),
+			}),
+		])
+		expect((await store.getSnapshotsForTests())[poisonedSnapshotHash]).toBeDefined()
+	})
+
+	it("uploads a healthy lifecycle report after disk restart while preserving one path-poisoned raw report", async () => {
+		await store.getRawStateForTests()
+		const baseDir = path.join(tmpDir, "ai-code-stats", "v1")
+		const healthy = buildQueuedLifecycleReport({
+			createdAt: 2,
+			report: buildLifecycleReport({
+				eventId: "healthy-disk-lifecycle",
+				reportId: "healthy-disk-lifecycle-report",
+			}),
+		})
+		const poisoned = {
+			...buildQueuedLifecycleReport({
+				createdAt: 1,
+				report: buildLifecycleReport({
+					eventId: "poisoned-disk-lifecycle",
+					reportId: "poisoned-disk-lifecycle-report",
+				}),
+			}),
+			report: {
+				...buildLifecycleReport({
+					eventId: "poisoned-disk-lifecycle",
+					reportId: "poisoned-disk-lifecycle-report",
+				}),
+				repoRoot: { invalid: "non-string-path" },
+			},
+		}
+		await fs.writeFile(
+			path.join(baseDir, "queued-lifecycle-reports.json"),
+			JSON.stringify([poisoned, healthy]),
+			"utf8",
+		)
+
+		store = new AiCodeStatsStore(tmpDir)
+		uploader = new AiCodeStatsUploader(store)
+		const fetchMock = vi.fn(acceptedIngestResponseForRequest)
+		vi.stubGlobal("fetch", fetchMock)
+
+		const result = await uploader.uploadQueuedLifecycleReports({
+			enabled: true,
+			webhookUrl: "https://example.com/webhook",
+		})
+
+		expect(result).toMatchObject({ uploadedReports: 1, failedReports: 0 })
+		expect(fetchMock).toHaveBeenCalledTimes(1)
+		expect(await store.getQueuedCommitLifecycleReportsForTests()).toEqual([])
+		expect((await store.getCommitUploadDiagnostics()).quarantinedOutboxRecords).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					kind: "commit_lifecycle",
+					reportId: "poisoned-disk-lifecycle-report",
+					eventId: "poisoned-disk-lifecycle",
+				}),
+			]),
+		)
+
+		store = new AiCodeStatsStore(tmpDir)
+		expect(await store.getQueuedCommitLifecycleReportsForTests()).toEqual([])
+		expect((await store.getCommitUploadDiagnostics()).quarantinedOutboxRecords).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ kind: "commit_lifecycle", eventId: "poisoned-disk-lifecycle" }),
+			]),
+		)
+		const persisted = JSON.parse(await fs.readFile(path.join(baseDir, "queued-lifecycle-reports.json"), "utf8"))
+		expect(persisted).toEqual([
+			expect.objectContaining({
+				report: expect.objectContaining({
+					eventId: "poisoned-disk-lifecycle",
+					repoRoot: { invalid: "non-string-path" },
+				}),
+			}),
+		])
+	})
+
+	it.each(["acceptedBlocks", "generatedBlocks", "candidateLines"] as const)(
+		"isolates a numeric %s userEmail and uploads a later valid report in the same pass",
+		async (field) => {
+			const baseline = buildCommitReport().acceptedBlocks![0]
+			const poisonReport = buildCommitReport({
+				reportId: `report-number-${field}`,
+				commitHash: `commit-number-${field}`,
+				acceptedBlocks: field === "acceptedBlocks" ? [{ ...baseline, userEmail: 42 as unknown as string }] : [],
+				generatedBlocks:
+					field === "generatedBlocks" ? [{ ...baseline, userEmail: 42 as unknown as string }] : [],
+			})
+			if (field === "candidateLines") {
+				poisonReport.candidateLines = [
+					{
+						clientLineId: "candidate-number-user-email",
+						generatedBlockId: "generated-1",
+						baselineEventId: "generated-1:generated",
+						baselineMetricType: "generated",
+						sourceTimestamp: Date.now(),
+						sourceType: "agent_insert",
+						ide: "vscode",
+						userEmail: 42 as unknown as string,
+						projectKey: "project-key",
+						projectName: "repo",
+						filePath: "/workspace/project/src/a.ts",
+						relativePath: "src/a.ts",
+						repoRoot: "/workspace/project",
+						repoRelativePath: "src/a.ts",
+						lineNumber: 1,
+						rawLine: "const a = 1",
+						blockLineIndex: 1,
+						blockLineCount: 1,
+						lineHash: "line-hash",
+						occurrenceIndex: 1,
+					} satisfies AiCodeCommitCandidateLine,
+				]
+			}
+			await store.queueCommitReport(buildQueuedReport({ createdAt: 1, report: poisonReport }))
+			await store.queueCommitReport(
+				buildQueuedReport({
+					createdAt: 2,
+					report: buildCommitReport({
+						reportId: `report-valid-after-${field}`,
+						commitHash: `commit-valid-after-${field}`,
+						acceptedBlocks: [{ ...baseline, userEmail: "valid.persisted@example.com" }],
+					}),
+				}),
+			)
+			const fetchMock = vi.fn(acceptedIngestResponseForRequest)
+			vi.stubGlobal("fetch", fetchMock)
+
+			const result = await uploader.uploadQueuedReports({
+				enabled: true,
+				webhookUrl: "https://example.com/webhook",
+				userEmail: "current.user@example.com",
+			})
+
+			expect(result).toMatchObject({ uploadedReports: 1, failedReports: 1 })
+			expect(result.failedReportErrors[0]).toMatchObject({
+				reportId: `report-number-${field}`,
+				errorCategory: "invalid_local_payload",
+			})
+			expect(fetchMock).toHaveBeenCalledTimes(1)
+			expect((await store.getQueuedReportsForTests()).map((queued) => queued.report.reportId)).toEqual([
+				`report-number-${field}`,
+			])
+		},
+	)
+
+	it("rejects mixed persisted A/B report identities without blocking a later valid report", async () => {
+		const baseline = buildCommitReport().acceptedBlocks![0]
+		await store.queueCommitReport(
+			buildQueuedReport({
+				createdAt: 1,
+				report: buildCommitReport({
+					reportId: "report-mixed-identities",
+					commitHash: "commit-mixed-identities",
+					acceptedBlocks: [{ ...baseline, userEmail: "owner.a@example.com" }],
+					generatedBlocks: [{ ...baseline, userEmail: "owner.b@example.com" }],
+				}),
+			}),
+		)
+		await store.queueCommitReport(
+			buildQueuedReport({
+				createdAt: 2,
+				report: buildCommitReport({
+					reportId: "report-valid-after-mixed-identities",
+					commitHash: "commit-valid-after-mixed-identities",
+					acceptedBlocks: [{ ...baseline, userEmail: "owner.a@example.com" }],
+				}),
+			}),
+		)
+		const fetchMock = vi.fn(acceptedIngestResponseForRequest)
+		vi.stubGlobal("fetch", fetchMock)
+
+		const result = await uploader.uploadQueuedReports({
+			enabled: true,
+			webhookUrl: "https://example.com/webhook",
+			userEmail: "owner.b@example.com",
+		})
+
+		expect(result).toMatchObject({ uploadedReports: 1, failedReports: 1 })
+		expect(result.failedReportErrors[0]).toMatchObject({
+			reportId: "report-mixed-identities",
+			errorCategory: "invalid_local_payload",
+		})
+		expect(result.failedReportErrors[0].message).toContain("conflicting persisted identities")
+		expect(fetchMock).toHaveBeenCalledTimes(1)
+		expect((await store.getQueuedReportsForTests()).map((queued) => queued.report.reportId)).toEqual([
+			"report-mixed-identities",
+		])
 	})
 
 	it("does not substitute the Git author for a missing enterprise user identity", async () => {
@@ -935,6 +1381,79 @@ describe("AiCodeStatsUploader", () => {
 		expect((await store.getRawStateForTests()).blockedEvents).toEqual({})
 	})
 
+	it("keeps the first fallback identity after an acknowledgement is lost and the profile switches", async () => {
+		await store.appendEvent(buildIncrementalEvent("identity-ack-lost", { userEmail: undefined }))
+		const uploadedEmails: string[] = []
+		const fetchMock = vi
+			.fn()
+			.mockImplementationOnce(async (_url: string, init: RequestInit) => {
+				const body = JSON.parse(String(init.body))
+				uploadedEmails.push(body.events[0].userEmail)
+				return new Response(
+					JSON.stringify({
+						accepted: true,
+						kind: "envelope",
+						insertedEvents: 1,
+						duplicateEvents: 0,
+						payloadSha256: "0".repeat(64),
+					}),
+					{ status: 200 },
+				)
+			})
+			.mockImplementationOnce(async (_url: string, init: RequestInit) => {
+				const body = JSON.parse(String(init.body))
+				uploadedEmails.push(body.events[0].userEmail)
+				return acceptedIngestResponseForRequestWith(init)
+			})
+		vi.stubGlobal("fetch", fetchMock)
+
+		await expect(
+			uploader.upload(
+				{ enabled: true, webhookUrl: "https://example.com/webhook", userEmail: "owner.a@example.com" },
+				{ client: { ide: "vscode", machineId: "machine-1" } },
+			),
+		).rejects.toThrow("acknowledgement")
+		expect((await store.getRawStateForTests()).pendingEventUserEmails).toEqual({
+			"identity-ack-lost": "owner.a@example.com",
+		})
+
+		await expect(
+			uploader.upload(
+				{ enabled: true, webhookUrl: "https://example.com/webhook", userEmail: "owner.b@example.com" },
+				{ client: { ide: "vscode", machineId: "machine-1" } },
+			),
+		).resolves.toEqual({ uploaded: 1 })
+		expect(uploadedEmails).toEqual(["owner.a@example.com", "owner.a@example.com"])
+		expect((await store.getRawStateForTests()).pendingEventUserEmails).toEqual({})
+	})
+
+	it("keeps the first fallback identity when local acknowledgement persistence fails", async () => {
+		await store.appendEvent(buildIncrementalEvent("identity-local-ack-failed", { userEmail: undefined }))
+		const uploadedEmails: string[] = []
+		const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
+			const body = JSON.parse(String(init.body))
+			uploadedEmails.push(body.events[0].userEmail)
+			return acceptedIngestResponseForRequestWith(init)
+		})
+		vi.stubGlobal("fetch", fetchMock)
+		vi.spyOn(store, "markEventsUploaded").mockRejectedValueOnce(new Error("state fsync failed"))
+
+		await expect(
+			uploader.upload(
+				{ enabled: true, webhookUrl: "https://example.com/webhook", userEmail: "owner.a@example.com" },
+				{ client: { ide: "vscode", machineId: "machine-1" } },
+			),
+		).rejects.toThrow("state fsync failed")
+
+		await expect(
+			uploader.upload(
+				{ enabled: true, webhookUrl: "https://example.com/webhook", userEmail: "owner.b@example.com" },
+				{ client: { ide: "vscode", machineId: "machine-1" } },
+			),
+		).resolves.toEqual({ uploaded: 1 })
+		expect(uploadedEmails).toEqual(["owner.a@example.com", "owner.a@example.com"])
+	})
+
 	it("never replaces a valid persisted event identity with a different current configuration", async () => {
 		await store.appendEvent(
 			buildIncrementalEvent("persisted-identity-wins", {
@@ -1009,6 +1528,177 @@ describe("AiCodeStatsUploader", () => {
 			],
 		})
 		expect((await store.getPendingEvents()).map((event) => event.eventId)).toEqual(["invalid-email"])
+	})
+
+	it("isolates an object event userEmail after restart while uploading a later valid event", async () => {
+		const now = Date.now()
+		await store.appendEvents([
+			buildIncrementalEvent("object-email", {
+				timestamp: now,
+				userEmail: { legacyOwner: "unknown" } as unknown as string,
+			}),
+			buildIncrementalEvent("valid-after-object-email", {
+				timestamp: now + 1,
+				userEmail: "valid.user@example.com",
+			}),
+		])
+		store = new AiCodeStatsStore(tmpDir)
+		uploader = new AiCodeStatsUploader(store)
+		const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+			const body = JSON.parse(String(init?.body))
+			expect(body.events.map((event: AiCodeStatsEvent) => event.eventId)).toEqual(["valid-after-object-email"])
+			return acceptedIngestResponseForRequestWith(init!, {
+				kind: "envelope",
+				insertedEvents: 1,
+				duplicateEvents: 0,
+			})
+		})
+		vi.stubGlobal("fetch", fetchMock)
+
+		expect(
+			await uploader.upload(
+				{
+					enabled: true,
+					webhookUrl: "https://example.com/webhook",
+					userEmail: "current.user@example.com",
+				},
+				{ client: { ide: "vscode", machineId: "machine-1" } },
+			),
+		).toMatchObject({
+			uploaded: 1,
+			blockedEvents: [
+				expect.objectContaining({
+					eventId: "object-email",
+					category: "invalid_identity",
+					retryable: false,
+				}),
+			],
+		})
+		expect((await store.getPendingEvents()).map((event) => event.eventId)).toEqual(["object-email"])
+		expect((await store.getRawStateForTests()).pendingEventUserEmails).not.toHaveProperty("object-email")
+	})
+
+	it("isolates an object incremental path while uploading a later valid event", async () => {
+		const now = Date.now()
+		await store.appendEvents([
+			buildIncrementalEvent("object-file-path", {
+				timestamp: now,
+				userEmail: "valid.user@example.com",
+				filePath: { legacyPath: "/workspace/project/src/incremental.ts" } as unknown as string,
+			}),
+			buildIncrementalEvent("valid-after-object-file-path", {
+				timestamp: now + 1,
+				userEmail: "valid.user@example.com",
+			}),
+		])
+		store = new AiCodeStatsStore(tmpDir)
+		uploader = new AiCodeStatsUploader(store)
+		const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+			const body = JSON.parse(String(init?.body))
+			expect(body.events.map((event: AiCodeStatsEvent) => event.eventId)).toEqual([
+				"valid-after-object-file-path",
+			])
+			return acceptedIngestResponseForRequestWith(init!, {
+				kind: "envelope",
+				insertedEvents: 1,
+				duplicateEvents: 0,
+			})
+		})
+		vi.stubGlobal("fetch", fetchMock)
+
+		expect(
+			await uploader.upload(
+				{
+					enabled: true,
+					webhookUrl: "https://example.com/webhook",
+					userEmail: "current.user@example.com",
+				},
+				{ client: { ide: "vscode", machineId: "machine-1" } },
+			),
+		).toMatchObject({
+			uploaded: 1,
+			blockedEvents: [
+				expect.objectContaining({
+					eventId: "object-file-path",
+					category: "invalid_local_payload",
+					retryable: false,
+					reason: expect.stringContaining("filePath must be a string"),
+				}),
+			],
+		})
+		expect(fetchMock).toHaveBeenCalledTimes(1)
+		expect((await store.getPendingEvents()).map((event) => event.eventId)).toEqual(["object-file-path"])
+	})
+
+	it("retains an array pending identity binding as invalid instead of binding current user B", async () => {
+		await store.appendEvent(buildIncrementalEvent("array-pending-binding", { userEmail: undefined }))
+		const statePath = path.join(tmpDir, "ai-code-stats", "v1", "state.json")
+		const persistedState = JSON.parse(await fs.readFile(statePath, "utf8")) as Record<string, any>
+		persistedState.pendingEventUserEmails = { "array-pending-binding": [] }
+		await fs.writeFile(statePath, JSON.stringify(persistedState), "utf8")
+		store = new AiCodeStatsStore(tmpDir)
+		uploader = new AiCodeStatsUploader(store)
+		const fetchMock = vi.fn()
+		vi.stubGlobal("fetch", fetchMock)
+
+		expect(
+			await uploader.upload(
+				{
+					enabled: true,
+					webhookUrl: "https://example.com/webhook",
+					userEmail: "user-b@example.com",
+				},
+				{ client: { ide: "vscode", machineId: "machine-1" } },
+			),
+		).toMatchObject({
+			uploaded: 0,
+			blockedEvents: [
+				expect.objectContaining({
+					eventId: "array-pending-binding",
+					category: "invalid_identity",
+					retryable: false,
+				}),
+			],
+		})
+		expect(fetchMock).not.toHaveBeenCalled()
+		expect((await store.getRawStateForTests()).pendingEventUserEmails).toEqual({
+			"array-pending-binding": [],
+		})
+	})
+
+	it("retains a malformed pending identity binding container instead of binding current user B", async () => {
+		await store.appendEvent(buildIncrementalEvent("array-binding-container", { userEmail: undefined }))
+		const statePath = path.join(tmpDir, "ai-code-stats", "v1", "state.json")
+		const persistedState = JSON.parse(await fs.readFile(statePath, "utf8")) as Record<string, any>
+		persistedState.pendingEventUserEmails = []
+		await fs.writeFile(statePath, JSON.stringify(persistedState), "utf8")
+		store = new AiCodeStatsStore(tmpDir)
+		uploader = new AiCodeStatsUploader(store)
+		const fetchMock = vi.fn()
+		vi.stubGlobal("fetch", fetchMock)
+
+		expect(
+			await uploader.upload(
+				{
+					enabled: true,
+					webhookUrl: "https://example.com/webhook",
+					userEmail: "user-b@example.com",
+				},
+				{ client: { ide: "vscode", machineId: "machine-1" } },
+			),
+		).toMatchObject({
+			uploaded: 0,
+			blockedEvents: [
+				expect.objectContaining({
+					eventId: "array-binding-container",
+					category: "invalid_identity",
+					retryable: false,
+				}),
+			],
+		})
+		expect(fetchMock).not.toHaveBeenCalled()
+		expect(await store.hasInvalidPendingEventUserEmailState()).toBe(true)
+		expect((await store.getRawStateForTests()).pendingEventUserEmails).toEqual({})
 	})
 
 	it.each([

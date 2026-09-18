@@ -3,14 +3,16 @@ import { AsyncLocalStorage } from "async_hooks"
 import * as fs from "fs/promises"
 import * as path from "path"
 
-import { recoverSafeWriteJson, safeWriteJson, withCrossProcessFileLock } from "../../utils/safeWriteJson"
+import { recoverSafeWriteJson, safeWriteJson, syncDirectory, withCrossProcessFileLock } from "../../utils/safeWriteJson"
 import { countSnapshotLines, hashSnapshotContent, normalizeSnapshotContent } from "./AiCodeCompactCommitReport"
 import { hashLineFingerprint } from "./AiCodeLineFingerprint"
 import { AiCodeUploadEventQueue } from "./AiCodeUploadEventQueue"
 import {
 	AI_CODE_STATS_VERSION,
 	CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
+	classifyUserEmail,
 	normalizePath,
+	normalizeUserEmail,
 	toLocalDateKey,
 	type AiCodeGeneratedBlock,
 	type AiCodePendingCommitMetricBlock,
@@ -18,6 +20,9 @@ import {
 	type AiCodeCommitUploadDiagnosticEvent,
 	type AiCodeCommitUploadRecord,
 	type AiCodePendingLineAttribution,
+	type AiCodeQuarantinedFactSummary,
+	type AiCodeQuarantinedOutboxKind,
+	type AiCodeQuarantinedOutboxRecordSummary,
 	type AiCodeQueuedCommitLifecycleReport,
 	type AiCodeQueuedCommitReport,
 	type AiCodeStatsEvent,
@@ -53,11 +58,18 @@ type AiCodeStatsStoreFileKey =
 
 interface AiCodeStatsStoreTransaction {
 	version: typeof STORE_TRANSACTION_VERSION
+	transactionId?: string
+	status?: "prepared" | "committed"
 	uploadEvents?: AiCodeStatsEvent[]
 	writes: Array<{
 		key: AiCodeStatsStoreFileKey
 		value: unknown
 	}>
+}
+
+interface AiCodeStatsStoreOptions {
+	open?: typeof fs.open
+	syncDirectory?: typeof syncDirectory
 }
 
 interface AiCodeSnapshotStoreEntry {
@@ -69,17 +81,25 @@ interface AiCodeSnapshotStoreEntry {
 	lastUsedAt: number
 }
 
+interface AiCodeQuarantinedOutboxRecord extends AiCodeQuarantinedOutboxRecordSummary {
+	raw: unknown
+}
+
+type AiCodeQuarantinedPendingFactRecord = AiCodeQuarantinedOutboxRecord & {
+	kind: Exclude<AiCodeQuarantinedOutboxKind, "commit_upload_record">
+}
+
+type PersistedRecordDisposition = { kind: "current" | "legacy" } | { kind: "poison"; reason: string }
+
 const createEmptyState = (): AiCodeStatsPersistedState => ({
 	version: AI_CODE_STATS_VERSION,
 	pendingEventIds: [],
 	supersededEventIds: [],
+	pendingEventUserEmails: {},
 	blockedEvents: {},
 	repoObservedCommits: {},
 	lastUpload: { status: "idle" },
 })
-
-const isCurrentSemanticsVersion = (semanticsVersion?: number): boolean =>
-	semanticsVersion === CURRENT_AI_CODE_STATS_SEMANTICS_VERSION
 
 export class AiCodeStatsStore {
 	private readonly baseDir: string
@@ -96,23 +116,37 @@ export class AiCodeStatsStore {
 	private readonly transactionPath: string
 	private readonly storeLockPath: string
 	private readonly revisionPath: string
+	private readonly syncStoreDirectory: typeof syncDirectory
 	private state: AiCodeStatsPersistedState | null = null
 	private pendingLines: AiCodePendingLineAttribution[] = []
 	private generatedBlocks: AiCodeGeneratedBlockState[] = []
 	private queuedReports: AiCodeQueuedCommitReport[] = []
 	private queuedLifecycleReports: AiCodeQueuedCommitLifecycleReport[] = []
+	private quarantinedPendingLines: AiCodeQuarantinedOutboxRecord[] = []
+	private quarantinedGeneratedBlocks: AiCodeQuarantinedOutboxRecord[] = []
+	private quarantinedQueuedReports: AiCodeQuarantinedOutboxRecord[] = []
+	private quarantinedQueuedLifecycleReports: AiCodeQuarantinedOutboxRecord[] = []
 	private commitUploadRecords: AiCodeCommitUploadRecord[] = []
+	private quarantinedCommitUploadRecords: AiCodeQuarantinedOutboxRecord[] = []
 	private pendingCommitMetricBlocks: AiCodePendingCommitMetricBlock[] = []
+	private quarantinedPendingCommitMetricBlocks: AiCodeQuarantinedOutboxRecord[] = []
 	private snapshots: Record<string, AiCodeSnapshotStoreEntry> = {}
 	private snapshotsChanged = false
+	private snapshotNormalizationJournal: Map<string, AiCodeSnapshotStoreEntry | undefined> | null = null
+	private retainedTransactionUploadEvents: AiCodeStatsEvent[] = []
+	private warnedAboutTransactionDirectoryDurability = false
 	private loadPromise: Promise<void> | null = null
 	private operationQueue: Promise<void> = Promise.resolve()
 	private loadedRevision: string | undefined
 	private readonly storeLockContext = new AsyncLocalStorage<boolean>()
 
-	constructor(globalStoragePath: string) {
+	constructor(globalStoragePath: string, options: AiCodeStatsStoreOptions = {}) {
 		this.baseDir = path.join(globalStoragePath, "ai-code-stats", "v1")
-		this.uploadEventQueue = new AiCodeUploadEventQueue(this.baseDir)
+		this.syncStoreDirectory = options.syncDirectory ?? syncDirectory
+		this.uploadEventQueue = new AiCodeUploadEventQueue(this.baseDir, {
+			open: options.open,
+			syncDirectory: this.syncStoreDirectory,
+		})
 		this.statePath = path.join(this.baseDir, STATE_FILE)
 		this.pendingLinesPath = path.join(this.baseDir, PENDING_LINES_FILE)
 		this.generatedBlocksPath = path.join(this.baseDir, GENERATED_BLOCKS_FILE)
@@ -384,6 +418,7 @@ export class AiCodeStatsStore {
 		records: AiCodeCommitUploadRecord[]
 		events: AiCodeCommitUploadDiagnosticEvent[]
 		blockedEvents: AiCodeStatsEventUploadBlock[]
+		quarantinedOutboxRecords: AiCodeQuarantinedOutboxRecordSummary[]
 	}> {
 		await this.ensureLoaded()
 		const targetRecord = recordId ? this.commitUploadRecords.find((record) => record.id === recordId) : undefined
@@ -416,6 +451,7 @@ export class AiCodeStatsStore {
 				eventId,
 				...block,
 			})),
+			quarantinedOutboxRecords: this.getQuarantinedOutboxRecordSummaries(),
 		}
 	}
 
@@ -587,7 +623,28 @@ export class AiCodeStatsStore {
 		const pendingGeneratedBlocks = this.generatedBlocks.filter(
 			(block) => block.uploadStatus === "pending" || block.uploadStatus === "queued",
 		).length
-		return pendingStandaloneEvents + pendingCommitMetricEvents + pendingGeneratedBlocks
+		const quarantinedPendingFacts = this.getQuarantinedPendingFactRecords().length
+		return pendingStandaloneEvents + pendingCommitMetricEvents + pendingGeneratedBlocks + quarantinedPendingFacts
+	}
+
+	async getQuarantinedPendingFactStatus(): Promise<{
+		count: number
+		summaries: AiCodeQuarantinedFactSummary[]
+	}> {
+		await this.ensureLoaded()
+		const records = this.getQuarantinedPendingFactRecords()
+		const summaries: AiCodeQuarantinedFactSummary[] = []
+		for (const record of records) {
+			const existing = summaries.find(
+				(summary) => summary.kind === record.kind && summary.reason === record.reason,
+			)
+			if (existing) {
+				existing.count += 1
+			} else {
+				summaries.push({ kind: record.kind, reason: record.reason, count: 1 })
+			}
+		}
+		return { count: records.length, summaries }
 	}
 
 	async getPendingEvents(
@@ -601,6 +658,94 @@ export class AiCodeStatsStore {
 			maxEvents,
 			includeEvent,
 		)
+	}
+
+	async getPendingEventUserEmails(): Promise<Record<string, unknown>> {
+		await this.ensureLoaded()
+		return { ...(this.state!.pendingEventUserEmails ?? {}) }
+	}
+
+	async hasInvalidPendingEventUserEmailState(): Promise<boolean> {
+		await this.ensureLoaded()
+		return this.state!.pendingEventUserEmailsInvalid === true
+	}
+
+	/**
+	 * Durably binds only identity-less pending events to the first configured
+	 * enterprise email that reaches the store. A concurrent extension host sees
+	 * and reuses the winner instead of changing ownership on a later retry.
+	 */
+	async bindPendingEventUserEmails(eventIds: string[], userEmail: string): Promise<Record<string, unknown>> {
+		const configuredIdentity = classifyUserEmail(userEmail)
+		if (configuredIdentity.kind !== "valid" || eventIds.length === 0) {
+			return {}
+		}
+		const normalizedUserEmail = configuredIdentity.userEmail
+
+		let result: Record<string, unknown> = {}
+		await this.enqueue(async () => {
+			await this.ensureLoaded()
+			const state = this.state!
+			const pendingEventIds = new Set(state.pendingEventIds)
+			const bindings = (state.pendingEventUserEmails ??= {})
+			let changed = false
+			for (const eventId of new Set(eventIds.map((value) => value.trim()).filter(Boolean))) {
+				if (!pendingEventIds.has(eventId)) {
+					continue
+				}
+				if (state.pendingEventUserEmailsInvalid) {
+					result[eventId] = { invalidPersistedBindingState: true }
+					continue
+				}
+				const existing = classifyUserEmail(bindings[eventId])
+				if (existing.kind === "valid") {
+					result[eventId] = existing.userEmail
+					continue
+				}
+				if (existing.kind === "invalid") {
+					result[eventId] = bindings[eventId]
+					continue
+				}
+				bindings[eventId] = normalizedUserEmail
+				result[eventId] = normalizedUserEmail
+				changed = true
+			}
+			if (changed) {
+				await this.persistState()
+			}
+		})
+		return { ...result }
+	}
+
+	/** Persist the first fallback identity selected for an identity-less report. */
+	async bindQueuedCommitReportUserEmail(reportId: string, userEmail: string): Promise<unknown> {
+		const configuredIdentity = classifyUserEmail(userEmail)
+		if (!reportId.trim() || configuredIdentity.kind !== "valid") {
+			return undefined
+		}
+		const normalizedUserEmail = configuredIdentity.userEmail
+
+		let result: unknown
+		await this.enqueue(async () => {
+			await this.ensureLoaded()
+			const queued = this.queuedReports.find((item) => item.report.reportId === reportId)
+			if (!queued) {
+				return
+			}
+			const existing = classifyUserEmail(queued.boundUserEmail)
+			if (existing.kind === "valid") {
+				result = existing.userEmail
+				return
+			}
+			if (existing.kind === "invalid") {
+				result = queued.boundUserEmail
+				return
+			}
+			queued.boundUserEmail = normalizedUserEmail
+			result = normalizedUserEmail
+			await this.persistQueuedReports()
+		})
+		return result
 	}
 
 	async reconcileEventUploadBlocks(
@@ -795,7 +940,11 @@ export class AiCodeStatsStore {
 			const uploadedSet = new Set(eventIds)
 			this.state!.pendingEventIds = this.state!.pendingEventIds.filter((id) => !uploadedSet.has(id))
 			for (const eventId of uploadedSet) {
+				delete this.state!.pendingEventUserEmails?.[eventId]
 				delete this.state!.blockedEvents?.[eventId]
+			}
+			if (this.state!.pendingEventIds.length === 0) {
+				delete this.state!.pendingEventUserEmailsInvalid
 			}
 			await this.persistState()
 			await this.pruneDeliveredUploadSegmentsBestEffort(uploadedSet)
@@ -829,6 +978,14 @@ export class AiCodeStatsStore {
 				if (!pendingIds.has(eventId) || supersededIds.has(eventId)) {
 					delete state.blockedEvents?.[eventId]
 				}
+			}
+			for (const eventId of Object.keys(state.pendingEventUserEmails ?? {})) {
+				if (!pendingIds.has(eventId) || supersededIds.has(eventId)) {
+					delete state.pendingEventUserEmails?.[eventId]
+				}
+			}
+			if ([...pendingIds].every((eventId) => supersededIds.has(eventId))) {
+				delete state.pendingEventUserEmailsInvalid
 			}
 			this.pendingLines = this.pendingLines.filter((line) => line.timestamp >= cutoffTimestamp)
 			this.pendingCommitMetricBlocks = this.pendingCommitMetricBlocks.filter(
@@ -894,10 +1051,15 @@ export class AiCodeStatsStore {
 			if (parsed.version !== AI_CODE_STATS_VERSION) {
 				shouldArchiveIncompatibleStorage = true
 			} else {
+				const pendingEventUserEmailsInvalid =
+					parsed.pendingEventUserEmailsInvalid === true ||
+					this.isInvalidPendingEventUserEmailContainer(parsed.pendingEventUserEmails)
 				this.state = {
 					version: AI_CODE_STATS_VERSION,
 					pendingEventIds: this.normalizeEventIds(parsed.pendingEventIds),
 					supersededEventIds: this.normalizeEventIds(parsed.supersededEventIds),
+					pendingEventUserEmails: this.normalizePendingEventUserEmails(parsed.pendingEventUserEmails),
+					...(pendingEventUserEmailsInvalid ? { pendingEventUserEmailsInvalid: true } : {}),
 					blockedEvents: this.normalizeEventUploadBlocks(parsed.blockedEvents),
 					repoObservedCommits: this.normalizeRepoObservedCommits(parsed.repoObservedCommits),
 					lastUpload: parsed.lastUpload ?? { status: "idle" },
@@ -924,8 +1086,14 @@ export class AiCodeStatsStore {
 			this.generatedBlocks = []
 			this.queuedReports = []
 			this.queuedLifecycleReports = []
+			this.quarantinedPendingLines = []
+			this.quarantinedGeneratedBlocks = []
+			this.quarantinedQueuedReports = []
+			this.quarantinedQueuedLifecycleReports = []
 			this.commitUploadRecords = []
+			this.quarantinedCommitUploadRecords = []
 			this.pendingCommitMetricBlocks = []
+			this.quarantinedPendingCommitMetricBlocks = []
 			this.snapshots = {}
 			this.snapshotsChanged = false
 			await this.persistState()
@@ -964,10 +1132,21 @@ export class AiCodeStatsStore {
 			if (!Array.isArray(parsed)) {
 				throw new Error("Invalid AI code pending line store")
 			}
-			this.pendingLines = parsed.map((line) => this.normalizePendingLine(line as AiCodePendingLineAttribution))
+			this.pendingLines = []
+			this.quarantinedPendingLines = []
+			for (const [sourceIndex, rawLine] of parsed.entries()) {
+				try {
+					this.pendingLines.push(this.normalizePendingLine(rawLine as AiCodePendingLineAttribution))
+				} catch (error) {
+					this.quarantinedPendingLines.push(
+						this.buildQuarantinedOutboxRecord("pending_line", rawLine, sourceIndex, error),
+					)
+				}
+			}
 		} catch (error) {
 			await this.archiveCorruptFileIfPresent(this.pendingLinesPath, error)
 			this.pendingLines = []
+			this.quarantinedPendingLines = []
 			await this.persistPendingLines()
 		}
 
@@ -977,17 +1156,40 @@ export class AiCodeStatsStore {
 			if (!Array.isArray(parsed)) {
 				throw new Error("Invalid AI code generated block store")
 			}
-			this.generatedBlocks = parsed
-				.filter(
-					(block): block is AiCodeGeneratedBlockState =>
-						typeof block === "object" &&
-						block !== null &&
-						isCurrentSemanticsVersion((block as AiCodeGeneratedBlockState).semanticsVersion),
-				)
-				.map((block) => this.normalizeGeneratedBlockState(block))
+			this.generatedBlocks = []
+			this.quarantinedGeneratedBlocks = []
+			for (const [sourceIndex, rawBlock] of parsed.entries()) {
+				const disposition = this.classifyPersistedSemanticsRecord(rawBlock)
+				if (disposition.kind === "legacy") {
+					continue
+				}
+				if (disposition.kind === "poison") {
+					this.quarantinedGeneratedBlocks.push(
+						this.buildQuarantinedOutboxRecord(
+							"generated_block",
+							rawBlock,
+							sourceIndex,
+							new Error(disposition.reason),
+						),
+					)
+					continue
+				}
+				try {
+					this.generatedBlocks.push(
+						this.normalizeWithSnapshotRollback(() =>
+							this.normalizeGeneratedBlockState(rawBlock as AiCodeGeneratedBlockState),
+						),
+					)
+				} catch (error) {
+					this.quarantinedGeneratedBlocks.push(
+						this.buildQuarantinedOutboxRecord("generated_block", rawBlock, sourceIndex, error),
+					)
+				}
+			}
 		} catch (error) {
 			await this.archiveCorruptFileIfPresent(this.generatedBlocksPath, error)
 			this.generatedBlocks = []
+			this.quarantinedGeneratedBlocks = []
 			await this.persistGeneratedBlocks()
 		}
 
@@ -997,17 +1199,40 @@ export class AiCodeStatsStore {
 			if (!Array.isArray(parsed)) {
 				throw new Error("Invalid AI code commit report outbox")
 			}
-			this.queuedReports = parsed
-				.filter(
-					(report): report is AiCodeQueuedCommitReport =>
-						typeof report === "object" &&
-						report !== null &&
-						isCurrentSemanticsVersion((report as AiCodeQueuedCommitReport).report?.semanticsVersion),
-				)
-				.map((report) => this.normalizeQueuedReport(report))
+			this.queuedReports = []
+			this.quarantinedQueuedReports = []
+			for (const [sourceIndex, rawReport] of parsed.entries()) {
+				const disposition = this.classifyPersistedSemanticsOutboxRecord(rawReport)
+				if (disposition.kind === "legacy") {
+					continue
+				}
+				if (disposition.kind === "poison") {
+					this.quarantinedQueuedReports.push(
+						this.buildQuarantinedOutboxRecord(
+							"commit_report",
+							rawReport,
+							sourceIndex,
+							new Error(disposition.reason),
+						),
+					)
+					continue
+				}
+				try {
+					this.queuedReports.push(
+						this.normalizeWithSnapshotRollback(() =>
+							this.normalizeQueuedReport(rawReport as AiCodeQueuedCommitReport),
+						),
+					)
+				} catch (error) {
+					this.quarantinedQueuedReports.push(
+						this.buildQuarantinedOutboxRecord("commit_report", rawReport, sourceIndex, error),
+					)
+				}
+			}
 		} catch (error) {
 			await this.archiveCorruptFileIfPresent(this.queuedReportsPath, error)
 			this.queuedReports = []
+			this.quarantinedQueuedReports = []
 			await this.persistQueuedReports()
 		}
 
@@ -1017,19 +1242,38 @@ export class AiCodeStatsStore {
 			if (!Array.isArray(parsed)) {
 				throw new Error("Invalid AI code lifecycle report outbox")
 			}
-			this.queuedLifecycleReports = parsed
-				.filter(
-					(report): report is AiCodeQueuedCommitLifecycleReport =>
-						typeof report === "object" &&
-						report !== null &&
-						isCurrentSemanticsVersion(
-							(report as AiCodeQueuedCommitLifecycleReport).report?.semanticsVersion,
+			this.queuedLifecycleReports = []
+			this.quarantinedQueuedLifecycleReports = []
+			for (const [sourceIndex, rawReport] of parsed.entries()) {
+				const disposition = this.classifyPersistedSemanticsOutboxRecord(rawReport)
+				if (disposition.kind === "legacy") {
+					continue
+				}
+				if (disposition.kind === "poison") {
+					this.quarantinedQueuedLifecycleReports.push(
+						this.buildQuarantinedOutboxRecord(
+							"commit_lifecycle",
+							rawReport,
+							sourceIndex,
+							new Error(disposition.reason),
 						),
-				)
-				.map((report) => this.normalizeQueuedCommitLifecycleReport(report))
+					)
+					continue
+				}
+				try {
+					this.queuedLifecycleReports.push(
+						this.normalizeQueuedCommitLifecycleReport(rawReport as AiCodeQueuedCommitLifecycleReport),
+					)
+				} catch (error) {
+					this.quarantinedQueuedLifecycleReports.push(
+						this.buildQuarantinedOutboxRecord("commit_lifecycle", rawReport, sourceIndex, error),
+					)
+				}
+			}
 		} catch (error) {
 			await this.archiveCorruptFileIfPresent(this.queuedLifecycleReportsPath, error)
 			this.queuedLifecycleReports = []
+			this.quarantinedQueuedLifecycleReports = []
 			await this.persistQueuedLifecycleReports()
 		}
 
@@ -1039,12 +1283,23 @@ export class AiCodeStatsStore {
 			if (!Array.isArray(parsed)) {
 				throw new Error("Invalid AI code commit upload record store")
 			}
-			this.commitUploadRecords = parsed.map((record) =>
-				this.normalizeCommitUploadRecord(record as AiCodeCommitUploadRecord),
-			)
+			this.commitUploadRecords = []
+			this.quarantinedCommitUploadRecords = []
+			for (const [sourceIndex, rawRecord] of parsed.entries()) {
+				try {
+					this.commitUploadRecords.push(
+						this.normalizeCommitUploadRecord(rawRecord as AiCodeCommitUploadRecord),
+					)
+				} catch (error) {
+					this.quarantinedCommitUploadRecords.push(
+						this.buildQuarantinedOutboxRecord("commit_upload_record", rawRecord, sourceIndex, error),
+					)
+				}
+			}
 		} catch (error) {
 			await this.archiveCorruptFileIfPresent(this.commitUploadRecordsPath, error)
 			this.commitUploadRecords = []
+			this.quarantinedCommitUploadRecords = []
 			await this.persistCommitUploadRecords()
 		}
 
@@ -1054,17 +1309,40 @@ export class AiCodeStatsStore {
 			if (!Array.isArray(parsed)) {
 				throw new Error("Invalid AI code pending commit metric store")
 			}
-			this.pendingCommitMetricBlocks = parsed
-				.filter(
-					(block): block is AiCodePendingCommitMetricBlock =>
-						typeof block === "object" &&
-						block !== null &&
-						isCurrentSemanticsVersion((block as AiCodePendingCommitMetricBlock).semanticsVersion),
-				)
-				.map((block) => this.normalizePendingCommitMetricBlock(block))
+			this.pendingCommitMetricBlocks = []
+			this.quarantinedPendingCommitMetricBlocks = []
+			for (const [sourceIndex, rawBlock] of parsed.entries()) {
+				const disposition = this.classifyPersistedSemanticsRecord(rawBlock)
+				if (disposition.kind === "legacy") {
+					continue
+				}
+				if (disposition.kind === "poison") {
+					this.quarantinedPendingCommitMetricBlocks.push(
+						this.buildQuarantinedOutboxRecord(
+							"pending_commit_metric_block",
+							rawBlock,
+							sourceIndex,
+							new Error(disposition.reason),
+						),
+					)
+					continue
+				}
+				try {
+					this.pendingCommitMetricBlocks.push(
+						this.normalizeWithSnapshotRollback(() =>
+							this.normalizePendingCommitMetricBlock(rawBlock as AiCodePendingCommitMetricBlock),
+						),
+					)
+				} catch (error) {
+					this.quarantinedPendingCommitMetricBlocks.push(
+						this.buildQuarantinedOutboxRecord("pending_commit_metric_block", rawBlock, sourceIndex, error),
+					)
+				}
+			}
 		} catch (error) {
 			await this.archiveCorruptFileIfPresent(this.pendingCommitMetricBlocksPath, error)
 			this.pendingCommitMetricBlocks = []
+			this.quarantinedPendingCommitMetricBlocks = []
 			await this.persistPendingCommitMetricBlocks()
 		}
 
@@ -1150,9 +1428,23 @@ export class AiCodeStatsStore {
 			"queuedLifecycleReports",
 			"commitUploadRecords",
 		]
+		const pendingEventIds = new Set(this.state?.pendingEventIds ?? [])
+		const supersededEventIds = new Set(this.state?.supersededEventIds ?? [])
+		const retainedUploadEvents = this.retainedTransactionUploadEvents.filter(
+			(event) => pendingEventIds.has(event.eventId) && !supersededEventIds.has(event.eventId),
+		)
+		const transactionUploadEventsById = new Map<string, AiCodeStatsEvent>()
+		for (const event of [...retainedUploadEvents, ...uploadEvents]) {
+			if (!transactionUploadEventsById.has(event.eventId)) {
+				transactionUploadEventsById.set(event.eventId, event)
+			}
+		}
+		const transactionUploadEvents = [...transactionUploadEventsById.values()]
 		const transaction: AiCodeStatsStoreTransaction = {
 			version: STORE_TRANSACTION_VERSION,
-			uploadEvents,
+			transactionId: randomUUID(),
+			status: "prepared",
+			uploadEvents: transactionUploadEvents,
 			writes: orderedKeys
 				.filter((key) => values.has(key))
 				.map((key) => ({
@@ -1162,8 +1454,14 @@ export class AiCodeStatsStore {
 		}
 
 		await safeWriteJson(this.transactionPath, transaction)
-		await this.applyTransaction(transaction)
-		await this.removeTransactionFile()
+		const appendedWithDurableDirectory = await this.applyTransaction(transaction, retainedUploadEvents.length > 0)
+		const uploadQueueDirectoryDurable =
+			retainedUploadEvents.length === 0 || transactionUploadEvents.length === 0
+				? appendedWithDurableDirectory
+				: appendedWithDurableDirectory && (await this.uploadEventQueue.confirmDirectoryDurability())
+		this.retainedTransactionUploadEvents = uploadQueueDirectoryDurable ? [] : transactionUploadEvents
+		await this.markTransactionCommitted(transaction, this.retainedTransactionUploadEvents)
+		await this.removeCommittedTransactionFile()
 	}
 
 	private buildPersistedValue(key: Exclude<AiCodeStatsStoreFileKey, "snapshots">): unknown {
@@ -1171,17 +1469,29 @@ export class AiCodeStatsStore {
 			case "state":
 				return this.state
 			case "pendingLines":
-				return this.pendingLines
+				return [...this.pendingLines, ...this.quarantinedPendingLines.map((record) => record.raw)]
 			case "generatedBlocks":
-				return this.generatedBlocks.map((block) => this.compactGeneratedBlockForStorage(block))
+				return [
+					...this.generatedBlocks.map((block) => this.compactGeneratedBlockForStorage(block)),
+					...this.quarantinedGeneratedBlocks.map((record) => record.raw),
+				]
 			case "queuedReports":
-				return this.queuedReports.map((report) => this.compactQueuedReportForStorage(report))
+				return [
+					...this.queuedReports.map((report) => this.compactQueuedReportForStorage(report)),
+					...this.quarantinedQueuedReports.map((record) => record.raw),
+				]
 			case "queuedLifecycleReports":
-				return this.queuedLifecycleReports
+				return [
+					...this.queuedLifecycleReports,
+					...this.quarantinedQueuedLifecycleReports.map((record) => record.raw),
+				]
 			case "commitUploadRecords":
-				return this.commitUploadRecords
+				return [...this.commitUploadRecords, ...this.quarantinedCommitUploadRecords.map((record) => record.raw)]
 			case "pendingCommitMetricBlocks":
-				return this.pendingCommitMetricBlocks.map((block) => this.compactGeneratedBlockForStorage(block))
+				return [
+					...this.pendingCommitMetricBlocks.map((block) => this.compactGeneratedBlockForStorage(block)),
+					...this.quarantinedPendingCommitMetricBlocks.map((record) => record.raw),
+				]
 		}
 	}
 
@@ -1207,7 +1517,10 @@ export class AiCodeStatsStore {
 			if (
 				parsed.version !== STORE_TRANSACTION_VERSION ||
 				!Array.isArray(parsed.writes) ||
-				(parsed.uploadEvents !== undefined && !Array.isArray(parsed.uploadEvents))
+				(parsed.uploadEvents !== undefined && !Array.isArray(parsed.uploadEvents)) ||
+				(parsed.transactionId !== undefined &&
+					(typeof parsed.transactionId !== "string" || !parsed.transactionId.trim())) ||
+				(parsed.status !== undefined && parsed.status !== "prepared" && parsed.status !== "committed")
 			) {
 				throw new Error("Invalid AI code stats pending transaction")
 			}
@@ -1222,6 +1535,8 @@ export class AiCodeStatsStore {
 			})
 			transaction = {
 				version: STORE_TRANSACTION_VERSION,
+				transactionId: parsed.transactionId ?? randomUUID(),
+				status: parsed.status ?? "prepared",
 				uploadEvents: parsed.uploadEvents as AiCodeStatsEvent[] | undefined,
 				writes,
 			}
@@ -1232,19 +1547,35 @@ export class AiCodeStatsStore {
 			await this.archiveFile(this.transactionPath, "invalid")
 			return
 		}
-		await this.applyTransaction(transaction, true)
-		await this.removeTransactionFile()
+		if (transaction.status === "committed") {
+			if (transaction.uploadEvents && transaction.uploadEvents.length > 0) {
+				await this.uploadEventQueue.appendUnique(transaction.uploadEvents)
+				const uploadQueueDirectoryDurable = await this.uploadEventQueue.confirmDirectoryDurability()
+				this.retainedTransactionUploadEvents = uploadQueueDirectoryDurable ? [] : transaction.uploadEvents
+				await this.markTransactionCommitted(transaction, this.retainedTransactionUploadEvents)
+			}
+			await this.removeCommittedTransactionFile()
+			return
+		}
+		const appendedWithDurableDirectory = await this.applyTransaction(transaction, true)
+		const uploadQueueDirectoryDurable =
+			!transaction.uploadEvents?.length ||
+			(appendedWithDurableDirectory && (await this.uploadEventQueue.confirmDirectoryDurability()))
+		this.retainedTransactionUploadEvents = uploadQueueDirectoryDurable ? [] : (transaction.uploadEvents ?? [])
+		await this.markTransactionCommitted(transaction, this.retainedTransactionUploadEvents)
+		await this.removeCommittedTransactionFile()
 	}
 
 	private async applyTransaction(
 		transaction: AiCodeStatsStoreTransaction,
 		deduplicatePersistedEvents = false,
-	): Promise<void> {
+	): Promise<boolean> {
+		let uploadQueueDirectoryDurable = true
 		if (transaction.uploadEvents && transaction.uploadEvents.length > 0) {
 			if (deduplicatePersistedEvents) {
-				await this.uploadEventQueue.appendUnique(transaction.uploadEvents)
+				uploadQueueDirectoryDurable = await this.uploadEventQueue.appendUnique(transaction.uploadEvents)
 			} else {
-				await this.uploadEventQueue.append(transaction.uploadEvents)
+				uploadQueueDirectoryDurable = await this.uploadEventQueue.append(transaction.uploadEvents)
 			}
 		}
 		for (const write of transaction.writes) {
@@ -1253,11 +1584,38 @@ export class AiCodeStatsStore {
 				this.snapshotsChanged = false
 			}
 		}
+		return uploadQueueDirectoryDurable
 	}
 
-	private async removeTransactionFile(): Promise<void> {
+	private async markTransactionCommitted(
+		transaction: AiCodeStatsStoreTransaction,
+		retainedUploadEvents: AiCodeStatsEvent[] = [],
+	): Promise<void> {
+		await safeWriteJson(this.transactionPath, {
+			version: STORE_TRANSACTION_VERSION,
+			transactionId: transaction.transactionId,
+			status: "committed",
+			uploadEvents: retainedUploadEvents,
+			writes: [],
+		} satisfies AiCodeStatsStoreTransaction)
+	}
+
+	private async removeCommittedTransactionFile(): Promise<void> {
+		// Directory fsync is unavailable on Windows. Keep the fsynced committed
+		// tombstone there: startup can identify it as completed and must never
+		// replay stale state writes, while the next transaction may overwrite it.
+		if (!(await this.syncStoreDirectory(this.baseDir))) {
+			if (!this.warnedAboutTransactionDirectoryDurability) {
+				this.warnedAboutTransactionDirectoryDurability = true
+				console.warn(
+					"[AiCodeStats] Directory fsync is unavailable; retaining a committed store transaction tombstone",
+				)
+			}
+			return
+		}
 		try {
 			await fs.unlink(this.transactionPath)
+			await this.syncStoreDirectory(this.baseDir)
 		} catch (error) {
 			if (
 				typeof error === "object" &&
@@ -1299,6 +1657,138 @@ export class AiCodeStatsStore {
 			return
 		}
 		await this.archiveFile(filePath, "corrupt")
+	}
+
+	private classifyPersistedSemanticsOutboxRecord(value: unknown): PersistedRecordDisposition {
+		if (!value || typeof value !== "object" || Array.isArray(value)) {
+			return { kind: "poison", reason: "persisted outbox entry must be an object" }
+		}
+		const report = (value as Record<string, unknown>).report
+		if (!report || typeof report !== "object" || Array.isArray(report)) {
+			return { kind: "poison", reason: "persisted outbox entry has a missing or invalid report envelope" }
+		}
+		return this.classifyPersistedSemanticsVersion(
+			(report as Record<string, unknown>).semanticsVersion,
+			"persisted outbox report",
+		)
+	}
+
+	private classifyPersistedSemanticsRecord(value: unknown): PersistedRecordDisposition {
+		if (!value || typeof value !== "object" || Array.isArray(value)) {
+			return { kind: "poison", reason: "persisted record must be an object" }
+		}
+		return this.classifyPersistedSemanticsVersion(
+			(value as Record<string, unknown>).semanticsVersion,
+			"persisted record",
+		)
+	}
+
+	private classifyPersistedSemanticsVersion(value: unknown, subject: string): PersistedRecordDisposition {
+		if (value === CURRENT_AI_CODE_STATS_SEMANTICS_VERSION) {
+			return { kind: "current" }
+		}
+		if (
+			typeof value === "number" &&
+			Number.isSafeInteger(value) &&
+			value >= 1 &&
+			value < CURRENT_AI_CODE_STATS_SEMANTICS_VERSION
+		) {
+			return { kind: "legacy" }
+		}
+		return {
+			kind: "poison",
+			reason: `${subject} semanticsVersion is missing, malformed, or not a recognized older version`,
+		}
+	}
+
+	private normalizeWithSnapshotRollback<T>(normalize: () => T): T {
+		if (this.snapshotNormalizationJournal) {
+			throw new Error("Nested snapshot normalization transaction is not supported")
+		}
+		const snapshotsChangedBefore = this.snapshotsChanged
+		const journal = new Map<string, AiCodeSnapshotStoreEntry | undefined>()
+		this.snapshotNormalizationJournal = journal
+		try {
+			const result = normalize()
+			this.snapshotNormalizationJournal = null
+			return result
+		} catch (error) {
+			for (const [contentHash, previous] of journal) {
+				if (previous) {
+					this.snapshots[contentHash] = previous
+				} else {
+					delete this.snapshots[contentHash]
+				}
+			}
+			this.snapshotNormalizationJournal = null
+			this.snapshotsChanged = snapshotsChangedBefore
+			throw error
+		}
+	}
+
+	private rememberSnapshotBeforeNormalizationMutation(contentHash: string): void {
+		if (!this.snapshotNormalizationJournal || this.snapshotNormalizationJournal.has(contentHash)) {
+			return
+		}
+		const existing = this.snapshots[contentHash]
+		this.snapshotNormalizationJournal.set(contentHash, existing ? { ...existing } : undefined)
+	}
+
+	private buildQuarantinedOutboxRecord(
+		kind: AiCodeQuarantinedOutboxKind,
+		raw: unknown,
+		sourceIndex: number,
+		error: unknown,
+	): AiCodeQuarantinedOutboxRecord {
+		const envelope = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {}
+		const nestedReport =
+			envelope?.report && typeof envelope.report === "object" && !Array.isArray(envelope.report)
+				? (envelope.report as Record<string, unknown>)
+				: undefined
+		const report = nestedReport ?? envelope
+		const stringField = (field: string): string | undefined => {
+			const value = report[field]
+			return typeof value === "string" && value.trim() ? value.trim() : undefined
+		}
+		const rawReason = error instanceof Error ? error.message : String(error)
+		return {
+			kind,
+			raw,
+			sourceIndex,
+			reason: (rawReason.trim() || "invalid current-semantics outbox record").slice(0, 500),
+			reportId: stringField("reportId"),
+			eventId: stringField("eventId") ?? stringField("generatedEventId") ?? stringField("stateId"),
+			commitHash: stringField("commitHash"),
+			repoRoot: stringField("repoRoot"),
+		}
+	}
+
+	private getQuarantinedOutboxRecords(): AiCodeQuarantinedOutboxRecord[] {
+		return [
+			...this.quarantinedPendingLines,
+			...this.quarantinedGeneratedBlocks,
+			...this.quarantinedQueuedReports,
+			...this.quarantinedQueuedLifecycleReports,
+			...this.quarantinedCommitUploadRecords,
+			...this.quarantinedPendingCommitMetricBlocks,
+		]
+	}
+
+	private getQuarantinedOutboxRecordSummaries(): AiCodeQuarantinedOutboxRecordSummary[] {
+		return this.getQuarantinedOutboxRecords().map(({ raw: _raw, ...summary }) => ({ ...summary }))
+	}
+
+	private getQuarantinedPendingFactRecords(): AiCodeQuarantinedPendingFactRecord[] {
+		return this.getQuarantinedOutboxRecords().filter((record): record is AiCodeQuarantinedPendingFactRecord => {
+			if (record.kind === "commit_upload_record") {
+				return false
+			}
+			if (record.kind !== "generated_block") {
+				return true
+			}
+			const uploadStatus = this.readRawStringField(record.raw, "uploadStatus")
+			return uploadStatus !== "uploaded"
+		})
 	}
 
 	private isStoreFileKey(value: unknown): value is AiCodeStatsStoreFileKey {
@@ -1343,39 +1833,48 @@ export class AiCodeStatsStore {
 	}
 
 	private async persistPendingLines(): Promise<void> {
-		await safeWriteJson(this.pendingLinesPath, this.pendingLines)
+		await safeWriteJson(this.pendingLinesPath, [
+			...this.pendingLines,
+			...this.quarantinedPendingLines.map((record) => record.raw),
+		])
 	}
 
 	private async persistGeneratedBlocks(): Promise<void> {
 		await this.persistSnapshotsIfChanged()
-		await safeWriteJson(
-			this.generatedBlocksPath,
-			this.generatedBlocks.map((block) => this.compactGeneratedBlockForStorage(block)),
-		)
+		await safeWriteJson(this.generatedBlocksPath, [
+			...this.generatedBlocks.map((block) => this.compactGeneratedBlockForStorage(block)),
+			...this.quarantinedGeneratedBlocks.map((record) => record.raw),
+		])
 	}
 
 	private async persistPendingCommitMetricBlocks(): Promise<void> {
 		await this.persistSnapshotsIfChanged()
-		await safeWriteJson(
-			this.pendingCommitMetricBlocksPath,
-			this.pendingCommitMetricBlocks.map((block) => this.compactGeneratedBlockForStorage(block)),
-		)
+		await safeWriteJson(this.pendingCommitMetricBlocksPath, [
+			...this.pendingCommitMetricBlocks.map((block) => this.compactGeneratedBlockForStorage(block)),
+			...this.quarantinedPendingCommitMetricBlocks.map((record) => record.raw),
+		])
 	}
 
 	private async persistQueuedReports(): Promise<void> {
 		await this.persistSnapshotsIfChanged()
-		await safeWriteJson(
-			this.queuedReportsPath,
-			this.queuedReports.map((report) => this.compactQueuedReportForStorage(report)),
-		)
+		await safeWriteJson(this.queuedReportsPath, [
+			...this.queuedReports.map((report) => this.compactQueuedReportForStorage(report)),
+			...this.quarantinedQueuedReports.map((record) => record.raw),
+		])
 	}
 
 	private async persistQueuedLifecycleReports(): Promise<void> {
-		await safeWriteJson(this.queuedLifecycleReportsPath, this.queuedLifecycleReports)
+		await safeWriteJson(this.queuedLifecycleReportsPath, [
+			...this.queuedLifecycleReports,
+			...this.quarantinedQueuedLifecycleReports.map((record) => record.raw),
+		])
 	}
 
 	private async persistCommitUploadRecords(): Promise<void> {
-		await safeWriteJson(this.commitUploadRecordsPath, this.commitUploadRecords)
+		await safeWriteJson(this.commitUploadRecordsPath, [
+			...this.commitUploadRecords,
+			...this.quarantinedCommitUploadRecords.map((record) => record.raw),
+		])
 	}
 
 	private async persistSnapshotsIfChanged(): Promise<void> {
@@ -1443,11 +1942,13 @@ export class AiCodeStatsStore {
 		const now = Date.now()
 		if (existing) {
 			if (existing.lastUsedAt !== now) {
+				this.rememberSnapshotBeforeNormalizationMutation(contentHash)
 				existing.lastUsedAt = now
 				this.snapshotsChanged = true
 			}
 			return contentHash
 		}
+		this.rememberSnapshotBeforeNormalizationMutation(contentHash)
 		this.snapshots[contentHash] = {
 			contentHash,
 			content: normalizedContent,
@@ -1468,6 +1969,7 @@ export class AiCodeStatsStore {
 		if (!entry) {
 			return undefined
 		}
+		this.rememberSnapshotBeforeNormalizationMutation(contentHash)
 		entry.lastUsedAt = Date.now()
 		this.snapshotsChanged = true
 		return entry.content
@@ -1648,6 +2150,31 @@ export class AiCodeStatsStore {
 		]
 	}
 
+	private normalizePendingEventUserEmails(value: unknown): Record<string, unknown> {
+		if (!value || typeof value !== "object" || Array.isArray(value)) {
+			return {}
+		}
+		const normalized: Record<string, unknown> = {}
+		for (const [eventId, rawUserEmail] of Object.entries(value)) {
+			if (!eventId.trim()) {
+				continue
+			}
+			const identity = classifyUserEmail(rawUserEmail)
+			if (identity.kind === "valid") {
+				normalized[eventId] = identity.userEmail
+			} else if (identity.kind === "invalid") {
+				// Keep malformed persisted identity explicit. Dropping it would make a
+				// later profile look like a safe first-time binding candidate.
+				normalized[eventId] = typeof rawUserEmail === "string" ? normalizeUserEmail(rawUserEmail) : rawUserEmail
+			}
+		}
+		return normalized
+	}
+
+	private isInvalidPendingEventUserEmailContainer(value: unknown): boolean {
+		return value !== undefined && value !== null && (typeof value !== "object" || Array.isArray(value))
+	}
+
 	private normalizeEventUploadBlocks(value: unknown): Record<string, Omit<AiCodeStatsEventUploadBlock, "eventId">> {
 		if (!value || typeof value !== "object" || Array.isArray(value)) {
 			return {}
@@ -1814,6 +2341,7 @@ export class AiCodeStatsStore {
 		return {
 			createdAt: typeof report.createdAt === "number" ? report.createdAt : Date.now(),
 			generatedBlockIds: Array.isArray(report.generatedBlockIds) ? [...new Set(report.generatedBlockIds)] : [],
+			boundUserEmail: this.normalizePersistedUserEmail(report.boundUserEmail),
 			report: {
 				version: "v2",
 				source: "kilocode-ai-code-stats",
@@ -1980,6 +2508,17 @@ export class AiCodeStatsStore {
 		}
 	}
 
+	private normalizePersistedUserEmail(value: unknown): unknown {
+		const identity = classifyUserEmail(value)
+		if (identity.kind === "valid") {
+			return identity.userEmail
+		}
+		if (identity.kind === "missing") {
+			return undefined
+		}
+		return typeof value === "string" ? normalizeUserEmail(value) : value
+	}
+
 	private normalizeQueuedCommitLifecycleReport(
 		report: AiCodeQueuedCommitLifecycleReport,
 	): AiCodeQueuedCommitLifecycleReport {
@@ -2037,6 +2576,12 @@ export class AiCodeStatsStore {
 
 	private pruneRepoObservedCommits(state: AiCodeStatsPersistedState): boolean {
 		const pendingRepoRoots = new Set(this.pendingLines.map((line) => line.repoRoot))
+		for (const quarantined of this.quarantinedPendingLines) {
+			const repoRoot = this.readRawStringField(quarantined.raw, "repoRoot")
+			if (repoRoot) {
+				pendingRepoRoots.add(normalizePath(repoRoot))
+			}
+		}
 		let changed = false
 		for (const repoRoot of Object.keys(state.repoObservedCommits)) {
 			if (pendingRepoRoots.has(this.repoRootFromObservedCommitKey(repoRoot))) {
@@ -2060,6 +2605,14 @@ export class AiCodeStatsStore {
 
 	private pruneInactiveUploadedBlocks(): void {
 		const activeGeneratedIds = new Set(this.pendingLines.map((line) => line.generatedEventId))
+		for (const quarantined of this.quarantinedPendingLines) {
+			for (const field of ["generatedEventId", "generatedBlockId", "blockId"] as const) {
+				const generatedId = this.readRawStringField(quarantined.raw, field)
+				if (generatedId) {
+					activeGeneratedIds.add(generatedId)
+				}
+			}
+		}
 		this.generatedBlocks = this.generatedBlocks.filter((block) => {
 			if (block.uploadStatus !== "uploaded") {
 				return true
@@ -2068,11 +2621,53 @@ export class AiCodeStatsStore {
 		})
 	}
 
+	private readRawStringField(value: unknown, field: string): string | undefined {
+		if (!value || typeof value !== "object" || Array.isArray(value)) {
+			return undefined
+		}
+		const rawValue = (value as Record<string, unknown>)[field]
+		return typeof rawValue === "string" && rawValue.trim() ? rawValue.trim() : undefined
+	}
+
 	private pruneUnreferencedSnapshots(): void {
 		const referencedHashes = new Set<string>()
+		const snapshotHashFields = new Set([
+			"fileSnapshotHash",
+			"originFileSnapshotHash",
+			"currentFileSnapshotHash",
+			"committedSnapshotHash",
+		])
 		const rememberHash = (hash?: string): void => {
 			if (typeof hash === "string" && hash.trim()) {
 				referencedHashes.add(hash.trim())
+			}
+		}
+		let rawSnapshotReferenceScanComplete = true
+		const rememberRawSnapshotHashes = (value: unknown): void => {
+			const pending: unknown[] = [value]
+			let visitedValues = 0
+			while (pending.length > 0) {
+				const current = pending.pop()
+				visitedValues += 1
+				if (visitedValues > 100_000) {
+					rawSnapshotReferenceScanComplete = false
+					return
+				}
+				if (Array.isArray(current)) {
+					for (const item of current) {
+						pending.push(item)
+					}
+					continue
+				}
+				if (!current || typeof current !== "object") {
+					continue
+				}
+				for (const [field, nestedValue] of Object.entries(current as Record<string, unknown>)) {
+					if (snapshotHashFields.has(field) && typeof nestedValue === "string") {
+						rememberHash(nestedValue)
+					}
+					pending.push(nestedValue)
+				}
 			}
 		}
 		const rememberBlockHashes = (block: AiCodeGeneratedBlockState | AiCodePendingCommitMetricBlock): void => {
@@ -2097,6 +2692,19 @@ export class AiCodeStatsStore {
 			for (const file of queuedReport.report.changedFiles ?? []) {
 				rememberHash(file.committedSnapshotHash)
 			}
+		}
+		for (const quarantined of [
+			...this.quarantinedPendingLines,
+			...this.quarantinedGeneratedBlocks,
+			...this.quarantinedQueuedReports,
+			...this.quarantinedQueuedLifecycleReports,
+			...this.quarantinedCommitUploadRecords,
+			...this.quarantinedPendingCommitMetricBlocks,
+		]) {
+			rememberRawSnapshotHashes(quarantined.raw)
+		}
+		if (!rawSnapshotReferenceScanComplete) {
+			return
 		}
 
 		let changed = false
@@ -2244,10 +2852,18 @@ export class AiCodeStatsStore {
 		this.generatedBlocks = []
 		this.queuedReports = []
 		this.queuedLifecycleReports = []
+		this.quarantinedPendingLines = []
+		this.quarantinedGeneratedBlocks = []
+		this.quarantinedQueuedReports = []
+		this.quarantinedQueuedLifecycleReports = []
 		this.commitUploadRecords = []
+		this.quarantinedCommitUploadRecords = []
 		this.pendingCommitMetricBlocks = []
+		this.quarantinedPendingCommitMetricBlocks = []
 		this.snapshots = {}
 		this.snapshotsChanged = false
+		this.snapshotNormalizationJournal = null
+		this.retainedTransactionUploadEvents = []
 		this.loadedRevision = undefined
 	}
 
@@ -2260,10 +2876,17 @@ export class AiCodeStatsStore {
 			this.generatedBlocks = []
 			this.queuedReports = []
 			this.queuedLifecycleReports = []
+			this.quarantinedPendingLines = []
+			this.quarantinedGeneratedBlocks = []
+			this.quarantinedQueuedReports = []
+			this.quarantinedQueuedLifecycleReports = []
 			this.commitUploadRecords = []
+			this.quarantinedCommitUploadRecords = []
 			this.pendingCommitMetricBlocks = []
+			this.quarantinedPendingCommitMetricBlocks = []
 			this.snapshots = {}
 			this.snapshotsChanged = false
+			this.snapshotNormalizationJournal = null
 			await fs.rm(this.baseDir, { recursive: true, force: true })
 			await fs.mkdir(this.baseDir, { recursive: true })
 			await this.uploadEventQueue.ensureReady()

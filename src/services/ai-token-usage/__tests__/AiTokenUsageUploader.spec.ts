@@ -29,6 +29,8 @@ const buildUsageRecord = (overrides: Partial<AiTokenUsageRecordInput> = {}): AiT
 	inputTokens: overrides.inputTokens ?? 120,
 	outputTokens: overrides.outputTokens ?? 80,
 	cacheReadTokens: overrides.cacheReadTokens ?? 10,
+	cacheReadObservedRequestCount: overrides.cacheReadObservedRequestCount ?? 1,
+	cacheReadObservedInputTokens: overrides.cacheReadObservedInputTokens ?? overrides.inputTokens ?? 120,
 	cacheWriteTokens: overrides.cacheWriteTokens ?? 5,
 	totalTokens: overrides.totalTokens ?? 200,
 	departmentName: overrides.departmentName,
@@ -138,6 +140,8 @@ describe("AiTokenUsageUploader", () => {
 			provider: "openai",
 			model: "gpt-5.4",
 			totalTokens: 200,
+			cacheReadObservedRequestCount: 0,
+			cacheReadObservedInputTokens: 0,
 		})
 		expect(payload.rows[0]).not.toHaveProperty("gitBranch")
 
@@ -282,7 +286,7 @@ describe("AiTokenUsageUploader", () => {
 		},
 	)
 
-	it("isolates a single row larger than the envelope budget without blocking later rows", async () => {
+	it("blocks a single row over the current envelope budget and retries it after the budget is corrected", async () => {
 		const occurredAt = Date.now()
 		await store.recordUsage(
 			buildUsageRecord({
@@ -308,17 +312,30 @@ describe("AiTokenUsageUploader", () => {
 					maxPayloadBytes: 1600,
 				},
 			),
-		).toEqual({ uploaded: 1, blocked: 0, invalid: 1 })
+		).toEqual({ uploaded: 1, blocked: 1, invalid: 0 })
 		const serializedBody = fetchMock.mock.calls[0][1]?.body as string
 		expect(Buffer.byteLength(serializedBody, "utf8")).toBeLessThanOrEqual(1600)
 		expect(JSON.parse(serializedBody).rows[0].projectKey).toBe("z-valid-after-oversized-envelope")
 		expect(await store.getPendingUploadRows()).toEqual([
 			expect.objectContaining({
 				projectKey: "a-oversized-envelope",
-				uploadIssueKind: "invalid",
-				uploadIssueCode: "row_exceeds_envelope_budget",
+				uploadIssueKind: "blocked",
+				uploadIssueCode: "row_exceeds_current_envelope_budget",
 			}),
 		])
+
+		expect(
+			await uploader.upload(
+				{ webhookUrl: "https://example.com/webhook" },
+				{
+					client: { ide: "vscode", machineId: "machine-1" },
+					maxPayloadBytes: 8_000,
+				},
+			),
+		).toEqual({ uploaded: 1, blocked: 0, invalid: 0 })
+		expect(fetchMock).toHaveBeenCalledTimes(2)
+		expect(JSON.parse(fetchMock.mock.calls[1][1]?.body as string).rows[0].projectKey).toBe("a-oversized-envelope")
+		expect(await store.getPendingUploadRows()).toHaveLength(0)
 	})
 
 	it("persists a negative legacy counter as permanently invalid instead of letting the backend clamp it", async () => {
@@ -414,6 +431,203 @@ describe("AiTokenUsageUploader", () => {
 		expect(JSON.parse(fetchMock.mock.calls[0][1]?.body as string).rows[0]).toMatchObject({
 			userEmail: "user-a@example.com",
 			userKey: "email:user-a@example.com",
+		})
+	})
+
+	it("does not assign a non-empty invalid persisted email to the currently configured user B", async () => {
+		await store.recordUsage(
+			buildUsageRecord({
+				userEmail: undefined,
+				userKey: "anonymous-install:stable-install",
+				identityKind: "anonymous",
+			}),
+		)
+		const statePath = path.join(tmpDir, "ai-token-usage", "v1", "state.json")
+		const persisted = JSON.parse(await fs.readFile(statePath, "utf8")) as {
+			rows: Record<string, AiTokenUsageAggregateRow>
+		}
+		Object.values(persisted.rows)[0].userEmail = "legacy-user-a-invalid-email"
+		await fs.writeFile(statePath, JSON.stringify(persisted), "utf8")
+		store = new AiTokenUsageStore(tmpDir)
+		uploader = new AiTokenUsageUploader(store)
+		const fetchMock = vi.fn(acceptedResponseForRequest)
+		vi.stubGlobal("fetch", fetchMock)
+
+		expect(
+			await uploader.upload(
+				{ webhookUrl: "https://example.com/webhook", userEmail: "user-b@example.com" },
+				{ client: { ide: "vscode", machineId: "machine-1" } },
+			),
+		).toEqual({ uploaded: 0, blocked: 0, invalid: 1 })
+		expect(fetchMock).not.toHaveBeenCalled()
+		expect(await store.getPendingUploadRows()).toEqual([
+			expect.objectContaining({
+				userEmail: "legacy-user-a-invalid-email",
+				userKey: "anonymous-install:stable-install",
+				uploadIssueKind: "invalid",
+				uploadIssueCode: "invalid_persisted_user_email",
+			}),
+		])
+	})
+
+	it("quarantines a numeric persisted email while uploading a later valid token row", async () => {
+		const occurredAt = Date.now()
+		await store.recordUsage(buildUsageRecord({ occurredAt, projectKey: "a-number-email" }))
+		await store.recordUsage(buildUsageRecord({ occurredAt, projectKey: "z-valid-after-number-email" }))
+		const statePath = path.join(tmpDir, "ai-token-usage", "v1", "state.json")
+		const persisted = JSON.parse(await fs.readFile(statePath, "utf8")) as {
+			rows: Record<string, AiTokenUsageAggregateRow>
+		}
+		const poisonedRow = Object.values(persisted.rows).find((row) => row.projectKey === "a-number-email")
+		expect(poisonedRow).toBeDefined()
+		poisonedRow!.userEmail = 42 as unknown as string
+		await fs.writeFile(statePath, JSON.stringify(persisted), "utf8")
+		store = new AiTokenUsageStore(tmpDir)
+		uploader = new AiTokenUsageUploader(store)
+		const fetchMock = vi.fn(acceptedResponseForRequest)
+		vi.stubGlobal("fetch", fetchMock)
+
+		expect(
+			await uploader.upload(
+				{ webhookUrl: "https://example.com/webhook", userEmail: "user-b@example.com" },
+				{ client: { ide: "vscode", machineId: "machine-1" } },
+			),
+		).toEqual({ uploaded: 1, blocked: 0, invalid: 1 })
+		expect(fetchMock).toHaveBeenCalledTimes(1)
+		expect(JSON.parse(fetchMock.mock.calls[0][1]?.body as string).rows).toEqual([
+			expect.objectContaining({ projectKey: "z-valid-after-number-email" }),
+		])
+		expect(await store.getPendingUploadRows()).toHaveLength(0)
+		expect(await store.getQuarantinedRows()).toEqual([
+			expect.objectContaining({
+				issueCode: "invalid_persisted_row_structure",
+				raw: expect.objectContaining({ projectKey: "a-number-email", userEmail: 42 }),
+			}),
+		])
+
+		expect(
+			await uploader.upload(
+				{ webhookUrl: "https://example.com/webhook", userEmail: "user-b@example.com" },
+				{ client: { ide: "vscode", machineId: "machine-1" } },
+			),
+		).toEqual({ uploaded: 0, blocked: 0, invalid: 1 })
+		expect(fetchMock).toHaveBeenCalledTimes(1)
+		expect(await uploader.upload({}, { client: { ide: "vscode", machineId: "machine-1" } })).toEqual({
+			uploaded: 0,
+			blocked: 0,
+			invalid: 1,
+		})
+	})
+
+	it("canonicalizes a persisted A row userKey from its validated email before upload", async () => {
+		await store.recordUsage(
+			buildUsageRecord({
+				userEmail: "user-a@example.com",
+				userKey: "email:user-a@example.com",
+				projectKey: "project-key-mismatch",
+			}),
+		)
+		const statePath = path.join(tmpDir, "ai-token-usage", "v1", "state.json")
+		const persisted = JSON.parse(await fs.readFile(statePath, "utf8")) as {
+			rows: Record<string, AiTokenUsageAggregateRow>
+		}
+		Object.values(persisted.rows)[0].userKey = "email:user-b@example.com"
+		await fs.writeFile(statePath, JSON.stringify(persisted), "utf8")
+		store = new AiTokenUsageStore(tmpDir)
+		uploader = new AiTokenUsageUploader(store)
+		const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+			const body = JSON.parse(String(init?.body))
+			expect(body.rows).toEqual([
+				expect.objectContaining({
+					userEmail: "user-a@example.com",
+					userKey: "email:user-a@example.com",
+				}),
+			])
+			return acceptedResponseForRequest(_url, init)
+		})
+		vi.stubGlobal("fetch", fetchMock)
+
+		expect(
+			await uploader.upload(
+				{ webhookUrl: "https://example.com/webhook", userEmail: "user-b@example.com" },
+				{ client: { ide: "vscode", machineId: "machine-1" } },
+			),
+		).toEqual({ uploaded: 1, blocked: 0, invalid: 0 })
+		expect(fetchMock).toHaveBeenCalledTimes(1)
+		const afterUpload = JSON.parse(await fs.readFile(statePath, "utf8")) as {
+			rows: Record<string, AiTokenUsageAggregateRow>
+		}
+		expect(Object.values(afterUpload.rows)).toEqual([
+			expect.objectContaining({ userEmail: "user-a@example.com", dirty: false }),
+		])
+	})
+
+	it("quarantines an object Token dimension while uploading a later valid row", async () => {
+		const occurredAt = Date.now()
+		await store.recordUsage(buildUsageRecord({ occurredAt, projectKey: "a-object-dimension" }))
+		await store.recordUsage(buildUsageRecord({ occurredAt, projectKey: "z-valid-after-object-dimension" }))
+		const statePath = path.join(tmpDir, "ai-token-usage", "v1", "state.json")
+		const persisted = JSON.parse(await fs.readFile(statePath, "utf8")) as {
+			rows: Record<string, AiTokenUsageAggregateRow>
+		}
+		const poisonedRow = Object.values(persisted.rows).find((row) => row.projectKey === "a-object-dimension")
+		expect(poisonedRow).toBeDefined()
+		poisonedRow!.departmentName = { legacyDepartment: "unknown" } as unknown as string
+		await fs.writeFile(statePath, JSON.stringify(persisted), "utf8")
+		store = new AiTokenUsageStore(tmpDir)
+		uploader = new AiTokenUsageUploader(store)
+		const fetchMock = vi.fn(acceptedResponseForRequest)
+		vi.stubGlobal("fetch", fetchMock)
+
+		expect(
+			await uploader.upload(
+				{ webhookUrl: "https://example.com/webhook" },
+				{ client: { ide: "vscode", machineId: "machine-1" } },
+			),
+		).toEqual({ uploaded: 1, blocked: 0, invalid: 1 })
+		expect(JSON.parse(fetchMock.mock.calls[0][1]?.body as string).rows).toEqual([
+			expect.objectContaining({ projectKey: "z-valid-after-object-dimension" }),
+		])
+		expect(await store.getPendingUploadRows()).toHaveLength(0)
+		expect(await store.getQuarantinedRows()).toEqual([
+			expect.objectContaining({
+				issueCode: "invalid_persisted_row_structure",
+				raw: expect.objectContaining({
+					projectKey: "a-object-dimension",
+					departmentName: { legacyDepartment: "unknown" },
+				}),
+			}),
+		])
+	})
+
+	it("assigns a legacy anonymous row only when its email is truly missing and its key has anonymous provenance", async () => {
+		await store.recordUsage(
+			buildUsageRecord({
+				userEmail: undefined,
+				userKey: "anonymous-install:legacy-install",
+				identityKind: "anonymous",
+			}),
+		)
+		const statePath = path.join(tmpDir, "ai-token-usage", "v1", "state.json")
+		const persisted = JSON.parse(await fs.readFile(statePath, "utf8")) as {
+			rows: Record<string, AiTokenUsageAggregateRow>
+		}
+		delete Object.values(persisted.rows)[0].identityKind
+		await fs.writeFile(statePath, JSON.stringify(persisted), "utf8")
+		store = new AiTokenUsageStore(tmpDir)
+		uploader = new AiTokenUsageUploader(store)
+		const fetchMock = vi.fn(acceptedResponseForRequest)
+		vi.stubGlobal("fetch", fetchMock)
+
+		expect(
+			await uploader.upload(
+				{ webhookUrl: "https://example.com/webhook", userEmail: "configured@example.com" },
+				{ client: { ide: "vscode", machineId: "machine-1" } },
+			),
+		).toEqual({ uploaded: 1, blocked: 0, invalid: 0 })
+		expect(JSON.parse(fetchMock.mock.calls[0][1]?.body as string).rows[0]).toMatchObject({
+			userEmail: "configured@example.com",
+			userKey: "email:configured@example.com",
 		})
 	})
 

@@ -6,7 +6,7 @@ export type AiCodeMetricType = "generated" | "accepted"
 export type AiCodeChangeType = "addition" | "deletion"
 export type AiCodeUploadMode = "incremental"
 export type AiCodeGeneratedBlockUploadStatus = "pending" | "queued" | "uploaded"
-export type AiCodeStatsSemanticsVersion = 1 | 2
+export type AiCodeStatsSemanticsVersion = 1 | 2 | 3
 
 export interface AiCodeModelContext {
 	provider?: string
@@ -225,6 +225,12 @@ export interface AiCodeQueuedCommitReport {
 	report: AiCodeCommitReport
 	createdAt: number
 	generatedBlockIds: string[]
+	/**
+	 * First configured enterprise identity adopted by a legacy report whose
+	 * retained facts did not yet contain one. Once set, retries must keep using
+	 * this identity even if the current profile changes.
+	 */
+	boundUserEmail?: unknown
 }
 
 export type AiCodeCommitLifecycleEventType = "commit_replaced" | "commits_abandoned" | "branch_rewrite_observed"
@@ -371,6 +377,30 @@ export interface AiCodeStatsEventBlockSummary {
 	count: number
 }
 
+export type AiCodeQuarantinedOutboxKind =
+	| "pending_line"
+	| "generated_block"
+	| "commit_report"
+	| "commit_lifecycle"
+	| "commit_upload_record"
+	| "pending_commit_metric_block"
+
+export interface AiCodeQuarantinedOutboxRecordSummary {
+	kind: AiCodeQuarantinedOutboxKind
+	sourceIndex: number
+	reason: string
+	reportId?: string
+	eventId?: string
+	commitHash?: string
+	repoRoot?: string
+}
+
+export interface AiCodeQuarantinedFactSummary {
+	kind: Exclude<AiCodeQuarantinedOutboxKind, "commit_upload_record">
+	reason: string
+	count: number
+}
+
 export interface AiCodeStatsLastUpload {
 	status: "idle" | "success" | "failed"
 	timestamp?: number
@@ -383,6 +413,8 @@ export interface AiCodeStatsLastUpload {
 	eventUploadError?: string
 	blockedEvents?: number
 	blockedEventReasons?: AiCodeStatsEventBlockSummary[]
+	quarantinedFacts?: number
+	quarantinedFactReasons?: AiCodeQuarantinedFactSummary[]
 	rawPayloadBytes?: number
 	compressedPayloadBytes?: number
 	timeoutMs?: number
@@ -394,6 +426,10 @@ export interface AiCodeStatsPersistedState {
 	version: 1
 	pendingEventIds: string[]
 	supersededEventIds: string[]
+	/** First configured identity durably adopted by each identity-less event. */
+	pendingEventUserEmails?: Record<string, unknown>
+	/** The legacy binding container itself was present but malformed. */
+	pendingEventUserEmailsInvalid?: boolean
 	blockedEvents?: Record<string, Omit<AiCodeStatsEventUploadBlock, "eventId">>
 	repoObservedCommits: Record<string, string>
 	lastUpload: AiCodeStatsLastUpload
@@ -508,7 +544,7 @@ export interface AiCodePendingLineAttribution {
 }
 
 export const AI_CODE_STATS_VERSION = 1 as const
-export const CURRENT_AI_CODE_STATS_SEMANTICS_VERSION = 2 as const
+export const CURRENT_AI_CODE_STATS_SEMANTICS_VERSION = 3 as const
 export const AI_CODE_STATS_RETENTION_DAYS = 30
 
 export const toLocalDateKey = (timestamp: number): string => {
@@ -524,9 +560,33 @@ export const normalizePath = (value: string): string => value.replace(/\\/g, "/"
 export const buildRepoCommitKey = (repoRoot: string, commitHash: string): string =>
 	JSON.stringify([normalizePath(repoRoot).replace(/\/+$/, ""), commitHash.trim().toLowerCase()])
 
-export const normalizeUserEmail = (value?: string): string | undefined => {
-	const normalized = value?.trim().toLowerCase()
+export const normalizeUserEmail = (value?: unknown): string | undefined => {
+	if (typeof value !== "string") {
+		return undefined
+	}
+	const normalized = value.trim().toLowerCase()
 	return normalized ? normalized : undefined
+}
+
+export type UserEmailIdentity = { kind: "missing" } | { kind: "valid"; userEmail: string } | { kind: "invalid" }
+
+/**
+ * Classifies persisted identity without conflating malformed, present values
+ * with a genuinely missing value that may safely adopt a configured fallback.
+ */
+export const classifyUserEmail = (value: unknown): UserEmailIdentity => {
+	if (value === undefined || value === null || (typeof value === "string" && !value.trim())) {
+		return { kind: "missing" }
+	}
+	const normalized = normalizeUserEmail(value)
+	if (!normalized || normalized.includes(" ")) {
+		return { kind: "invalid" }
+	}
+	const at = normalized.indexOf("@")
+	const dot = normalized.lastIndexOf(".")
+	return at > 0 && dot > at + 1 && dot < normalized.length - 1
+		? { kind: "valid", userEmail: normalized }
+		: { kind: "invalid" }
 }
 
 export const buildEmailUserKey = (userEmail: string): string => `email:${normalizeUserEmail(userEmail) ?? ""}`

@@ -525,7 +525,7 @@ export class AwsBedrockHandler extends BaseProvider implements SingleCompletionH
 					const usage = (streamEvent.metadata?.usage || {}) as UsageType
 
 					// Check both field naming conventions for cache tokens
-					const cacheReadTokens = usage.cacheReadInputTokens || usage.cacheReadInputTokenCount || 0
+					const cacheReadTokens = usage.cacheReadInputTokens ?? usage.cacheReadInputTokenCount // kilocode_change: preserve explicit zero vs missing
 					const cacheWriteTokens = usage.cacheWriteInputTokens || usage.cacheWriteInputTokenCount || 0
 
 					// Always include all available token information
@@ -557,8 +557,7 @@ export class AwsBedrockHandler extends BaseProvider implements SingleCompletionH
 							const routerUsage = streamEvent.trace.promptRouter.usage
 
 							// Check both field naming conventions for cache tokens
-							const cacheReadTokens =
-								routerUsage.cacheReadTokens || routerUsage.cacheReadInputTokenCount || 0
+							const cacheReadTokens = routerUsage.cacheReadTokens ?? routerUsage.cacheReadInputTokenCount // kilocode_change: preserve explicit zero vs missing
 							const cacheWriteTokens =
 								routerUsage.cacheWriteTokens || routerUsage.cacheWriteInputTokenCount || 0
 

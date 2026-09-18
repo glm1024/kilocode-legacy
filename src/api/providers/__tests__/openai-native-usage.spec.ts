@@ -20,6 +20,24 @@ describe("OpenAiNativeHandler - normalizeUsage", () => {
 	})
 
 	describe("detailed token shapes (Responses API)", () => {
+		// kilocode_change start
+		it("distinguishes an explicit zero cache read from missing cache metadata", () => {
+			const explicitZero = (handler as any).normalizeUsage(
+				{
+					input_tokens: 100,
+					output_tokens: 50,
+					cache_read_input_tokens: 0,
+					input_tokens_details: { cached_tokens: 30 },
+				},
+				mockModel,
+			)
+			const missing = (handler as any).normalizeUsage({ input_tokens: 100, output_tokens: 50 }, mockModel)
+
+			expect(explicitZero.cacheReadTokens).toBe(0)
+			expect(missing.cacheReadTokens).toBeUndefined()
+		})
+		// kilocode_change end
+
 		it("should handle detailed shapes with cached and miss tokens", () => {
 			const usage = {
 				input_tokens: 100,
@@ -193,9 +211,9 @@ describe("OpenAiNativeHandler - normalizeUsage", () => {
 				type: "usage",
 				inputTokens: 100,
 				outputTokens: 50,
-				cacheReadTokens: 0,
 				cacheWriteTokens: 0,
 			})
+			expect(result.cacheReadTokens).toBeUndefined() // kilocode_change
 		})
 	})
 
@@ -212,9 +230,9 @@ describe("OpenAiNativeHandler - normalizeUsage", () => {
 				type: "usage",
 				inputTokens: 100,
 				outputTokens: 50,
-				cacheReadTokens: 0,
 				cacheWriteTokens: 0,
 			})
+			expect(result.cacheReadTokens).toBeUndefined() // kilocode_change
 		})
 
 		it("should handle SSE events with no cache information", () => {
@@ -229,9 +247,9 @@ describe("OpenAiNativeHandler - normalizeUsage", () => {
 				type: "usage",
 				inputTokens: 100,
 				outputTokens: 50,
-				cacheReadTokens: 0,
 				cacheWriteTokens: 0,
 			})
+			expect(result.cacheReadTokens).toBeUndefined() // kilocode_change
 		})
 	})
 
@@ -255,9 +273,9 @@ describe("OpenAiNativeHandler - normalizeUsage", () => {
 				type: "usage",
 				inputTokens: 0,
 				outputTokens: 0,
-				cacheReadTokens: 0,
 				cacheWriteTokens: 0,
 			})
+			expect(result.cacheReadTokens).toBeUndefined() // kilocode_change
 		})
 
 		it("should handle missing details but with cache fields", () => {

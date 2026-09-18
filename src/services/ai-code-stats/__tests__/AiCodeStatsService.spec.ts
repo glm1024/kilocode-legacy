@@ -365,6 +365,103 @@ describe("AiCodeStatsService", () => {
 		expect(callOrder).toEqual(["upload", "status"])
 	})
 
+	it("rejects an invalid stored commit hash before the status scanner invokes Git", async () => {
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const repoDir = await createGitRepo()
+		const markerPath = path.join(repoDir, "status-shell-injection-marker")
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({ enabled: false }))
+
+		await expect(
+			(service as any).loadCommitSummary(repoDir, `${"b".repeat(40)}; touch ${markerPath}`),
+		).rejects.toThrow("commit summary hash is not a full Git object id")
+		await expect(fs.access(markerPath)).rejects.toMatchObject({ code: "ENOENT" })
+	})
+
+	it("diagnoses and skips an invalid commit hash restored from status storage", async () => {
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const repoDir = await createGitRepo()
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({
+			webhookUrl: "https://example.com/prod-api",
+			userEmail: "tester@example.com",
+		}))
+		const invalidCommitHash = `${"c".repeat(40)}; touch should-not-run`
+		await (service as any).store.upsertCommitUploadRecord({
+			commitHash: invalidCommitHash,
+			repoRoot: repoDir,
+			reportId: "corrupt-stored-report",
+			status: "reanalysis_failed",
+		})
+		const fetchMock = vi.fn()
+		vi.stubGlobal("fetch", fetchMock)
+
+		await (service as any).scanCommitUploadStatus()
+
+		expect(fetchMock).not.toHaveBeenCalled()
+		const diagnostics = await (service as any).store.getCommitUploadDiagnostics()
+		expect(diagnostics.events).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					type: "report_skipped",
+					commitHash: invalidCommitHash,
+					reportId: "corrupt-stored-report",
+					details: expect.objectContaining({ reason: "invalid_commit_hash" }),
+				}),
+			]),
+		)
+	})
+
+	it("ignores legacy deletion-only state during commit status scans and automatic reanalysis", async () => {
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const repoDir = await createGitRepo()
+		mockIsGitRepository.mockResolvedValue(true)
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({
+			webhookUrl: "https://example.com/prod-api",
+			userEmail: "tester@example.com",
+		}))
+		const relativePath = "src/legacy-deletion.ts"
+		const filePath = path.join(repoDir, relativePath)
+		const originalContent = "const base = true\n"
+		const generatedContent = `${originalContent}const legacyDeletion = true\n`
+		await commitFile(repoDir, relativePath, originalContent, "base")
+		await service.recordAgentFileWrite({
+			cwd: repoDir,
+			filePath,
+			relativePath,
+			originalContent,
+			newContent: generatedContent,
+			taskId: "task-legacy-deletion",
+		})
+		const commitHash = await commitFile(repoDir, relativePath, generatedContent, "legacy deletion state")
+
+		const store = (service as any).store
+		const [generatedBlock] = await store.getGeneratedBlocksForTests()
+		const legacyDeletionBlock = { ...generatedBlock, changeType: "deletion" as const }
+		await store.replaceGeneratedStateForContext({
+			filePath,
+			taskId: "task-legacy-deletion",
+			sourceType: "agent_insert",
+			nextBlocks: [legacyDeletionBlock],
+			nextPendingLines: [],
+		})
+
+		const fetchMock = vi.fn()
+		vi.stubGlobal("fetch", fetchMock)
+		const reanalysis = vi.spyOn(service as any, "runAutomaticCommitReanalysis")
+		const summary = {
+			commitHash,
+			commitOccurredAt: Date.now(),
+			changedPaths: new Set([relativePath]),
+			addedLineCount: 1,
+			changedFileCount: 1,
+		}
+
+		expect((service as any).hasRetainedCandidateForCommit([legacyDeletionBlock], summary)).toBe(false)
+		await (service as any).scanCommitUploadStatus()
+
+		expect(fetchMock).not.toHaveBeenCalled()
+		expect(reanalysis).not.toHaveBeenCalled()
+	})
+
 	it("waits for an in-flight server status reconciliation instead of returning stale records", async () => {
 		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
 		const service = AiCodeStatsService.initialize(tmpDir, async () => ({ enabled: false }))
@@ -930,6 +1027,12 @@ describe("AiCodeStatsService", () => {
 					filePath,
 					language: "python",
 					committedSnapshotContent: `${finalAcceptedContent}\n`,
+					addedLines: retainedBlockLines.map((content, addedIndex) => ({
+						addedIndex,
+						lineNumber: generatedBlock.lineStart + addedIndex,
+						content,
+						lineHash: hashLineFingerprint(content),
+					})),
 					changedBlocks: [
 						{
 							startLine: generatedBlock.lineStart,
@@ -1100,6 +1203,12 @@ describe("AiCodeStatsService", () => {
 							displayOrder: 1,
 						},
 					],
+					addedLines: retainedLines.map((content, addedIndex) => ({
+						addedIndex,
+						lineNumber: generatedBlock.lineStart + addedIndex,
+						content,
+						lineHash: hashLineFingerprint(content),
+					})),
 				},
 			],
 		})
@@ -1109,7 +1218,7 @@ describe("AiCodeStatsService", () => {
 		expect(queuedReports[0].report.candidateLines).toHaveLength(4)
 	})
 
-	it("records pure deletion writes as deletion blocks and pending deletion lines", async () => {
+	it("does not create AI source facts for pure deletion writes", async () => {
 		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
 		const repoDir = await createGitRepo()
 		mockIsGitRepository.mockResolvedValue(true)
@@ -1130,46 +1239,50 @@ describe("AiCodeStatsService", () => {
 		})
 
 		const store = (service as any).store
-		const generatedBlocks = await store.getGeneratedBlocksForTests()
-		expect(generatedBlocks).toHaveLength(1)
-		expect(generatedBlocks[0]).toMatchObject({
-			changeType: "deletion",
-			uploadStatus: "pending",
-			lineStart: 2,
-			lineEnd: 3,
-			lineCount: 2,
-			codeSnippet: "const old1 = 2\nconst old2 = 3",
-			fileSnapshotContent: originalContent,
-		})
-
-		const pendingCommitMetricBlocks = await store.getPendingCommitMetricBlocksForTests()
-		expect(pendingCommitMetricBlocks).toHaveLength(1)
-		expect(pendingCommitMetricBlocks[0]).toMatchObject({
-			changeType: "deletion",
-			lineStart: 2,
-			lineEnd: 3,
-			lineCount: 2,
-			codeSnippet: "const old1 = 2\nconst old2 = 3",
-		})
-
-		const pendingLines = await store.getPendingLineAttributions(repoDir)
-		expect(pendingLines).toHaveLength(2)
-		expect(pendingLines[0]).toMatchObject({
-			changeType: "deletion",
-			lineNumber: 2,
-			rawLine: "const old1 = 2",
-			blockLineIndex: 1,
-			blockLineCount: 2,
-			occurrenceIndex: 1,
-		})
-		expect(pendingLines[1]).toMatchObject({
-			changeType: "deletion",
-			lineNumber: 3,
-			rawLine: "const old2 = 3",
-		})
+		expect(await store.getGeneratedBlocksForTests()).toHaveLength(0)
+		expect(await store.getPendingCommitMetricBlocksForTests()).toHaveLength(0)
+		expect(await store.getPendingLineAttributions(repoDir)).toHaveLength(0)
 	})
 
-	it("records deletion candidates for replacement edits", async () => {
+	it("keeps only surviving AI additions when generated code is deleted before commit", async () => {
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const repoDir = await createGitRepo()
+		mockIsGitRepository.mockResolvedValue(true)
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({ enabled: false }))
+		const filePath = path.join(repoDir, "src/delete-before-commit.ts")
+		const baseContent = "const base = 0\n"
+		const generatedContent = `${baseContent}const ai1 = 1\nconst ai2 = 2\nconst ai3 = 3\n`
+		const survivingContent = `${baseContent}const ai1 = 1\nconst ai3 = 3\n`
+
+		await service.recordAgentFileWrite({
+			cwd: repoDir,
+			filePath,
+			relativePath: "src/delete-before-commit.ts",
+			originalContent: baseContent,
+			newContent: generatedContent,
+			taskId: "task-delete-before-commit",
+		})
+		await service.recordAgentFileWrite({
+			cwd: repoDir,
+			filePath,
+			relativePath: "src/delete-before-commit.ts",
+			originalContent: generatedContent,
+			newContent: survivingContent,
+			taskId: "task-delete-before-commit",
+		})
+
+		const store = (service as any).store
+		const generatedBlocks = await store.getGeneratedBlocksForTests()
+		expect(generatedBlocks).toHaveLength(1)
+		expect(generatedBlocks.every((block: any) => block.changeType !== "deletion")).toBe(true)
+		expect(generatedBlocks[0]).toMatchObject({
+			lineCount: 2,
+			codeSnippet: "const ai1 = 1\nconst ai3 = 3",
+		})
+		expect(await store.getPendingLineAttributions(repoDir)).toHaveLength(2)
+	})
+
+	it("records only addition candidates for replacement edits", async () => {
 		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
 		const repoDir = await createGitRepo()
 		mockIsGitRepository.mockResolvedValue(true)
@@ -1195,24 +1308,15 @@ describe("AiCodeStatsService", () => {
 			lineEnd: 2,
 			codeSnippet: "const replaced = 3",
 		})
-		expect(deletionBlocks).toHaveLength(1)
-		expect(deletionBlocks[0]).toMatchObject({
-			lineStart: 2,
-			lineEnd: 2,
-			codeSnippet: "const old = 2",
-		})
+		expect(deletionBlocks).toHaveLength(0)
 		const pendingLines = await store.getPendingLineAttributions(repoDir)
 		const deletionLines = pendingLines.filter((line: any) => line.changeType === "deletion")
-		expect(deletionLines).toHaveLength(1)
-		expect(deletionLines[0]).toMatchObject({
-			lineNumber: 2,
-			rawLine: "const old = 2",
-			blockLineIndex: 1,
-			blockLineCount: 1,
-		})
+		expect(deletionLines).toHaveLength(0)
+		expect(pendingLines).toHaveLength(1)
+		expect(pendingLines[0]).toMatchObject({ rawLine: "const replaced = 3" })
 	})
 
-	it("computes deletion occurrence indexes from the original content for duplicate lines", async () => {
+	it("does not create deletion candidates for duplicate deleted lines", async () => {
 		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
 		const repoDir = await createGitRepo()
 		mockIsGitRepository.mockResolvedValue(true)
@@ -1233,15 +1337,11 @@ describe("AiCodeStatsService", () => {
 		const store = (service as any).store
 		const pendingLines = await store.getPendingLineAttributions(repoDir)
 		const deletionLines = pendingLines.filter((line: any) => line.changeType === "deletion")
-		expect(deletionLines).toHaveLength(1)
-		expect(deletionLines[0]).toMatchObject({
-			lineNumber: 3,
-			rawLine: "const dup = 1",
-			occurrenceIndex: 2,
-		})
+		expect(deletionLines).toHaveLength(0)
+		expect(pendingLines).toHaveLength(0)
 	})
 
-	it("queues commit reports with deleted lines and deletion candidate lines", async () => {
+	it("does not queue a business report for a deletion-only commit", async () => {
 		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
 		const repoDir = await createGitRepo()
 		mockIsGitRepository.mockResolvedValue(true)
@@ -1297,54 +1397,10 @@ describe("AiCodeStatsService", () => {
 
 		const store = (service as any).store
 		const queuedReports = await store.getQueuedReportsForTests()
-		expect(queuedReports).toHaveLength(1)
-		const report = queuedReports[0].report
-		expect(report.changedFiles[0].deletedLines).toEqual([
-			{
-				deletedIndex: 0,
-				lineNumber: 2,
-				content: "const old1 = 2",
-				lineHash: hashLineFingerprint("const old1 = 2"),
-				occurrenceIndex: 1,
-			},
-			{
-				deletedIndex: 1,
-				lineNumber: 3,
-				content: "const old2 = 3",
-				lineHash: hashLineFingerprint("const old2 = 3"),
-				occurrenceIndex: 1,
-			},
-		])
-		const candidateLines = report.candidateLines as AiCodeCommitCandidateLine[]
-		expect(candidateLines).toHaveLength(2)
-		expect(candidateLines[0]).toMatchObject({
-			changeType: "deletion",
-			lineNumber: 2,
-			rawLine: "const old1 = 2",
-			blockLineIndex: 1,
-			blockLineCount: 2,
-			baselineMetricType: "accepted",
-		})
-		expect(candidateLines[1]).toMatchObject({
-			changeType: "deletion",
-			lineNumber: 3,
-			rawLine: "const old2 = 3",
-		})
-		const deletionBlocks = (report.generatedBlocks ?? []).filter((block: any) => block.changeType === "deletion")
-		expect(deletionBlocks).toHaveLength(1)
-		expect(deletionBlocks[0]).toMatchObject({
-			lineStart: 2,
-			lineEnd: 3,
-			lineCount: 2,
-			codeSnippet: "const old1 = 2\nconst old2 = 3",
-		})
-		const acceptedDeletionBlocks = (report.acceptedBlocks ?? []).filter(
-			(block: any) => block.changeType === "deletion",
-		)
-		expect(acceptedDeletionBlocks).toHaveLength(1)
+		expect(queuedReports).toHaveLength(0)
 	})
 
-	it("queues deletion candidates when a function is replaced and another line is edited", async () => {
+	it("keeps raw deleted lines but queues only addition candidates for replacement commits", async () => {
 		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
 		const repoDir = await createGitRepo()
 		mockIsGitRepository.mockResolvedValue(true)
@@ -1479,17 +1535,8 @@ describe("AiCodeStatsService", () => {
 		expect(queuedReports).toHaveLength(1)
 		const report = queuedReports[0].report
 		const candidateLines = report.candidateLines as AiCodeCommitCandidateLine[]
-		const deletionCandidates = candidateLines
-			.filter((line) => line.changeType === "deletion")
-			.sort((left, right) => left.lineNumber - right.lineNumber)
-		expect(deletionCandidates).toHaveLength(4)
-		expect(deletionCandidates.map((line) => line.lineNumber)).toEqual([4, 5, 6, 9])
-		expect(deletionCandidates.map((line) => line.rawLine)).toEqual([
-			"def subtract_two_numbers(a, b):",
-			'    """Return the difference of two numbers."""',
-			"    return a - b",
-			'    """Return the quotient of two numbers."""',
-		])
+		const deletionCandidates = candidateLines.filter((line) => line.changeType === "deletion")
+		expect(deletionCandidates).toHaveLength(0)
 		const additionCandidates = candidateLines
 			.filter((line) => line.changeType !== "deletion")
 			.sort((left, right) => left.lineNumber - right.lineNumber)
@@ -1501,8 +1548,8 @@ describe("AiCodeStatsService", () => {
 			'    """Return the quotint of two numbers."""',
 		])
 		const deletionBlocks = (report.generatedBlocks ?? []).filter((block: any) => block.changeType === "deletion")
-		expect(deletionBlocks).toHaveLength(2)
-		expect(deletionBlocks.map((block: any) => block.lineStart)).toEqual([4, 9])
+		expect(deletionBlocks).toHaveLength(0)
+		expect(report.changedFiles[0].deletedLines).toHaveLength(4)
 	})
 
 	it("queues duplicate candidate line occurrence facts without client committed attribution fields", async () => {
@@ -1904,6 +1951,87 @@ describe("AiCodeStatsService", () => {
 
 		expect(uploadedReports).toHaveLength(1)
 		expect(await service.getVisibleCommitUploadRecords()).toHaveLength(0)
+	})
+
+	it("does not let blank lines reuse an uploaded block without a non-blank commit anchor", async () => {
+		mockIsGitRepository.mockResolvedValue(true)
+		mockGetRemoteUrl.mockResolvedValue("https://github.com/example/uploaded-blank-anchor.git")
+		mockGetCurrentBranch.mockResolvedValue("main")
+
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const repoDir = await createGitRepo()
+		const service = AiCodeStatsService.initialize(tmpDir, async () => ({
+			webhookUrl: "https://example.com/prod-api",
+			userEmail: "tester@example.com",
+		}))
+		const uploadedReports: any[] = []
+		const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+			const payload = await parseJsonBody(
+				init?.body as BodyInit,
+				init?.headers as Record<string, string> | undefined,
+			)
+			if (payload.mode === "commit_report") {
+				uploadedReports.push(payload)
+			}
+			return acceptedIngestResponseForRequest(_url, init!)
+		})
+		vi.stubGlobal("fetch", fetchMock)
+
+		const relativePath = "src/uploaded-blank-anchor.ts"
+		const filePath = path.join(repoDir, relativePath)
+		const aiLine = "const uploadedAnchor = true"
+		await service.recordAgentFileWrite({
+			cwd: repoDir,
+			filePath,
+			relativePath,
+			originalContent: "const base = 1\n",
+			newContent: `const base = 1\n\n\n${aiLine}\n`,
+			taskId: "task-uploaded-blank-anchor",
+		})
+
+		const changedFile = (lines: string[]) => ({
+			relativePath,
+			filePath,
+			language: "typescript",
+			addedLines: lines.map((content, addedIndex) => ({
+				addedIndex,
+				lineNumber: addedIndex + 2,
+				content,
+				lineHash: hashLineFingerprint(content),
+			})),
+		})
+
+		await (service as any).handleCommitCollected({
+			repoRoot: repoDir,
+			branch: "main",
+			commitHash: "commit-blank-anchor-first",
+			previousCommit: "commit-base",
+			commitOccurredAt: Date.now(),
+			changedFiles: [changedFile(["", "", aiLine])],
+		})
+		expect(uploadedReports).toHaveLength(1)
+		expect(uploadedReports[0].candidateLines.map((line: any) => line.rawLine)).toEqual(["", "", aiLine])
+
+		await (service as any).handleCommitCollected({
+			repoRoot: repoDir,
+			branch: "main",
+			commitHash: "commit-blank-only-overlap",
+			previousCommit: "commit-blank-anchor-first",
+			commitOccurredAt: Date.now(),
+			changedFiles: [changedFile(["", "", "const codexOnly = true"])],
+		})
+		expect(uploadedReports).toHaveLength(1)
+
+		await (service as any).handleCommitCollected({
+			repoRoot: repoDir,
+			branch: "main",
+			commitHash: "commit-blank-with-anchor",
+			previousCommit: "commit-blank-only-overlap",
+			commitOccurredAt: Date.now(),
+			changedFiles: [changedFile(["", "", aiLine])],
+		})
+		expect(uploadedReports).toHaveLength(2)
+		expect(uploadedReports[1].candidateLines.map((line: any) => line.rawLine)).toEqual(["", "", aiLine])
 	})
 
 	it("keeps old-path candidates when commit facts report a rename", async () => {
@@ -2366,6 +2494,69 @@ describe("AiCodeStatsService", () => {
 				retryable: true,
 			}),
 		})
+	})
+
+	it("reports an only-quarantine disk outbox as blocked after restart without retrying it over the network", async () => {
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-service-"))
+		const baseDir = path.join(tmpDir, "ai-code-stats", "v1")
+		await fs.mkdir(baseDir, { recursive: true })
+		const quarantinedReport = {
+			createdAt: Date.now(),
+			generatedBlockIds: [],
+			report: {
+				version: "v2",
+				source: "kilocode-ai-code-stats",
+				mode: "commit_report",
+				semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
+				reportId: "only-quarantine-report",
+				reportGeneratedAt: Date.now(),
+				client: { ide: "vscode" },
+				repoRoot: { invalid: "non-string-path" },
+				projectKey: "project-key",
+				commitHash: "only-quarantine-commit",
+				commitOccurredAt: Date.now(),
+				acceptedBlocks: [],
+				changedFiles: [],
+			},
+		}
+		await fs.writeFile(path.join(baseDir, "queued-reports.json"), JSON.stringify([quarantinedReport]), "utf8")
+
+		let service = AiCodeStatsService.initialize(tmpDir, async () => ({
+			webhookUrl: "https://example.com/webhook",
+			userEmail: "tester@example.com",
+		}))
+		expect(await (service as any).store.getPendingEventCount()).toBe(1)
+		AiCodeStatsService.disposeInstance()
+		service = AiCodeStatsService.initialize(tmpDir, async () => ({
+			webhookUrl: "https://example.com/webhook",
+			userEmail: "tester@example.com",
+		}))
+		const store = (service as any).store
+		const fetchMock = vi.fn()
+		vi.stubGlobal("fetch", fetchMock)
+
+		await (service as any).performIncrementalUpload("commit")
+
+		expect(fetchMock).not.toHaveBeenCalled()
+		expect(await store.getPendingEventCount()).toBe(1)
+		const state = await store.getRawStateForTests()
+		expect(state.lastUpload).toMatchObject({
+			status: "failed",
+			uploadedEvents: 0,
+			uploadedReports: 0,
+			eventUploadFailed: true,
+			quarantinedFacts: 1,
+		})
+		expect(state.lastUpload.eventUploadError).toContain("quarantined local fact")
+		expect(state.lastUpload.quarantinedFactReasons).toEqual([
+			expect.objectContaining({ kind: "commit_report", count: 1 }),
+		])
+		expect((await store.getCommitUploadDiagnostics()).quarantinedOutboxRecords).toEqual([
+			expect.objectContaining({ kind: "commit_report", reportId: "only-quarantine-report" }),
+		])
+		expect(JSON.parse(await fs.readFile(path.join(baseDir, "queued-reports.json"), "utf8"))).toEqual([
+			expect.objectContaining({ report: expect.objectContaining({ reportId: "only-quarantine-report" }) }),
+		])
 	})
 
 	it("does not create a second report when the same physical commit is replayed after queue persistence", async () => {

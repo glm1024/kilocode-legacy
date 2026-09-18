@@ -6,6 +6,7 @@ import Disassembler from "stream-json/Disassembler"
 import Stringer from "stream-json/Stringer"
 
 type SafeWriteRecoveryResult = "current" | "new" | "backup" | "recovery" | "none"
+type SafeWriteArtifactKind = "new" | "backup" | "recovery"
 
 const SAFE_WRITE_INTENT_VERSION = 1 as const
 const STORE_LOCK_STALE_MS = 120_000
@@ -23,6 +24,25 @@ interface SafeWriteIntent {
 	state: "prepared" | "aborted"
 	newFileName: string
 	backupFileName: string
+}
+
+interface SafeWriteArtifactCandidate {
+	path: string
+	kind: SafeWriteArtifactKind
+}
+
+class SafeWriteRecoveryAmbiguityError extends Error {
+	constructor(filePath: string, reason: string, candidates: SafeWriteArtifactCandidate[]) {
+		const artifactNames = candidates
+			.map((candidate) => path.basename(candidate.path))
+			.sort()
+			.join(", ")
+		super(
+			`Ambiguous safe-write recovery for ${filePath}: ${reason}. ` +
+				`Recovery artifacts were preserved for inspection: ${artifactNames || "none"}`,
+		)
+		this.name = "SafeWriteRecoveryAmbiguityError"
+	}
 }
 
 interface CrossProcessFileLockOptions {
@@ -141,22 +161,14 @@ async function recoverSafeWriteJsonLocked(absoluteFilePath: string): Promise<Saf
 		return currentExists ? "current" : "none"
 	}
 
-	const candidates = await Promise.all(
-		candidateNames.map(async (name) => {
-			const candidatePath = path.join(dirPath, name)
-			const stat = await fs.stat(candidatePath)
-			return {
-				path: candidatePath,
-				kind: name.startsWith(`.${baseName}.new_`)
-					? ("new" as const)
-					: name.startsWith(`.${baseName}.bak_`)
-						? ("backup" as const)
-						: ("recovery" as const),
-				mtimeMs: stat.mtimeMs,
-			}
-		}),
-	)
-	candidates.sort((left, right) => right.mtimeMs - left.mtimeMs || right.path.localeCompare(left.path))
+	const candidates: SafeWriteArtifactCandidate[] = candidateNames.map((name) => ({
+		path: path.join(dirPath, name),
+		kind: name.startsWith(`.${baseName}.new_`)
+			? "new"
+			: name.startsWith(`.${baseName}.bak_`)
+				? "backup"
+				: "recovery",
+	}))
 
 	const validCandidates: typeof candidates = []
 	for (const candidate of candidates) {
@@ -217,9 +229,31 @@ async function recoverSafeWriteJsonLocked(absoluteFilePath: string): Promise<Saf
 		return "new"
 	}
 
-	const backup = intent
-		? (intendedBackup ?? validCandidates.find((candidate) => candidate.kind === "backup"))
-		: validCandidates.find((candidate) => candidate.kind === "backup")
+	const validBackups = validCandidates.filter((candidate) => candidate.kind === "backup")
+	const backupCandidates = candidates.filter((candidate) => candidate.kind === "backup")
+	let backup: SafeWriteArtifactCandidate | undefined
+	if (intent) {
+		if (!intendedBackup) {
+			throw new SafeWriteRecoveryAmbiguityError(
+				absoluteFilePath,
+				"the v1 intent's exact committed backup is missing or invalid",
+				validCandidates,
+			)
+		}
+		backup = intendedBackup
+	} else if (backupCandidates.length === 1 && validBackups.length === 1) {
+		// A single unmarked backup remains compatible with legacy writers. With
+		// multiple generations there is no durable ordering proof: rename keeps
+		// the original file's mtime, clocks can move backwards, and directory
+		// enumeration order is unspecified.
+		backup = validBackups[0]
+	} else if (backupCandidates.length > 0) {
+		throw new SafeWriteRecoveryAmbiguityError(
+			absoluteFilePath,
+			"committed backup artifacts are ambiguous or invalid without a valid intent naming the exact generation",
+			backupCandidates,
+		)
+	}
 	if (backup) {
 		await promoteRecoveryCandidate(backup.path, absoluteFilePath, currentExists, true)
 		await syncFile(absoluteFilePath)
@@ -234,7 +268,16 @@ async function recoverSafeWriteJsonLocked(absoluteFilePath: string): Promise<Saf
 	// but before publishing the selected candidate, `.recovery_*` may be the last
 	// remaining valid copy. It is deliberately below a committed backup and
 	// above an unmarked `.new` artifact in the fallback order.
-	const recovery = validCandidates.find((candidate) => candidate.kind === "recovery")
+	const recoveryCandidates = candidates.filter((candidate) => candidate.kind === "recovery")
+	const validRecoveries = validCandidates.filter((candidate) => candidate.kind === "recovery")
+	if (recoveryCandidates.length > 1 || (recoveryCandidates.length === 1 && validRecoveries.length === 0)) {
+		throw new SafeWriteRecoveryAmbiguityError(
+			absoluteFilePath,
+			"displaced-current recovery artifacts are ambiguous or invalid without an exact marker",
+			recoveryCandidates,
+		)
+	}
+	const recovery = validRecoveries[0]
 	if (recovery) {
 		await promoteRecoveryCandidate(recovery.path, absoluteFilePath, currentExists, true)
 		await syncFile(absoluteFilePath)
@@ -245,12 +288,21 @@ async function recoverSafeWriteJsonLocked(absoluteFilePath: string): Promise<Saf
 		return "recovery"
 	}
 
-	// Legacy writers did not leave an explicit intent marker. Never allow one
-	// of their orphaned `.new` files to replace a valid target based on mtime;
-	// clock rollback and coarse timestamp resolution can make that comparison
-	// regress a newer committed file. If no committed target or backup survives,
-	// the newest valid `.new` is the only remaining recovery evidence.
-	const legacyNew = intent ? undefined : validCandidates.find((candidate) => candidate.kind === "new")
+	// Legacy writers did not leave an explicit intent marker. Never allow an
+	// orphaned `.new` file to replace a valid target or choose between multiple
+	// generations based on mtime; clock rollback and coarse timestamp resolution
+	// make that ordering unprovable. If no committed target or backup survives,
+	// one uniquely valid `.new` is the only remaining recovery evidence.
+	const legacyNewCandidates = intent ? [] : candidates.filter((candidate) => candidate.kind === "new")
+	const validLegacyNewFiles = intent ? [] : validCandidates.filter((candidate) => candidate.kind === "new")
+	if (legacyNewCandidates.length > 1 || (legacyNewCandidates.length === 1 && validLegacyNewFiles.length === 0)) {
+		throw new SafeWriteRecoveryAmbiguityError(
+			absoluteFilePath,
+			"unmarked new-file artifacts are ambiguous or invalid without a committed target",
+			legacyNewCandidates,
+		)
+	}
+	const legacyNew = validLegacyNewFiles[0]
 	if (legacyNew) {
 		await promoteRecoveryCandidate(legacyNew.path, absoluteFilePath, currentExists, true)
 		await syncFile(absoluteFilePath)
@@ -765,5 +817,5 @@ async function _streamDataToFile(targetPath: string, data: any): Promise<void> {
 	})
 }
 
-export { recoverSafeWriteJson, safeWriteJson, withCrossProcessFileLock }
+export { recoverSafeWriteJson, safeWriteJson, syncDirectory, withCrossProcessFileLock }
 export type { CrossProcessFileLockOptions }

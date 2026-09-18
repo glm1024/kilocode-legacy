@@ -2847,6 +2847,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			try {
 				let cacheWriteTokens = 0
 				let cacheReadTokens = 0
+				let cacheReadTokensAvailable = false // kilocode_change: distinguish explicit zero from missing cache metadata
 				let inputTokens = 0
 				let outputTokens = 0
 				let totalCost: number | undefined
@@ -3055,6 +3056,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 								outputTokens += chunk.outputTokens
 								cacheWriteTokens += chunk.cacheWriteTokens ?? 0
 								cacheReadTokens += chunk.cacheReadTokens ?? 0
+								cacheReadTokensAvailable ||= chunk.cacheReadTokens !== undefined // kilocode_change
 								totalCost = chunk.totalCost
 								inferenceProvider = chunk.inferenceProvider // kilocode_change
 								break
@@ -3395,6 +3397,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						output: outputTokens,
 						cacheWrite: cacheWriteTokens,
 						cacheRead: cacheReadTokens,
+						cacheReadAvailable: cacheReadTokensAvailable,
 						total: totalCost,
 					}
 
@@ -3408,6 +3411,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						let bgOutputTokens = currentTokens.output
 						let bgCacheWriteTokens = currentTokens.cacheWrite
 						let bgCacheReadTokens = currentTokens.cacheRead
+						let bgCacheReadTokensAvailable = currentTokens.cacheReadAvailable // kilocode_change
 						let bgTotalCost = currentTokens.total
 
 						// kilocode_change start
@@ -3431,6 +3435,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 								output: number
 								cacheWrite: number
 								cacheRead: number
+								cacheReadAvailable: boolean
 								total?: number
 							},
 							messageIndex: number = apiReqIndex,
@@ -3507,6 +3512,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 											inputTokens: costResult.totalInputTokens,
 											outputTokens: costResult.totalOutputTokens,
 											cacheReadTokens: tokens.cacheRead,
+											cacheReadTokensAvailable: tokens.cacheReadAvailable,
 											cacheWriteTokens: tokens.cacheWrite,
 											occurredAt: Date.now(),
 										})
@@ -3546,6 +3552,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 									bgOutputTokens += chunk.outputTokens
 									bgCacheWriteTokens += chunk.cacheWriteTokens ?? 0
 									bgCacheReadTokens += chunk.cacheReadTokens ?? 0
+									bgCacheReadTokensAvailable ||= chunk.cacheReadTokens !== undefined // kilocode_change
 									bgTotalCost = chunk.totalCost
 									inferenceProvider = chunk.inferenceProvider // kilocode_change
 								}
@@ -3565,6 +3572,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 										output: bgOutputTokens,
 										cacheWrite: bgCacheWriteTokens,
 										cacheRead: bgCacheReadTokens,
+										cacheReadAvailable: bgCacheReadTokensAvailable,
 										total: bgTotalCost,
 									},
 									lastApiReqIndex,
@@ -3593,6 +3601,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 										output: bgOutputTokens,
 										cacheWrite: bgCacheWriteTokens,
 										cacheRead: bgCacheReadTokens,
+										cacheReadAvailable: bgCacheReadTokensAvailable,
 										total: bgTotalCost,
 									},
 									lastApiReqIndex,

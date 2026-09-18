@@ -173,18 +173,55 @@ describe("AwsBedrockHandler with invokedModelId", () => {
 		const usageEvents = events.filter((event) => event.type === "usage")
 		expect(usageEvents.length).toBeGreaterThanOrEqual(1)
 
-		// The last usage event should have the token counts from the metadata
-		const lastUsageEvent = usageEvents[usageEvents.length - 1]
-		// Expect the usage event to include all token information
-		expect(lastUsageEvent).toMatchObject({
+		// kilocode_change start
+		const routerUsageEvent = usageEvents.find((event) => event.inputTokens === 150)
+		expect(routerUsageEvent).toMatchObject({
 			type: "usage",
-			inputTokens: 100,
-			outputTokens: 200,
-			// Cache tokens may be present with default values
-			cacheReadTokens: expect.any(Number),
-			cacheWriteTokens: expect.any(Number),
+			inputTokens: 150,
+			outputTokens: 250,
+			cacheReadTokens: 0,
 		})
+
+		const metadataUsageEvent = usageEvents.find((event) => event.inputTokens === 100)
+		expect(metadataUsageEvent?.cacheReadTokens).toBeUndefined()
+		// kilocode_change end
 	})
+
+	// kilocode_change start
+	it("distinguishes explicit zero from missing cache-read metadata", async () => {
+		const handler = new AwsBedrockHandler({
+			apiModelId: "anthropic.claude-3-5-sonnet-20241022-v2:0",
+			awsAccessKey: "test-access-key",
+			awsSecretKey: "test-secret-key",
+			awsRegion: "us-east-1",
+		})
+
+		mockSend.mockImplementationOnce(async () => ({
+			stream: {
+				async *[Symbol.asyncIterator]() {
+					yield {
+						metadata: {
+							usage: { inputTokens: 100, outputTokens: 20, cacheReadInputTokens: 0 },
+						},
+					}
+					yield {
+						metadata: {
+							usage: { inputTokens: 200, outputTokens: 40 },
+						},
+					}
+				},
+			},
+		}))
+
+		const usageEvents = []
+		for await (const event of handler.createMessage("system prompt", [{ role: "user", content: "user message" }])) {
+			if (event.type === "usage") usageEvents.push(event)
+		}
+
+		expect(usageEvents[0]?.cacheReadTokens).toBe(0)
+		expect(usageEvents[1]?.cacheReadTokens).toBeUndefined()
+	})
+	// kilocode_change end
 
 	it("should not update costModelConfig when invokedModelId is not present", async () => {
 		// Create a handler with default settings

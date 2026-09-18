@@ -3,15 +3,18 @@ import * as fs from "fs/promises"
 import * as os from "os"
 import * as path from "path"
 
-import { beforeEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { AiCodeStatsStore } from "../AiCodeStatsStore"
 import { hashLineFingerprint } from "../AiCodeLineFingerprint"
 import {
 	CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
+	type AiCodeGeneratedBlockState,
 	type AiCodePendingLineAttribution,
+	type AiCodePendingCommitMetricBlock,
 	type AiCodeQueuedCommitLifecycleReport,
 	type AiCodeQueuedCommitReport,
+	type AiCodeStatsEvent,
 } from "../types"
 
 const buildPendingLine = (overrides: Partial<AiCodePendingLineAttribution> = {}): AiCodePendingLineAttribution => {
@@ -41,6 +44,50 @@ const buildPendingLine = (overrides: Partial<AiCodePendingLineAttribution> = {})
 		occurrenceIndex: overrides.occurrenceIndex ?? 1,
 	}
 }
+
+const buildGeneratedBlockState = (overrides: Partial<AiCodeGeneratedBlockState> = {}): AiCodeGeneratedBlockState => ({
+	stateId: overrides.stateId ?? "state-1",
+	eventId: overrides.eventId ?? "generated-event-1",
+	generatedBlockId: overrides.generatedBlockId ?? "generated-block-1",
+	timestamp: overrides.timestamp ?? Date.now(),
+	semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
+	sourceType: "agent_insert",
+	ide: "vscode",
+	projectKey: "project-key",
+	projectName: "repo",
+	repoRoot: "/repo",
+	repoRelativePath: "src/a.ts",
+	filePath: "/repo/src/a.ts",
+	relativePath: "src/a.ts",
+	lineStart: 1,
+	lineEnd: 1,
+	lineCount: 1,
+	codeSnippet: "const generated = true",
+	uploadStatus: "pending",
+	...overrides,
+})
+
+const buildPendingCommitMetricBlock = (
+	overrides: Partial<AiCodePendingCommitMetricBlock> = {},
+): AiCodePendingCommitMetricBlock => ({
+	eventId: overrides.eventId ?? "metric-event-1",
+	generatedBlockId: overrides.generatedBlockId ?? "metric-block-1",
+	timestamp: overrides.timestamp ?? Date.now(),
+	semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
+	sourceType: "agent_insert",
+	ide: "vscode",
+	projectKey: "project-key",
+	projectName: "repo",
+	repoRoot: "/repo",
+	repoRelativePath: "src/a.ts",
+	filePath: "/repo/src/a.ts",
+	relativePath: "src/a.ts",
+	lineStart: 1,
+	lineEnd: 1,
+	lineCount: 1,
+	codeSnippet: "const metric = true",
+	...overrides,
+})
 
 const buildQueuedReport = (overrides: Partial<AiCodeQueuedCommitReport> = {}): AiCodeQueuedCommitReport => ({
 	report: overrides.report ?? {
@@ -119,6 +166,10 @@ describe("AiCodeStatsStore", () => {
 	beforeEach(async () => {
 		tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-code-stats-store-"))
 		store = new AiCodeStatsStore(tmpDir)
+	})
+
+	afterEach(() => {
+		vi.restoreAllMocks()
 	})
 
 	it("prunes old local commit facts", async () => {
@@ -347,13 +398,185 @@ describe("AiCodeStatsStore", () => {
 			"utf8",
 		)
 
-		const reloadedStore = new AiCodeStatsStore(tmpDir)
+		const duplicateSegmentSyncs: string[] = []
+		const originalOpen = fs.open.bind(fs)
+		const openFile = (async (...args: Parameters<typeof fs.open>) => {
+			const handle = await originalOpen(...args)
+			if (String(args[0]).endsWith(".ndjson") && args[1] === "r+") {
+				const originalSync = handle.sync.bind(handle)
+				;(handle as any).sync = async () => {
+					duplicateSegmentSyncs.push(path.basename(String(args[0])))
+					return originalSync()
+				}
+			}
+			return handle
+		}) as typeof fs.open
+		const reloadedStore = new AiCodeStatsStore(tmpDir, { open: openFile })
 
 		expect((await reloadedStore.getPendingEvents()).map((item) => item.eventId)).toEqual([event.eventId])
+		expect(duplicateSegmentSyncs).toEqual(["2026-03-19.ndjson"])
 		const persistedLines = (await fs.readFile(path.join(queueDir, "2026-03-19.ndjson"), "utf8"))
 			.split("\n")
 			.filter(Boolean)
 		expect(persistedLines).toHaveLength(1)
+	})
+
+	it("retains prepared and committed event bodies until duplicate segment file and directory barriers succeed", async () => {
+		const baseDir = path.join(tmpDir, "ai-code-stats", "v1")
+		const transactionPath = path.join(baseDir, "pending-transaction.json")
+		const event = buildUploadEvent("event-needs-replay-file-barrier", 1_773_900_000_009)
+		const originalOpen = fs.open.bind(fs)
+		let failSegmentSync = true
+		let directoryDurable = false
+		const segmentSyncModes: string[] = []
+		const openFile = (async (...args: Parameters<typeof fs.open>) => {
+			const handle = await originalOpen(...args)
+			if (String(args[0]).endsWith(".ndjson")) {
+				const originalSync = handle.sync.bind(handle)
+				;(handle as any).sync = async () => {
+					segmentSyncModes.push(String(args[1]))
+					if (failSegmentSync) {
+						const error = new Error("segment fsync failed") as NodeJS.ErrnoException
+						error.code = "EIO"
+						throw error
+					}
+					return originalSync()
+				}
+			}
+			return handle
+		}) as typeof fs.open
+		const options = {
+			open: openFile,
+			syncDirectory: async () => directoryDurable,
+		}
+
+		await expect(new AiCodeStatsStore(tmpDir, options).appendEvent(event)).rejects.toThrow("segment fsync failed")
+		expect(JSON.parse(await fs.readFile(transactionPath, "utf8"))).toMatchObject({
+			status: "prepared",
+			uploadEvents: [expect.objectContaining({ eventId: event.eventId })],
+		})
+
+		await expect(new AiCodeStatsStore(tmpDir, options).getPendingEvents()).rejects.toThrow("segment fsync failed")
+		expect(segmentSyncModes).toEqual(["a", "r+"])
+		expect(JSON.parse(await fs.readFile(transactionPath, "utf8"))).toMatchObject({
+			status: "prepared",
+			uploadEvents: [expect.objectContaining({ eventId: event.eventId })],
+		})
+
+		failSegmentSync = false
+		await expect(new AiCodeStatsStore(tmpDir, options).getPendingEvents()).resolves.toEqual([
+			expect.objectContaining({ eventId: event.eventId }),
+		])
+		expect(segmentSyncModes.at(-1)).toBe("r+")
+		expect(JSON.parse(await fs.readFile(transactionPath, "utf8"))).toMatchObject({
+			status: "committed",
+			uploadEvents: [expect.objectContaining({ eventId: event.eventId })],
+			writes: [],
+		})
+
+		failSegmentSync = true
+		await expect(new AiCodeStatsStore(tmpDir, options).getPendingEvents()).rejects.toThrow("segment fsync failed")
+		expect(JSON.parse(await fs.readFile(transactionPath, "utf8"))).toMatchObject({
+			status: "committed",
+			uploadEvents: [expect.objectContaining({ eventId: event.eventId })],
+		})
+
+		failSegmentSync = false
+		directoryDurable = true
+		await expect(new AiCodeStatsStore(tmpDir, options).getPendingEvents()).resolves.toEqual([
+			expect.objectContaining({ eventId: event.eventId }),
+		])
+		await expect(fs.access(transactionPath)).rejects.toMatchObject({ code: "ENOENT" })
+	})
+
+	it("does not replay committed store writes after Windows-style directory fsync degradation", async () => {
+		const baseDir = path.join(tmpDir, "ai-code-stats", "v1")
+		const firstEvent = buildUploadEvent("windows-committed-before-ack", 1_773_900_000_010)
+		const secondEvent = buildUploadEvent("windows-next-transaction", 1_773_900_000_011)
+		let directorySyncSupported = false
+		const syncDirectoryForTest = async () => directorySyncSupported
+		const degradedStore = new AiCodeStatsStore(tmpDir, { syncDirectory: syncDirectoryForTest })
+
+		await degradedStore.appendEvent(firstEvent)
+		const firstTombstone = JSON.parse(await fs.readFile(path.join(baseDir, "pending-transaction.json"), "utf8"))
+		expect(firstTombstone).toMatchObject({
+			version: 1,
+			status: "committed",
+			transactionId: expect.any(String),
+			writes: [],
+		})
+
+		directorySyncSupported = true
+		await degradedStore.markEventsUploaded([firstEvent.eventId])
+		expect(await degradedStore.getPendingEvents()).toEqual([])
+
+		directorySyncSupported = false
+		const restartedStore = new AiCodeStatsStore(tmpDir, { syncDirectory: syncDirectoryForTest })
+		expect(await restartedStore.getPendingEvents()).toEqual([])
+
+		await restartedStore.appendEvent(secondEvent)
+		const nextTombstone = JSON.parse(await fs.readFile(path.join(baseDir, "pending-transaction.json"), "utf8"))
+		expect(nextTombstone).toMatchObject({
+			status: "committed",
+			transactionId: expect.any(String),
+			writes: [],
+		})
+		expect(nextTombstone.transactionId).not.toBe(firstTombstone.transactionId)
+
+		const restartedAgain = new AiCodeStatsStore(tmpDir, { syncDirectory: syncDirectoryForTest })
+		expect((await restartedAgain.getPendingEvents()).map((event) => event.eventId)).toEqual([secondEvent.eventId])
+	})
+
+	it("retains every event from an unproven Windows segment and replays it after the segment is lost", async () => {
+		const baseDir = path.join(tmpDir, "ai-code-stats", "v1")
+		const queueDir = path.join(baseDir, "upload-events")
+		const syncDirectoryForTest = async () => false
+		const store = new AiCodeStatsStore(tmpDir, { syncDirectory: syncDirectoryForTest })
+		const firstEvent = buildUploadEvent("windows-unproven-first", 1_773_900_000_010)
+		const secondEvent = buildUploadEvent("windows-unproven-second", 1_773_900_000_011)
+
+		await store.appendEvent(firstEvent)
+		await store.appendEvent(secondEvent)
+
+		const retainedTransaction = JSON.parse(
+			await fs.readFile(path.join(baseDir, "pending-transaction.json"), "utf8"),
+		)
+		expect(retainedTransaction).toMatchObject({
+			status: "committed",
+			uploadEvents: [
+				expect.objectContaining({ eventId: firstEvent.eventId }),
+				expect.objectContaining({ eventId: secondEvent.eventId }),
+			],
+			writes: [],
+		})
+
+		const concurrentHostStore = new AiCodeStatsStore(tmpDir, { syncDirectory: syncDirectoryForTest })
+		expect((await concurrentHostStore.getPendingEvents()).map((event) => event.eventId)).toEqual([
+			firstEvent.eventId,
+			secondEvent.eventId,
+		])
+		const retainedAfterConcurrentHost = JSON.parse(
+			await fs.readFile(path.join(baseDir, "pending-transaction.json"), "utf8"),
+		)
+		expect(retainedAfterConcurrentHost.uploadEvents).toHaveLength(2)
+
+		// Emulate a crash in which the newly created segment directory entry was
+		// not persisted even though its file contents had been flushed.
+		await fs.rm(queueDir, { recursive: true, force: true })
+
+		const recoveredStore = new AiCodeStatsStore(tmpDir, { syncDirectory: syncDirectoryForTest })
+		expect((await recoveredStore.getPendingEvents()).map((event) => event.eventId)).toEqual([
+			firstEvent.eventId,
+			secondEvent.eventId,
+		])
+
+		const replayedTransaction = JSON.parse(
+			await fs.readFile(path.join(baseDir, "pending-transaction.json"), "utf8"),
+		)
+		expect(replayedTransaction.uploadEvents.map((event: AiCodeStatsEvent) => event.eventId)).toEqual([
+			firstEvent.eventId,
+			secondEvent.eventId,
+		])
 	})
 
 	it("separates a replayed event from an interrupted NDJSON tail", async () => {
@@ -516,6 +739,342 @@ describe("AiCodeStatsStore", () => {
 		const files = await fs.readdir(baseDir)
 		expect(files.some((fileName) => fileName.startsWith("queued-reports.json.corrupt-"))).toBe(true)
 		expect(JSON.parse(await fs.readFile(path.join(baseDir, "queued-reports.json"), "utf8"))).toEqual([])
+	})
+
+	it("durably quarantines unknown structural poison while dropping only explicit older semantics", async () => {
+		const baseDir = path.join(tmpDir, "ai-code-stats", "v1")
+		await fs.mkdir(baseDir, { recursive: true })
+		const healthy = buildQueuedReport({
+			report: {
+				...buildQueuedReport().report,
+				reportId: "healthy-structural-report",
+				commitHash: "healthy-structural-commit",
+			},
+		})
+		const missingReport = { createdAt: 1, generatedBlockIds: [] }
+		const malformedSemantics = {
+			...buildQueuedReport(),
+			report: {
+				...buildQueuedReport().report,
+				reportId: "malformed-semantics-report",
+				semanticsVersion: String(CURRENT_AI_CODE_STATS_SEMANTICS_VERSION),
+			},
+		}
+		const unknownFutureSemantics = {
+			...buildQueuedReport(),
+			report: {
+				...buildQueuedReport().report,
+				reportId: "unknown-future-semantics-report",
+				semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION + 1,
+			},
+		}
+		const explicitLegacy = {
+			...buildQueuedReport(),
+			report: {
+				...buildQueuedReport().report,
+				reportId: "explicit-legacy-report",
+				semanticsVersion: 1,
+			},
+		}
+		await fs.writeFile(
+			path.join(baseDir, "queued-reports.json"),
+			JSON.stringify([null, missingReport, malformedSemantics, unknownFutureSemantics, explicitLegacy, healthy]),
+			"utf8",
+		)
+
+		let reloadedStore = new AiCodeStatsStore(tmpDir)
+		expect((await reloadedStore.getQueuedReportsForTests()).map((queued) => queued.report.reportId)).toEqual([
+			"healthy-structural-report",
+		])
+		expect(await reloadedStore.getPendingEventCount()).toBe(4)
+		expect((await reloadedStore.getQuarantinedPendingFactStatus()).count).toBe(4)
+		expect((await reloadedStore.getCommitUploadDiagnostics()).quarantinedOutboxRecords).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ kind: "commit_report", sourceIndex: 0 }),
+				expect.objectContaining({ kind: "commit_report", sourceIndex: 1 }),
+				expect.objectContaining({ kind: "commit_report", reportId: "malformed-semantics-report" }),
+				expect.objectContaining({ kind: "commit_report", reportId: "unknown-future-semantics-report" }),
+			]),
+		)
+
+		await reloadedStore.queueCommitReport(
+			buildQueuedReport({
+				report: {
+					...buildQueuedReport().report,
+					reportId: "later-healthy-report",
+					commitHash: "later-healthy-commit",
+				},
+			}),
+		)
+		reloadedStore = new AiCodeStatsStore(tmpDir)
+		expect((await reloadedStore.getQueuedReportsForTests()).map((queued) => queued.report.reportId).sort()).toEqual(
+			["healthy-structural-report", "later-healthy-report"],
+		)
+		expect((await reloadedStore.getQuarantinedPendingFactStatus()).count).toBe(4)
+		const persisted = JSON.parse(await fs.readFile(path.join(baseDir, "queued-reports.json"), "utf8"))
+		expect(persisted).toEqual(
+			expect.arrayContaining([
+				null,
+				missingReport,
+				expect.objectContaining({
+					report: expect.objectContaining({ reportId: "malformed-semantics-report" }),
+				}),
+				expect.objectContaining({
+					report: expect.objectContaining({ reportId: "unknown-future-semantics-report" }),
+				}),
+			]),
+		)
+		expect(persisted.some((queued: any) => queued?.report?.reportId === "explicit-legacy-report")).toBe(false)
+	})
+
+	it("quarantines one poisoned pending line without deleting healthy lines on later persistence", async () => {
+		const baseDir = path.join(tmpDir, "ai-code-stats", "v1")
+		await fs.mkdir(baseDir, { recursive: true })
+		const healthy = buildPendingLine({ id: "healthy-pending-line" })
+		const poisoned = {
+			...buildPendingLine({
+				id: "poisoned-pending-line",
+				generatedEventId: "poisoned-generated-reference",
+				blockId: "poisoned-generated-reference",
+			}),
+			filePath: { invalid: "non-string-path" },
+		}
+		await fs.writeFile(
+			path.join(baseDir, "state.json"),
+			JSON.stringify({
+				version: 1,
+				pendingEventIds: [],
+				supersededEventIds: [],
+				repoObservedCommits: { "/repo": "observed-commit" },
+				lastUpload: { status: "idle" },
+			}),
+			"utf8",
+		)
+		await fs.writeFile(path.join(baseDir, "pending-lines.json"), JSON.stringify([poisoned, healthy]), "utf8")
+		await fs.writeFile(
+			path.join(baseDir, "generated-blocks.json"),
+			JSON.stringify([
+				buildGeneratedBlockState({
+					stateId: "poisoned-generated-reference",
+					eventId: "poisoned-generated-reference",
+					generatedBlockId: "poisoned-generated-reference",
+					uploadStatus: "uploaded",
+				}),
+			]),
+			"utf8",
+		)
+
+		let reloadedStore = new AiCodeStatsStore(tmpDir)
+		expect((await reloadedStore.getRawPendingLineAttributionsForTests()).map((line) => line.id)).toEqual([
+			"healthy-pending-line",
+		])
+		expect((await reloadedStore.getCommitUploadDiagnostics()).quarantinedOutboxRecords).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ kind: "pending_line", eventId: "poisoned-generated-reference" }),
+			]),
+		)
+		expect((await reloadedStore.getGeneratedBlocksForTests()).map((block) => block.generatedBlockId)).toEqual([
+			"poisoned-generated-reference",
+		])
+		expect(await reloadedStore.getRepoObservedCommit("/repo")).toBe("observed-commit")
+
+		await reloadedStore.addPendingLineAttributions([buildPendingLine({ id: "later-pending-line" })])
+		reloadedStore = new AiCodeStatsStore(tmpDir)
+		expect((await reloadedStore.getRawPendingLineAttributionsForTests()).map((line) => line.id).sort()).toEqual([
+			"healthy-pending-line",
+			"later-pending-line",
+		])
+		const persisted = JSON.parse(await fs.readFile(path.join(baseDir, "pending-lines.json"), "utf8"))
+		expect(persisted).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ id: "poisoned-pending-line", filePath: { invalid: "non-string-path" } }),
+			]),
+		)
+		expect((await reloadedStore.getCommitUploadDiagnostics()).quarantinedOutboxRecords).toEqual(
+			expect.arrayContaining([expect.objectContaining({ kind: "pending_line" })]),
+		)
+	})
+
+	it("quarantines one poisoned generated block and protects its snapshot across restart", async () => {
+		const baseDir = path.join(tmpDir, "ai-code-stats", "v1")
+		const snapshotHash = "poisoned-generated-snapshot"
+		await fs.mkdir(baseDir, { recursive: true })
+		await fs.writeFile(
+			path.join(baseDir, "snapshot-store.json"),
+			JSON.stringify({
+				[snapshotHash]: {
+					contentHash: snapshotHash,
+					content: "const poisoned = true\n",
+					length: 22,
+					lineCount: 1,
+					createdAt: 1,
+					lastUsedAt: 1,
+				},
+			}),
+			"utf8",
+		)
+		const healthy = buildGeneratedBlockState({
+			stateId: "healthy-generated",
+			eventId: "healthy-generated",
+			generatedBlockId: "healthy-generated",
+		})
+		const poisoned = {
+			...buildGeneratedBlockState({
+				stateId: "poisoned-generated",
+				eventId: "poisoned-generated",
+				generatedBlockId: "poisoned-generated",
+				fileSnapshotHash: snapshotHash,
+			}),
+			filePath: { invalid: "non-string-path" },
+		}
+		await fs.writeFile(path.join(baseDir, "generated-blocks.json"), JSON.stringify([poisoned, healthy]), "utf8")
+
+		let reloadedStore = new AiCodeStatsStore(tmpDir)
+		expect((await reloadedStore.getGeneratedBlocksForTests()).map((block) => block.stateId)).toEqual([
+			"healthy-generated",
+		])
+		expect((await reloadedStore.getSnapshotsForTests())[snapshotHash]).toMatchObject({ lastUsedAt: 1 })
+		expect((await reloadedStore.getCommitUploadDiagnostics()).quarantinedOutboxRecords).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ kind: "generated_block", eventId: "poisoned-generated" }),
+			]),
+		)
+
+		await reloadedStore.pruneOldData(30, Date.now())
+		reloadedStore = new AiCodeStatsStore(tmpDir)
+		expect((await reloadedStore.getGeneratedBlocksForTests()).map((block) => block.stateId)).toEqual([
+			"healthy-generated",
+		])
+		expect((await reloadedStore.getSnapshotsForTests())[snapshotHash]).toBeDefined()
+		const persisted = JSON.parse(await fs.readFile(path.join(baseDir, "generated-blocks.json"), "utf8"))
+		expect(persisted).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					stateId: "poisoned-generated",
+					filePath: { invalid: "non-string-path" },
+					fileSnapshotHash: snapshotHash,
+				}),
+			]),
+		)
+	})
+
+	it("quarantines one poisoned pending commit metric without deleting healthy metrics", async () => {
+		const baseDir = path.join(tmpDir, "ai-code-stats", "v1")
+		const snapshotHash = "poisoned-metric-snapshot"
+		await fs.mkdir(baseDir, { recursive: true })
+		await fs.writeFile(
+			path.join(baseDir, "snapshot-store.json"),
+			JSON.stringify({
+				[snapshotHash]: {
+					contentHash: snapshotHash,
+					content: "const metricPoison = true\n",
+					length: 26,
+					lineCount: 1,
+					createdAt: 1,
+					lastUsedAt: 1,
+				},
+			}),
+			"utf8",
+		)
+		const healthy = buildPendingCommitMetricBlock({
+			eventId: "healthy-metric",
+			generatedBlockId: "healthy-metric",
+		})
+		const poisoned = {
+			...buildPendingCommitMetricBlock({
+				eventId: "poisoned-metric",
+				generatedBlockId: "poisoned-metric",
+				fileSnapshotHash: snapshotHash,
+			}),
+			filePath: { invalid: "non-string-path" },
+		}
+		await fs.writeFile(
+			path.join(baseDir, "pending-commit-metric-blocks.json"),
+			JSON.stringify([poisoned, healthy]),
+			"utf8",
+		)
+
+		let reloadedStore = new AiCodeStatsStore(tmpDir)
+		expect((await reloadedStore.getPendingCommitMetricBlocksForTests()).map((block) => block.eventId)).toEqual([
+			"healthy-metric",
+		])
+		expect((await reloadedStore.getSnapshotsForTests())[snapshotHash]).toMatchObject({ lastUsedAt: 1 })
+		expect((await reloadedStore.getCommitUploadDiagnostics()).quarantinedOutboxRecords).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ kind: "pending_commit_metric_block", eventId: "poisoned-metric" }),
+			]),
+		)
+
+		await reloadedStore.addPendingCommitMetricBlocks([
+			buildPendingCommitMetricBlock({ eventId: "later-metric", generatedBlockId: "later-metric" }),
+		])
+		reloadedStore = new AiCodeStatsStore(tmpDir)
+		expect(
+			(await reloadedStore.getPendingCommitMetricBlocksForTests()).map((block) => block.eventId).sort(),
+		).toEqual(["healthy-metric", "later-metric"])
+		expect((await reloadedStore.getSnapshotsForTests())[snapshotHash]).toBeDefined()
+		const persisted = JSON.parse(await fs.readFile(path.join(baseDir, "pending-commit-metric-blocks.json"), "utf8"))
+		expect(persisted).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					eventId: "poisoned-metric",
+					filePath: { invalid: "non-string-path" },
+					fileSnapshotHash: snapshotHash,
+				}),
+			]),
+		)
+	})
+
+	it("quarantines one poisoned commit upload record without deleting healthy diagnostics", async () => {
+		const baseDir = path.join(tmpDir, "ai-code-stats", "v1")
+		await fs.mkdir(baseDir, { recursive: true })
+		const healthy = {
+			id: "healthy-record",
+			commitHash: "healthy-commit",
+			repoRoot: "/repo",
+			status: "upload_failed",
+			createdAt: 1,
+			updatedAt: 1,
+		}
+		const poisoned = {
+			...healthy,
+			id: "poisoned-record",
+			commitHash: "poisoned-commit",
+			repoRoot: { invalid: "non-string-path" },
+		}
+		await fs.writeFile(
+			path.join(baseDir, "commit-upload-records.json"),
+			JSON.stringify([poisoned, healthy]),
+			"utf8",
+		)
+
+		let reloadedStore = new AiCodeStatsStore(tmpDir)
+		expect((await reloadedStore.getCommitUploadRecords()).map((record) => record.id)).toEqual(["healthy-record"])
+		expect((await reloadedStore.getCommitUploadDiagnostics()).quarantinedOutboxRecords).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ kind: "commit_upload_record", commitHash: "poisoned-commit" }),
+			]),
+		)
+
+		await reloadedStore.upsertCommitUploadRecord({
+			commitHash: "later-commit",
+			repoRoot: "/repo",
+			status: "upload_failed",
+		})
+		reloadedStore = new AiCodeStatsStore(tmpDir)
+		expect((await reloadedStore.getCommitUploadRecords()).map((record) => record.commitHash).sort()).toEqual([
+			"healthy-commit",
+			"later-commit",
+		])
+		const persisted = JSON.parse(await fs.readFile(path.join(baseDir, "commit-upload-records.json"), "utf8"))
+		expect(persisted).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					id: "poisoned-record",
+					repoRoot: { invalid: "non-string-path" },
+				}),
+			]),
+		)
 	})
 
 	it("reloads durable state after a persistence failure instead of leaking rejected in-memory mutations", async () => {

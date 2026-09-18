@@ -1,5 +1,5 @@
 import crypto from "crypto"
-import { exec as execCallback } from "child_process"
+import { execFile as execFileCallback } from "child_process"
 import * as fs from "fs/promises"
 import * as path from "path"
 import { promisify } from "util"
@@ -52,8 +52,9 @@ import {
 	type AiCodeStatsUploadSettings,
 } from "./types"
 
-const execAsync = promisify(execCallback)
+const execFileAsync = promisify(execFileCallback)
 const EXEC_MAX_BUFFER_BYTES = 4 * 1024 * 1024
+const FULL_GIT_OBJECT_ID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i
 const COMMIT_UPLOAD_SCAN_INTERVAL_MS = 5 * 60 * 1000
 const COMMIT_UPLOAD_SCAN_MAX_COMMITS = 50
 const COMMIT_UPLOAD_SCAN_RETENTION_DAYS = 30
@@ -77,6 +78,9 @@ const normalizeContentLines = (content: string): string[] => {
 	}
 	return lines
 }
+
+const hasMeaningfulAttributionContent = (content: string | undefined): boolean =>
+	typeof content === "string" && content.trim().length > 0
 
 const buildLineOccurrenceIndexes = (content: string): number[] => {
 	const counts = new Map<string, number>()
@@ -119,7 +123,6 @@ interface GeneratedStateBuildResult {
 
 interface AgentWriteBlockAnalysis {
 	acceptedBlocks: AiCodeAddedCodeBlock[]
-	acceptedDeletedBlocks: AiCodeAddedCodeBlock[]
 }
 
 interface CommitReportBuildOptions {
@@ -139,7 +142,6 @@ interface LocalCommitSummary {
 interface CommitCandidateSelection {
 	changedPathSet: Set<string>
 	addedLineHashesByPath: Map<string, Set<string>>
-	deletedLineHashesByPath: Map<string, Set<string>>
 	candidateBlocks: AiCodeGeneratedBlockState[]
 }
 
@@ -194,7 +196,7 @@ const resolveFilePathFromParent = async (targetPath: string): Promise<string> =>
 
 const resolveGitRepositoryRoot = async (cwd: string): Promise<string | undefined> => {
 	try {
-		const { stdout } = await execAsync("git rev-parse --show-toplevel", {
+		const { stdout } = await execFileAsync("git", ["rev-parse", "--show-toplevel"], {
 			cwd,
 			maxBuffer: EXEC_MAX_BUFFER_BYTES,
 		})
@@ -341,7 +343,12 @@ export class AiCodeStatsService {
 			finalAcceptedContent: record.newContent,
 			filePath: context.repoRelativePath,
 		})
-		if (blockAnalysis.acceptedBlocks.length === 0 && blockAnalysis.acceptedDeletedBlocks.length === 0) {
+		const existingPendingBlocks = await this.getPendingGeneratedBlocksForContext(
+			context.filePath,
+			record.taskId,
+			"agent_insert",
+		)
+		if (blockAnalysis.acceptedBlocks.length === 0 && existingPendingBlocks.length === 0) {
 			return
 		}
 		const timestamp = Date.now()
@@ -357,15 +364,9 @@ export class AiCodeStatsService {
 		}
 		// kilocode_change end
 
-		const existingPendingBlocks = await this.getPendingGeneratedBlocksForContext(
-			context.filePath,
-			record.taskId,
-			"agent_insert",
-		)
 		const existingAdditionBlocks = existingPendingBlocks.filter(
 			(block) => (block.changeType ?? "addition") === "addition",
 		)
-		const existingDeletionBlocks = existingPendingBlocks.filter((block) => block.changeType === "deletion")
 		const patchHunks = this.extractor.extractPatchHunks(
 			record.originalContent,
 			record.newContent,
@@ -385,62 +386,18 @@ export class AiCodeStatsService {
 			modelContext,
 		})
 
-		const deletionBlockStates = blockAnalysis.acceptedDeletedBlocks
-			.filter((deletedBlock) => deletedBlock.codeSnippet.trim().length > 0)
-			.map((deletedBlock) =>
-				this.createDeletionBlockState({
-					timestamp,
-					filePath: context.filePath,
-					repoRoot: context.repoRoot,
-					repoRelativePath: context.repoRelativePath,
-					taskId: record.taskId,
-					metadata,
-					modelContext,
-					originalContent: record.originalContent,
-					deletedBlock,
-				}),
-			)
-		const deletionMetricBlocks = deletionBlockStates.map((block) =>
-			this.createGeneratedMetricBlock({
-				generatedBlockId: block.generatedBlockId,
-				timestamp,
-				sourceType: block.sourceType,
-				filePath: block.filePath,
-				repoRoot: block.repoRoot || context.repoRoot,
-				repoRelativePath: block.repoRelativePath || context.repoRelativePath,
-				taskId: block.taskId,
-				metadata,
-				modelContext,
-				fileSnapshotContent: record.originalContent,
-				lineStart: block.lineStart,
-				lineEnd: block.lineEnd,
-				codeSnippet: block.codeSnippet,
-				changeType: "deletion",
-			}),
-		)
 		const lineOccurrenceIndexes = buildLineOccurrenceIndexes(record.newContent)
 		const pendingLineAttributions = nextBlocks.nextBlocks.flatMap((block) =>
 			this.buildPendingLineAttributions(block, lineOccurrenceIndexes),
-		)
-		const originalLineOccurrenceIndexes =
-			deletionBlockStates.length > 0 ? buildLineOccurrenceIndexes(record.originalContent) : []
-		const deletionPendingLines = deletionBlockStates.flatMap((block) =>
-			this.buildDeletionPendingLineAttributions(block, originalLineOccurrenceIndexes),
-		)
-		const carriedDeletionPendingLines = await this.getPendingDeletionLinesForContext(
-			context.repoRoot,
-			context.filePath,
-			record.taskId,
-			"agent_insert",
 		)
 
 		await this.store.replaceGeneratedStateForContext({
 			filePath: context.filePath,
 			taskId: record.taskId,
 			sourceType: "agent_insert",
-			nextBlocks: [...nextBlocks.nextBlocks, ...existingDeletionBlocks, ...deletionBlockStates],
-			nextPendingLines: [...pendingLineAttributions, ...carriedDeletionPendingLines, ...deletionPendingLines],
-			nextPendingCommitMetricBlocks: [...nextBlocks.metricBlocks, ...deletionMetricBlocks],
+			nextBlocks: nextBlocks.nextBlocks,
+			nextPendingLines: pendingLineAttributions,
+			nextPendingCommitMetricBlocks: nextBlocks.metricBlocks,
 		})
 		await this.commitAttributionService.refreshRepoTracking(context.repoRoot)
 	}
@@ -663,6 +620,10 @@ export class AiCodeStatsService {
 					client: this.buildUploadClient(),
 					records: diagnostics.records.map((record) => this.redactCommitUploadRecord(record)),
 					blockedEvents: diagnostics.blockedEvents,
+					quarantinedOutboxRecords: diagnostics.quarantinedOutboxRecords.map((record) => ({
+						...record,
+						repoRoot: record.repoRoot ? this.redactRepoRoot(record.repoRoot) : undefined,
+					})),
 					events: diagnostics.events.map((event) => ({
 						...event,
 						repoRoot: event.repoRoot ? this.redactRepoRoot(event.repoRoot) : undefined,
@@ -688,7 +649,10 @@ export class AiCodeStatsService {
 			this.store.getCommitUploadRecords(),
 		])
 		const candidateBlocks = generatedBlocks.filter(
-			(block) => block.repoRoot && (block.uploadStatus === "pending" || block.uploadStatus === "uploaded"),
+			(block) =>
+				block.changeType !== "deletion" &&
+				block.repoRoot &&
+				(block.uploadStatus === "pending" || block.uploadStatus === "uploaded"),
 		)
 		const repoRoots = new Set<string>()
 		for (const block of candidateBlocks) {
@@ -741,6 +705,19 @@ export class AiCodeStatsService {
 				commitsToQuery.set(summary.commitHash, summary)
 			}
 			for (const record of existingForRepo) {
+				if (!FULL_GIT_OBJECT_ID_PATTERN.test(record.commitHash.trim())) {
+					await this.store.appendDiagnosticEvent({
+						type: "report_skipped",
+						commitHash: record.commitHash,
+						reportId: record.reportId,
+						repoRoot,
+						message: "stored commit hash is not a full Git object id",
+						details: {
+							reason: "invalid_commit_hash",
+						},
+					})
+					continue
+				}
 				if (!commitsToQuery.has(record.commitHash)) {
 					commitsToQuery.set(
 						record.commitHash,
@@ -1131,8 +1108,9 @@ export class AiCodeStatsService {
 
 	private async listRecentCommitSummaries(repoRoot: string): Promise<LocalCommitSummary[]> {
 		const since = new Date(Date.now() - COMMIT_UPLOAD_SCAN_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString()
-		const { stdout } = await execAsync(
-			`git rev-list --max-count=${COMMIT_UPLOAD_SCAN_MAX_COMMITS} --since=${JSON.stringify(since)} HEAD`,
+		const { stdout } = await execFileAsync(
+			"git",
+			["rev-list", `--max-count=${COMMIT_UPLOAD_SCAN_MAX_COMMITS}`, `--since=${since}`, "HEAD", "--"],
 			{
 				cwd: repoRoot,
 				maxBuffer: EXEC_MAX_BUFFER_BYTES,
@@ -1144,16 +1122,27 @@ export class AiCodeStatsService {
 			.filter(Boolean)
 		const summaries: LocalCommitSummary[] = []
 		for (const commitHash of commitHashes) {
+			if (!FULL_GIT_OBJECT_ID_PATTERN.test(commitHash)) {
+				throw new Error("git rev-list returned a non-full object id")
+			}
 			summaries.push(await this.loadCommitSummary(repoRoot, commitHash))
 		}
 		return summaries
 	}
 
 	private async loadCommitSummary(repoRoot: string, commitHash: string): Promise<LocalCommitSummary> {
-		const { stdout } = await execAsync(`git show --format=%ct --numstat --find-renames ${commitHash}`, {
-			cwd: repoRoot,
-			maxBuffer: EXEC_MAX_BUFFER_BYTES,
-		})
+		const normalizedCommitHash = commitHash.trim()
+		if (!FULL_GIT_OBJECT_ID_PATTERN.test(normalizedCommitHash)) {
+			throw new Error("commit summary hash is not a full Git object id")
+		}
+		const { stdout } = await execFileAsync(
+			"git",
+			["show", "--format=%ct", "--numstat", "--find-renames", normalizedCommitHash, "--"],
+			{
+				cwd: repoRoot,
+				maxBuffer: EXEC_MAX_BUFFER_BYTES,
+			},
+		)
 		const lines = stdout.split(/\r?\n/).filter((line) => line.trim().length > 0)
 		const seconds = Number.parseInt(lines[0] ?? "", 10)
 		const changedPaths = new Set<string>()
@@ -1174,7 +1163,7 @@ export class AiCodeStatsService {
 			changedFileCount += 1
 		}
 		return {
-			commitHash,
+			commitHash: normalizedCommitHash,
 			commitOccurredAt: Number.isFinite(seconds) ? seconds * 1000 : undefined,
 			changedPaths,
 			addedLineCount,
@@ -1199,6 +1188,9 @@ export class AiCodeStatsService {
 
 	private hasRetainedCandidateForCommit(blocks: AiCodeGeneratedBlockState[], summary: LocalCommitSummary): boolean {
 		return blocks.some((block) => {
+			if (block.changeType === "deletion") {
+				return false
+			}
 			if (this.isAfterCommitTimestamp(block.timestamp, summary.commitOccurredAt)) {
 				return false
 			}
@@ -1250,12 +1242,6 @@ export class AiCodeStatsService {
 			params.proposedContent,
 			params.filePath,
 		)
-		const proposedDeletedBlocks = this.extractor.extractDeletedBlocks(
-			params.originalContent,
-			params.proposedContent,
-			params.filePath,
-		)
-
 		const acceptedBlocks =
 			proposedGeneratedBlocks.length > 0
 				? this.extractor.extractAddedBlocks(
@@ -1264,149 +1250,9 @@ export class AiCodeStatsService {
 						params.filePath,
 					)
 				: []
-		const acceptedDeletedBlocks =
-			proposedDeletedBlocks.length > 0
-				? this.extractor.extractDeletedBlocks(
-						params.originalContent,
-						params.finalAcceptedContent,
-						params.filePath,
-					)
-				: []
-
 		return {
 			acceptedBlocks,
-			acceptedDeletedBlocks,
 		}
-	}
-
-	private createDeletionBlockState(params: {
-		timestamp: number
-		filePath: string
-		repoRoot: string
-		repoRelativePath: string
-		taskId?: string
-		metadata: Awaited<ReturnType<AiCodeStatsMetadataResolver["resolve"]>>
-		modelContext?: AiCodeModelContext
-		originalContent: string
-		deletedBlock: AiCodeAddedCodeBlock
-	}): AiCodeGeneratedBlockState {
-		const generatedBlockId = crypto.randomUUID()
-		const stateId = crypto.randomUUID()
-		const codeSnippet = params.deletedBlock.codeSnippet
-		return {
-			stateId,
-			eventId: stateId,
-			generatedBlockId,
-			timestamp: params.timestamp,
-			semanticsVersion: CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
-			sourceType: "agent_insert",
-			ide: this.ide,
-			changeType: "deletion",
-			userName: params.metadata.userName,
-			departmentName: params.metadata.departmentName,
-			officeName: params.metadata.officeName,
-			teamName: params.metadata.teamName,
-			userEmail: params.metadata.userEmail,
-			organizationId: params.metadata.organizationId,
-			organizationName: params.metadata.organizationName,
-			sourceIp: params.metadata.sourceIp,
-			provider: params.modelContext?.provider,
-			model: params.modelContext?.model,
-			projectKey: params.metadata.projectKey,
-			projectName: params.metadata.projectName,
-			filePath: params.filePath,
-			relativePath: params.repoRelativePath,
-			repoRoot: params.repoRoot,
-			repoRelativePath: params.repoRelativePath,
-			language: params.metadata.language,
-			gitRemoteUrl: params.metadata.gitRemoteUrl,
-			gitBranch: params.metadata.gitBranch,
-			lineStart: params.deletedBlock.lineStart,
-			lineEnd: params.deletedBlock.lineEnd,
-			lineCount: params.deletedBlock.lineCount,
-			codeSnippet,
-			fileSnapshotContent: params.originalContent,
-			originEventId: `${stateId}:generated`,
-			originTimestamp: params.timestamp,
-			originLineStart: params.deletedBlock.lineStart,
-			originLineEnd: params.deletedBlock.lineEnd,
-			originLineCount: params.deletedBlock.lineCount,
-			originCodeSnippet: codeSnippet,
-			originFileSnapshotContent: params.originalContent,
-			currentTimestamp: params.timestamp,
-			currentLineStart: params.deletedBlock.lineStart,
-			currentLineEnd: params.deletedBlock.lineEnd,
-			currentLineCount: params.deletedBlock.lineCount,
-			currentCodeSnippet: codeSnippet,
-			currentFileSnapshotContent: params.originalContent,
-			taskId: params.taskId,
-			uploadStatus: "pending",
-		}
-	}
-
-	private buildDeletionPendingLineAttributions(
-		block: AiCodeGeneratedBlockState,
-		originalLineOccurrenceIndexes: number[],
-	): AiCodePendingLineAttribution[] {
-		const lines = normalizeContentLines(block.codeSnippet)
-
-		return lines.map((line, index) => {
-			const lineNumber = block.lineStart + index
-			const occurrenceIndex = originalLineOccurrenceIndexes[lineNumber - 1] ?? index + 1
-			return {
-				id: crypto.randomUUID(),
-				generatedEventId: block.generatedBlockId,
-				blockId: block.generatedBlockId,
-				timestamp: block.timestamp,
-				sourceType: block.sourceType,
-				ide: block.ide,
-				userName: block.userName,
-				departmentName: block.departmentName,
-				officeName: block.officeName,
-				teamName: block.teamName,
-				userEmail: block.userEmail,
-				organizationId: block.organizationId,
-				organizationName: block.organizationName,
-				sourceIp: block.sourceIp,
-				provider: block.provider,
-				model: block.model,
-				projectKey: block.projectKey,
-				projectName: block.projectName,
-				filePath: block.filePath,
-				relativePath: block.relativePath,
-				repoRoot: block.repoRoot || "",
-				repoRelativePath: block.repoRelativePath || block.relativePath,
-				language: block.language,
-				gitRemoteUrl: block.gitRemoteUrl,
-				gitBranch: block.gitBranch,
-				taskId: block.taskId,
-				rawLine: line,
-				blockLineIndex: index + 1,
-				blockLineCount: lines.length,
-				lineHash: hashLineFingerprint(line),
-				occurrenceIndex,
-				changeType: "deletion",
-				lineNumber,
-			}
-		})
-	}
-
-	private async getPendingDeletionLinesForContext(
-		repoRoot: string,
-		filePath: string,
-		taskId: string | undefined,
-		sourceType: AiCodePendingLineAttribution["sourceType"],
-	): Promise<AiCodePendingLineAttribution[]> {
-		const normalizedFilePath = normalizePath(path.resolve(filePath))
-		const normalizedTaskId = taskId?.trim() || ""
-		const pendingLines = await this.store.getPendingLineAttributions(repoRoot)
-		return pendingLines.filter(
-			(line) =>
-				line.changeType === "deletion" &&
-				normalizePath(path.resolve(line.filePath)) === normalizedFilePath &&
-				(line.taskId?.trim() || "") === normalizedTaskId &&
-				line.sourceType === sourceType,
-		)
 	}
 
 	private buildPendingLineAttributions(
@@ -1498,7 +1344,6 @@ export class AiCodeStatsService {
 			gitBranch: reportBranch,
 			commitHash: payload.commitHash,
 			addedLineHashesByPath: selection.addedLineHashesByPath,
-			deletedLineHashesByPath: selection.deletedLineHashesByPath,
 		})
 
 		const reportGeneratedAt = Date.now()
@@ -1618,8 +1463,7 @@ export class AiCodeStatsService {
 
 	private async selectCommitCandidateBlocks(payload: AiCodeCommitFactsPayload): Promise<CommitCandidateSelection> {
 		const changedPathSet = this.buildCommitChangedPathSet(payload)
-		const addedLineHashesByPath = this.buildChangedLineHashesByPath(payload, "addition")
-		const deletedLineHashesByPath = this.buildChangedLineHashesByPath(payload, "deletion")
+		const addedLineHashesByPath = this.buildAddedLineHashesByPath(payload)
 		const normalizedRepoRoot = normalizePath(payload.repoRoot)
 		const allBlocks = (await this.store.getGeneratedBlockStates()).filter(
 			(block) => block.repoRoot === normalizedRepoRoot || block.repoRoot === payload.repoRoot,
@@ -1627,7 +1471,16 @@ export class AiCodeStatsService {
 		const pendingLines = await this.store.getPendingLineAttributions(payload.repoRoot)
 		const uploadedBlockIdsWithAddedLineMatch = new Set<string>()
 		for (const pendingLine of pendingLines) {
+			if (pendingLine.changeType === "deletion") {
+				continue
+			}
 			if (this.isAfterCommitTimestamp(pendingLine.timestamp, payload.commitOccurredAt)) {
+				continue
+			}
+			// Whitespace has one universal fingerprint and therefore cannot prove that an
+			// already-uploaded Kilo block belongs to this later commit. It may only travel
+			// with a block that has an independently matched non-whitespace line.
+			if (!hasMeaningfulAttributionContent(pendingLine.rawLine)) {
 				continue
 			}
 			const generatedBlockId = normalizeGeneratedBlockId(pendingLine.generatedEventId || pendingLine.blockId)
@@ -1638,16 +1491,16 @@ export class AiCodeStatsService {
 			if (!repoRelativePath || !changedPathSet.has(repoRelativePath)) {
 				continue
 			}
-			const matchHashes =
-				pendingLine.changeType === "deletion"
-					? deletedLineHashesByPath.get(repoRelativePath)
-					: addedLineHashesByPath.get(repoRelativePath)
+			const matchHashes = addedLineHashesByPath.get(repoRelativePath)
 			if (matchHashes?.has(pendingLine.lineHash)) {
 				uploadedBlockIdsWithAddedLineMatch.add(generatedBlockId)
 			}
 		}
 
 		const candidateBlocks = allBlocks.filter((block) => {
+			if (block.changeType === "deletion") {
+				return false
+			}
 			if (block.uploadStatus !== "pending" && block.uploadStatus !== "uploaded") {
 				return false
 			}
@@ -1665,14 +1518,13 @@ export class AiCodeStatsService {
 			}
 			return (
 				uploadedBlockIdsWithAddedLineMatch.has(block.generatedBlockId) ||
-				this.generatedBlockHasChangedLineMatch(block, addedLineHashesByPath, deletedLineHashesByPath)
+				this.generatedBlockHasAddedLineMatch(block, addedLineHashesByPath)
 			)
 		})
 
 		return {
 			changedPathSet,
 			addedLineHashesByPath,
-			deletedLineHashesByPath,
 			candidateBlocks,
 		}
 	}
@@ -1683,14 +1535,11 @@ export class AiCodeStatsService {
 		)
 	}
 
-	private buildChangedLineHashesByPath(
-		payload: AiCodeCommitFactsPayload,
-		changeType: "addition" | "deletion",
-	): Map<string, Set<string>> {
+	private buildAddedLineHashesByPath(payload: AiCodeCommitFactsPayload): Map<string, Set<string>> {
 		const hashesByPath = new Map<string, Set<string>>()
 		for (const file of payload.changedFiles || []) {
 			const paths = this.resolveChangedFileRepoPaths(payload.repoRoot, file)
-			const lines = changeType === "deletion" ? file.deletedLines : file.addedLines
+			const lines = file.addedLines
 			if (paths.length === 0 || !lines || lines.length === 0) {
 				continue
 			}
@@ -1709,24 +1558,25 @@ export class AiCodeStatsService {
 		return hashesByPath
 	}
 
-	private generatedBlockHasChangedLineMatch(
+	private generatedBlockHasAddedLineMatch(
 		block: AiCodeGeneratedBlockState,
 		addedLineHashesByPath: Map<string, Set<string>>,
-		deletedLineHashesByPath: Map<string, Set<string>>,
 	): boolean {
+		if (block.changeType === "deletion") {
+			return false
+		}
 		const repoRelativePath = normalizePath(block.repoRelativePath || block.relativePath || "")
 		if (!repoRelativePath) {
 			return false
 		}
-		const isDeletionBlock = block.changeType === "deletion"
-		const matchHashes = isDeletionBlock
-			? deletedLineHashesByPath.get(repoRelativePath)
-			: addedLineHashesByPath.get(repoRelativePath)
+		const matchHashes = addedLineHashesByPath.get(repoRelativePath)
 		if (!matchHashes || matchHashes.size === 0) {
 			return false
 		}
 		const content = block.currentCodeSnippet ?? block.codeSnippet ?? ""
-		return normalizeContentLines(content).some((line) => matchHashes.has(hashLineFingerprint(line)))
+		return normalizeContentLines(content).some(
+			(line) => hasMeaningfulAttributionContent(line) && matchHashes.has(hashLineFingerprint(line)),
+		)
 	}
 
 	private buildCommitCandidateLineId(parts: Array<string | number | undefined>): string {
@@ -1769,7 +1619,6 @@ export class AiCodeStatsService {
 		gitBranch?: string
 		commitHash: string
 		addedLineHashesByPath: Map<string, Set<string>>
-		deletedLineHashesByPath: Map<string, Set<string>>
 	}): Promise<AiCodeCommitCandidateLine[]> {
 		const pendingBlockIds = new Set(params.pendingGeneratedBlocks.map((block) => block.generatedBlockId))
 		if (pendingBlockIds.size === 0) {
@@ -1800,8 +1649,17 @@ export class AiCodeStatsService {
 		}
 
 		const pendingLines = await this.store.getPendingLineAttributions(params.repoRoot)
+		const blockIdsWithMeaningfulChangedLineMatch = new Set(
+			params.pendingGeneratedBlocks
+				.filter((block) => this.generatedBlockHasAddedLineMatch(block, params.addedLineHashesByPath))
+				.map((block) => normalizeGeneratedBlockId(block.generatedBlockId))
+				.filter(Boolean),
+		)
 		const candidateLines: AiCodeCommitCandidateLine[] = []
 		for (const pendingLine of pendingLines) {
+			if (pendingLine.changeType === "deletion") {
+				continue
+			}
 			const generatedBlockId = normalizeGeneratedBlockId(pendingLine.generatedEventId || pendingLine.blockId)
 			if (!generatedBlockId || !pendingBlockIds.has(generatedBlockId)) {
 				continue
@@ -1810,22 +1668,22 @@ export class AiCodeStatsService {
 			if (params.changedPathSet.size > 0 && (!repoRelativePath || !params.changedPathSet.has(repoRelativePath))) {
 				continue
 			}
-			const isDeletionLine = pendingLine.changeType === "deletion"
+			if (
+				!hasMeaningfulAttributionContent(pendingLine.rawLine) &&
+				!blockIdsWithMeaningfulChangedLineMatch.has(generatedBlockId)
+			) {
+				continue
+			}
 			if (uploadedBlockIds.has(generatedBlockId)) {
-				const matchHashes = isDeletionLine
-					? params.deletedLineHashesByPath.get(repoRelativePath)
-					: params.addedLineHashesByPath.get(repoRelativePath)
+				const matchHashes = params.addedLineHashesByPath.get(repoRelativePath)
 				if (!matchHashes?.has(pendingLine.lineHash)) {
 					continue
 				}
 			}
 
 			const lineStart = lineStartsByBlockId.get(generatedBlockId)
-			const lineNumber = isDeletionLine
-				? (pendingLine.lineNumber ?? pendingLine.blockLineIndex)
-				: typeof lineStart === "number"
-					? lineStart + pendingLine.blockLineIndex - 1
-					: pendingLine.blockLineIndex
+			const lineNumber =
+				typeof lineStart === "number" ? lineStart + pendingLine.blockLineIndex - 1 : pendingLine.blockLineIndex
 			candidateLines.push({
 				clientLineId: this.buildCommitCandidateLineId([
 					params.commitHash,
@@ -1875,6 +1733,9 @@ export class AiCodeStatsService {
 			),
 		)
 		for (const block of params.pendingGeneratedBlocks) {
+			if (block.changeType === "deletion") {
+				continue
+			}
 			const generatedBlockId = normalizeGeneratedBlockId(block.generatedBlockId)
 			if (!generatedBlockId || !uploadedBlockIds.has(generatedBlockId)) {
 				continue
@@ -1883,10 +1744,7 @@ export class AiCodeStatsService {
 			if (params.changedPathSet.size > 0 && (!repoRelativePath || !params.changedPathSet.has(repoRelativePath))) {
 				continue
 			}
-			const isDeletionBlock = block.changeType === "deletion"
-			const matchHashes = isDeletionBlock
-				? params.deletedLineHashesByPath.get(repoRelativePath)
-				: params.addedLineHashesByPath.get(repoRelativePath)
+			const matchHashes = params.addedLineHashesByPath.get(repoRelativePath)
 			if (!matchHashes || matchHashes.size === 0) {
 				continue
 			}
@@ -1896,6 +1754,12 @@ export class AiCodeStatsService {
 			const occurrenceCounts = new Map<string, number>()
 			for (let index = 0; index < contentLines.length; index += 1) {
 				const rawLine = contentLines[index]
+				if (
+					!hasMeaningfulAttributionContent(rawLine) &&
+					!blockIdsWithMeaningfulChangedLineMatch.has(generatedBlockId)
+				) {
+					continue
+				}
 				const lineHash = hashLineFingerprint(rawLine)
 				const occurrenceIndex = (occurrenceCounts.get(lineHash) ?? 0) + 1
 				occurrenceCounts.set(lineHash, occurrenceIndex)
@@ -1908,11 +1772,7 @@ export class AiCodeStatsService {
 				}
 				candidateLineKeys.add(candidateLineKey)
 				const blockLineIndex = index + 1
-				const lineNumber = isDeletionBlock
-					? blockLineIndex
-					: typeof lineStart === "number"
-						? lineStart + blockLineIndex - 1
-						: blockLineIndex
+				const lineNumber = typeof lineStart === "number" ? lineStart + blockLineIndex - 1 : blockLineIndex
 				candidateLines.push({
 					clientLineId: this.buildCommitCandidateLineId([
 						params.commitHash,
@@ -2872,6 +2732,17 @@ export class AiCodeStatsService {
 				[eventUploadError, blockedEventMessage]
 					.filter((message): message is string => Boolean(message))
 					.join("; ") || undefined
+			const quarantinedFactStatus = await this.store.getQuarantinedPendingFactStatus()
+			const quarantinedFactMessage =
+				quarantinedFactStatus.count > 0
+					? `${quarantinedFactStatus.count} quarantined local fact(s) require manual repair: ${quarantinedFactStatus.summaries
+							.map((summary) => `${summary.kind} (${summary.count})`)
+							.join(", ")}`
+					: undefined
+			const effectiveLocalFactUploadError =
+				[effectiveEventUploadError, quarantinedFactMessage]
+					.filter((message): message is string => Boolean(message))
+					.join("; ") || undefined
 
 			const failedReports =
 				reportUploadResult.failedReports +
@@ -2887,7 +2758,9 @@ export class AiCodeStatsService {
 				lifecycleUploadResult.failedReportErrors.length > 0
 					? `${lifecycleUploadResult.failedReportErrors.length} queued lifecycle report(s) failed`
 					: undefined,
-				effectiveEventUploadError ? `AI code stats upload failed: ${effectiveEventUploadError}` : undefined,
+				effectiveLocalFactUploadError
+					? `AI code stats upload failed: ${effectiveLocalFactUploadError}`
+					: undefined,
 			].filter((message): message is string => Boolean(message))
 			const lastUpload: AiCodeStatsLastUpload = {
 				status: failureMessages.length > 0 ? "failed" : "success",
@@ -2899,10 +2772,13 @@ export class AiCodeStatsService {
 					...reportUploadResult.failedReportErrors,
 					...lifecycleUploadResult.failedReportErrors,
 				],
-				eventUploadFailed: Boolean(effectiveEventUploadError),
-				eventUploadError: effectiveEventUploadError,
+				eventUploadFailed: Boolean(effectiveLocalFactUploadError),
+				eventUploadError: effectiveLocalFactUploadError,
 				blockedEvents: blockedEventById.size || undefined,
 				blockedEventReasons: blockedEventReasons.length > 0 ? blockedEventReasons : undefined,
+				quarantinedFacts: quarantinedFactStatus.count || undefined,
+				quarantinedFactReasons:
+					quarantinedFactStatus.summaries.length > 0 ? quarantinedFactStatus.summaries : undefined,
 				message: failureMessages.length > 0 ? failureMessages.join("; ") : undefined,
 				rawPayloadBytes: reportUploadResult.rawPayloadBytes + lifecycleUploadResult.rawPayloadBytes,
 				compressedPayloadBytes:

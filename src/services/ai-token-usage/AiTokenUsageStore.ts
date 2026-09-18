@@ -9,10 +9,13 @@ import {
 	AI_TOKEN_USAGE_VERSION,
 	buildAggregateKey,
 	buildUserKey,
+	classifyUserEmail,
+	isReassignableAnonymousIdentity,
 	normalizeConfiguredUserEmail,
 	toLocalDateKey,
 	type AiTokenUsageAggregateRow,
 	type AiTokenUsagePersistedState,
+	type AiTokenUsageQuarantinedRow,
 	type AiTokenUsageRecordInput,
 	type AiTokenUsageRange,
 	type AiTokenUsageSummary,
@@ -43,7 +46,111 @@ export interface AiTokenUsageUploadIssueUpdate {
 const emptyState = (): AiTokenUsagePersistedState => ({
 	version: AI_TOKEN_USAGE_VERSION,
 	rows: {},
+	quarantinedRows: {},
 })
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+	typeof value === "object" && value !== null && !Array.isArray(value)
+
+const requiredStringFields = [
+	"key",
+	"dateKey",
+	"timezone",
+	"userName",
+	"sourceIp",
+	"userKey",
+	"projectKey",
+	"projectName",
+	"ide",
+	"provider",
+	"model",
+] as const
+
+const optionalStringFields = [
+	"taskId",
+	"userEmail",
+	"departmentName",
+	"officeName",
+	"teamName",
+	"organizationId",
+	"organizationName",
+	"repoRoot",
+	"gitRemoteUrl",
+	"gitBranch",
+	"uploadIssueCode",
+	"uploadIssueReason",
+] as const
+
+const requiredNumberFields = [
+	"occurredAt",
+	"requestCount",
+	"inputTokens",
+	"outputTokens",
+	"cacheReadTokens",
+	"cacheWriteTokens",
+	"totalTokens",
+	"firstOccurredAt",
+	"lastOccurredAt",
+] as const
+
+const optionalNumberFields = [
+	"cacheReadObservedRequestCount",
+	"cacheReadObservedInputTokens",
+	"uploadedAt",
+	"uploadIssueAt",
+] as const
+
+const validatePersistedRow = (sourceKey: string, value: unknown): string | undefined => {
+	if (!isRecord(value)) {
+		return "Persisted Token usage row must be a JSON object"
+	}
+	for (const field of requiredStringFields) {
+		if (typeof value[field] !== "string") {
+			return `Persisted Token usage row field ${field} must be a string`
+		}
+	}
+	for (const field of optionalStringFields) {
+		if (value[field] !== undefined && typeof value[field] !== "string") {
+			return `Persisted Token usage row field ${field} must be a string when present`
+		}
+	}
+	for (const field of requiredNumberFields) {
+		if (typeof value[field] !== "number" || !Number.isFinite(value[field])) {
+			return `Persisted Token usage row field ${field} must be a finite number`
+		}
+	}
+	for (const field of optionalNumberFields) {
+		if (value[field] !== undefined && (typeof value[field] !== "number" || !Number.isFinite(value[field]))) {
+			return `Persisted Token usage row field ${field} must be a finite number when present`
+		}
+	}
+	if (typeof value.dirty !== "boolean") {
+		return "Persisted Token usage row field dirty must be a boolean"
+	}
+	if (value.identityKind !== undefined && value.identityKind !== "anonymous" && value.identityKind !== "configured") {
+		return "Persisted Token usage row field identityKind is invalid"
+	}
+	if (
+		value.uploadIssueKind !== undefined &&
+		value.uploadIssueKind !== "blocked" &&
+		value.uploadIssueKind !== "invalid"
+	) {
+		return "Persisted Token usage row field uploadIssueKind is invalid"
+	}
+	if (value.key !== sourceKey) {
+		return "Persisted Token usage row key does not match its storage key"
+	}
+	return undefined
+}
+
+const isQuarantinedRow = (value: unknown): value is AiTokenUsageQuarantinedRow =>
+	isRecord(value) &&
+	typeof value.sourceKey === "string" &&
+	typeof value.detectedAt === "number" &&
+	Number.isFinite(value.detectedAt) &&
+	value.issueCode === "invalid_persisted_row_structure" &&
+	typeof value.issueReason === "string" &&
+	Object.prototype.hasOwnProperty.call(value, "raw")
 
 export class AiTokenUsageStore {
 	private readonly baseDir: string
@@ -67,17 +174,25 @@ export class AiTokenUsageStore {
 		await this.enqueue(async () => {
 			await this.ensureLoaded()
 			const state = this.state!
-			const configuredEmail = normalizeConfiguredUserEmail(record.userEmail)
+			const inputIdentity = classifyUserEmail(record.userEmail)
+			const configuredEmail = inputIdentity.kind === "valid" ? inputIdentity.userEmail : undefined
 			const identityKind = record.identityKind ?? (configuredEmail ? "configured" : "anonymous")
-			const effectiveEmail = identityKind === "configured" ? configuredEmail : undefined
+			const effectiveEmail =
+				inputIdentity.kind === "invalid"
+					? record.userEmail
+					: identityKind === "configured"
+						? configuredEmail
+						: undefined
 			const normalizedRecord: AiTokenUsageRecordInput = {
 				...record,
+				cacheReadObservedRequestCount: record.cacheReadObservedRequestCount ?? 0,
+				cacheReadObservedInputTokens: record.cacheReadObservedInputTokens ?? 0,
 				userEmail: effectiveEmail,
 				userKey: effectiveEmail ? buildUserKey(effectiveEmail) : record.userKey,
 				identityKind,
 			}
 			const dateKey = toLocalDateKey(record.occurredAt)
-			const key = buildAggregateKey(
+			const aggregateKey = buildAggregateKey(
 				dateKey,
 				normalizedRecord.userKey,
 				record.projectKey,
@@ -85,8 +200,15 @@ export class AiTokenUsageStore {
 				record.provider,
 				record.model,
 			)
-			let existing = state.rows[key]
-			if (!existing) {
+			// A newly observed invalid-present identity is its own forensic fact.
+			// It must not poison an otherwise assignable anonymous aggregate that
+			// happens to share the same installation/dimension key.
+			const key =
+				inputIdentity.kind === "invalid"
+					? JSON.stringify(["invalid-identity", aggregateKey, randomUUID()])
+					: aggregateKey
+			let existing: AiTokenUsageAggregateRow | undefined = state.rows[key]
+			if (!existing && inputIdentity.kind !== "invalid") {
 				const legacyEntry = Object.entries(state.rows).find(
 					([, row]) =>
 						row.dateKey === dateKey &&
@@ -103,6 +225,22 @@ export class AiTokenUsageStore {
 					state.rows[key] = legacyRow
 					existing = legacyRow
 				}
+			}
+			if (existing && classifyUserEmail(existing.userEmail).kind === "invalid") {
+				// A later healthy fact must never wash a non-empty invalid identity
+				// into the assignable anonymous state. Preserve the historical fact
+				// under a distinct forensic key and record the new fact separately.
+				this.setUploadIssue(
+					existing,
+					"invalid",
+					"invalid_persisted_user_email",
+					"Persisted Token usage has a non-empty invalid email, so later facts cannot replace or reassign it",
+				)
+				const quarantinedKey = JSON.stringify(["invalid-identity", key, randomUUID()])
+				delete state.rows[key]
+				existing.key = quarantinedKey
+				state.rows[quarantinedKey] = existing
+				existing = undefined
 			}
 			if (existing) {
 				existing.timezone = normalizedRecord.timezone
@@ -128,6 +266,14 @@ export class AiTokenUsageStore {
 				existing.inputTokens = saturatingAdd(existing.inputTokens, normalizedRecord.inputTokens)
 				existing.outputTokens = saturatingAdd(existing.outputTokens, normalizedRecord.outputTokens)
 				existing.cacheReadTokens = saturatingAdd(existing.cacheReadTokens, normalizedRecord.cacheReadTokens)
+				existing.cacheReadObservedRequestCount = saturatingAdd(
+					existing.cacheReadObservedRequestCount ?? 0,
+					normalizedRecord.cacheReadObservedRequestCount ?? 0,
+				)
+				existing.cacheReadObservedInputTokens = saturatingAdd(
+					existing.cacheReadObservedInputTokens ?? 0,
+					normalizedRecord.cacheReadObservedInputTokens ?? 0,
+				)
 				existing.cacheWriteTokens = saturatingAdd(existing.cacheWriteTokens, normalizedRecord.cacheWriteTokens)
 				existing.totalTokens = saturatingAdd(existing.totalTokens, normalizedRecord.totalTokens)
 				existing.firstOccurredAt = Math.min(existing.firstOccurredAt, record.occurredAt)
@@ -148,7 +294,14 @@ export class AiTokenUsageStore {
 					dirty: true,
 					...normalizedRecord,
 				}
-				if (identityKind === "anonymous") {
+				if (inputIdentity.kind === "invalid") {
+					this.setUploadIssue(
+						state.rows[key],
+						"invalid",
+						"invalid_persisted_user_email",
+						"Token usage was recorded with a non-empty invalid email and cannot be reassigned safely",
+					)
+				} else if (identityKind === "anonymous") {
 					this.setUploadIssue(
 						state.rows[key],
 						"blocked",
@@ -175,11 +328,12 @@ export class AiTokenUsageStore {
 		}
 
 		let assigned = 0
+		let collisionDiagnosticsChanged = false
 		await this.enqueue(async () => {
 			await this.ensureLoaded()
 			const state = this.state!
 			for (const [oldKey, row] of Object.entries({ ...state.rows })) {
-				if (!row.dirty || row.identityKind !== "anonymous") {
+				if (!row.dirty || !isReassignableAnonymousIdentity(row)) {
 					continue
 				}
 
@@ -200,20 +354,37 @@ export class AiTokenUsageStore {
 
 				const target = state.rows[newKey]
 				if (target && target !== row) {
-					const targetEmail = normalizeConfiguredUserEmail(target.userEmail)
-					if (targetEmail !== userEmail) {
+					const targetIdentity = classifyUserEmail(target.userEmail)
+					if (targetIdentity.kind !== "valid" || targetIdentity.userEmail !== userEmail) {
+						if (targetIdentity.kind === "invalid") {
+							this.setUploadIssue(
+								target,
+								"invalid",
+								"invalid_persisted_user_email",
+								"Persisted Token usage collision target has an invalid email, so automatic reassignment is unsafe",
+							)
+						}
 						this.setUploadIssue(
 							row,
 							"invalid",
 							"identity_key_collision",
 							"Anonymous Token usage could not be assigned without overwriting another configured identity",
 						)
+						collisionDiagnosticsChanged = true
 						continue
 					}
 					target.requestCount = saturatingAdd(target.requestCount, adopted.requestCount)
 					target.inputTokens = saturatingAdd(target.inputTokens, adopted.inputTokens)
 					target.outputTokens = saturatingAdd(target.outputTokens, adopted.outputTokens)
 					target.cacheReadTokens = saturatingAdd(target.cacheReadTokens, adopted.cacheReadTokens)
+					target.cacheReadObservedRequestCount = saturatingAdd(
+						target.cacheReadObservedRequestCount ?? 0,
+						adopted.cacheReadObservedRequestCount ?? 0,
+					)
+					target.cacheReadObservedInputTokens = saturatingAdd(
+						target.cacheReadObservedInputTokens ?? 0,
+						adopted.cacheReadObservedInputTokens ?? 0,
+					)
 					target.cacheWriteTokens = saturatingAdd(target.cacheWriteTokens, adopted.cacheWriteTokens)
 					target.totalTokens = saturatingAdd(target.totalTokens, adopted.totalTokens)
 					target.firstOccurredAt = Math.min(target.firstOccurredAt, adopted.firstOccurredAt)
@@ -234,7 +405,7 @@ export class AiTokenUsageStore {
 				delete state.rows[oldKey]
 				assigned++
 			}
-			if (assigned > 0) {
+			if (assigned > 0 || collisionDiagnosticsChanged) {
 				await this.persistState()
 			}
 		})
@@ -301,6 +472,23 @@ export class AiTokenUsageStore {
 				return left.dateKey.localeCompare(right.dateKey)
 			})
 			.map((row) => ({ ...row }))
+	}
+
+	async getQuarantinedRows(): Promise<AiTokenUsageQuarantinedRow[]> {
+		await this.ensureLoaded()
+		return Object.values(this.state!.quarantinedRows)
+			.sort((left, right) => {
+				if (left.detectedAt === right.detectedAt) {
+					return left.sourceKey.localeCompare(right.sourceKey)
+				}
+				return left.detectedAt - right.detectedAt
+			})
+			.map((row) => ({ ...row }))
+	}
+
+	async getQuarantinedRowCount(): Promise<number> {
+		await this.ensureLoaded()
+		return Object.keys(this.state!.quarantinedRows).length
 	}
 
 	async markRowsUploaded(uploadedRows: AiTokenUsageAggregateRow[], uploadedAt: number = Date.now()): Promise<void> {
@@ -389,20 +577,65 @@ export class AiTokenUsageStore {
 	private async loadState(): Promise<void> {
 		await fs.mkdir(this.baseDir, { recursive: true })
 		await recoverSafeWriteJson(this.statePath)
+		let shouldPersistQuarantine = false
 		try {
 			const raw = await fs.readFile(this.statePath, "utf8")
-			const parsed = JSON.parse(raw) as Partial<AiTokenUsagePersistedState>
+			const parsed: unknown = JSON.parse(raw)
 			if (
+				!isRecord(parsed) ||
 				(parsed.version !== undefined && parsed.version !== AI_TOKEN_USAGE_VERSION) ||
-				typeof parsed.rows !== "object" ||
-				parsed.rows === null ||
-				Array.isArray(parsed.rows)
+				!isRecord(parsed.rows)
 			) {
 				throw new Error("Incompatible AI token usage state")
 			}
+
+			const quarantinedRows: Record<string, AiTokenUsageQuarantinedRow> = Object.create(null)
+			if (parsed.quarantinedRows !== undefined) {
+				if (isRecord(parsed.quarantinedRows)) {
+					for (const [quarantineKey, quarantinedValue] of Object.entries(parsed.quarantinedRows)) {
+						if (isQuarantinedRow(quarantinedValue)) {
+							quarantinedRows[quarantineKey] = quarantinedValue
+						} else {
+							this.addQuarantinedRow(
+								quarantinedRows,
+								`quarantinedRows.${quarantineKey}`,
+								quarantinedValue,
+								"Persisted Token usage quarantine entry is structurally invalid",
+							)
+							shouldPersistQuarantine = true
+						}
+					}
+				} else {
+					this.addQuarantinedRow(
+						quarantinedRows,
+						"quarantinedRows",
+						parsed.quarantinedRows,
+						"Persisted Token usage quarantine container must be a JSON object",
+					)
+					shouldPersistQuarantine = true
+				}
+			}
+
+			const rows: Record<string, AiTokenUsageAggregateRow> = Object.create(null)
+			for (const [sourceKey, value] of Object.entries(parsed.rows)) {
+				const issueReason = validatePersistedRow(sourceKey, value)
+				if (issueReason) {
+					this.addQuarantinedRow(quarantinedRows, sourceKey, value, issueReason)
+					shouldPersistQuarantine = true
+					continue
+				}
+				rows[sourceKey] = {
+					...(value as unknown as AiTokenUsageAggregateRow),
+					cacheReadObservedRequestCount:
+						((value as Record<string, unknown>).cacheReadObservedRequestCount as number | undefined) ?? 0,
+					cacheReadObservedInputTokens:
+						((value as Record<string, unknown>).cacheReadObservedInputTokens as number | undefined) ?? 0,
+				}
+			}
 			this.state = {
 				version: AI_TOKEN_USAGE_VERSION,
-				rows: parsed.rows,
+				rows,
+				quarantinedRows,
 			}
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") {
@@ -415,6 +648,29 @@ export class AiTokenUsageStore {
 			}
 			this.state = emptyState()
 			await this.persistState()
+			return
+		}
+		if (shouldPersistQuarantine) {
+			await this.persistState()
+		}
+	}
+
+	private addQuarantinedRow(
+		quarantinedRows: Record<string, AiTokenUsageQuarantinedRow>,
+		sourceKey: string,
+		raw: unknown,
+		issueReason: string,
+	): void {
+		let quarantineKey = sourceKey
+		while (Object.prototype.hasOwnProperty.call(quarantinedRows, quarantineKey)) {
+			quarantineKey = JSON.stringify([sourceKey, randomUUID()])
+		}
+		quarantinedRows[quarantineKey] = {
+			sourceKey,
+			detectedAt: Date.now(),
+			issueCode: "invalid_persisted_row_structure",
+			issueReason,
+			raw,
 		}
 	}
 
@@ -571,6 +827,8 @@ export class AiTokenUsageStore {
 			current.inputTokens === uploaded.inputTokens &&
 			current.outputTokens === uploaded.outputTokens &&
 			current.cacheReadTokens === uploaded.cacheReadTokens &&
+			(current.cacheReadObservedRequestCount ?? 0) === (uploaded.cacheReadObservedRequestCount ?? 0) &&
+			(current.cacheReadObservedInputTokens ?? 0) === (uploaded.cacheReadObservedInputTokens ?? 0) &&
 			current.cacheWriteTokens === uploaded.cacheWriteTokens &&
 			current.totalTokens === uploaded.totalTokens &&
 			current.firstOccurredAt === uploaded.firstOccurredAt &&

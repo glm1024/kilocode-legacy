@@ -121,6 +121,34 @@ describe("GeminiHandler", () => {
 			)
 		})
 
+		// kilocode_change start
+		it("distinguishes explicit zero from missing cached content tokens", async () => {
+			const collectUsage = async (usageMetadata: Record<string, number>) => {
+				;(handler["client"].models.generateContentStream as any).mockResolvedValueOnce({
+					async *[Symbol.asyncIterator]() {
+						yield { usageMetadata }
+					},
+				})
+
+				const chunks = []
+				for await (const chunk of handler.createMessage(systemPrompt, mockMessages)) {
+					chunks.push(chunk)
+				}
+				return chunks.find((chunk) => chunk.type === "usage")
+			}
+
+			const explicitZero = await collectUsage({
+				promptTokenCount: 10,
+				candidatesTokenCount: 5,
+				cachedContentTokenCount: 0,
+			})
+			const missing = await collectUsage({ promptTokenCount: 10, candidatesTokenCount: 5 })
+
+			expect(explicitZero?.cacheReadTokens).toBe(0)
+			expect(missing?.cacheReadTokens).toBeUndefined()
+		})
+		// kilocode_change end
+
 		it("should handle API errors", async () => {
 			const mockError = new Error("Gemini API error")
 			;(handler["client"].models.generateContentStream as any).mockRejectedValue(mockError)

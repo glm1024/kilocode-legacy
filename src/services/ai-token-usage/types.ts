@@ -1,6 +1,11 @@
 import { createHash } from "crypto"
 
-import { buildEmailUserKey, normalizePath as normalizeFsPath, normalizeUserEmail } from "../ai-code-stats/types"
+import {
+	buildEmailUserKey,
+	classifyUserEmail,
+	normalizePath as normalizeFsPath,
+	normalizeUserEmail,
+} from "../ai-code-stats/types"
 
 export type AiTokenUsageIde = "vscode" | "jetbrains" | "unscoped"
 export type AiTokenUsageUploadMode = "incremental"
@@ -56,6 +61,8 @@ export interface AiTokenUsageRecordInput {
 	inputTokens: number
 	outputTokens: number
 	cacheReadTokens: number
+	cacheReadObservedRequestCount?: number
+	cacheReadObservedInputTokens?: number
 	cacheWriteTokens: number
 	totalTokens: number
 	/**
@@ -78,9 +85,23 @@ export interface AiTokenUsageAggregateRow extends AiTokenUsageRecordInput {
 	uploadIssueAt?: number
 }
 
+/**
+ * A structurally malformed persisted row cannot be interpreted as Token usage
+ * safely. Keep its JSON value and a durable diagnostic outside the active row
+ * map so healthy rows can continue without ever reassigning the malformed fact.
+ */
+export interface AiTokenUsageQuarantinedRow {
+	sourceKey: string
+	detectedAt: number
+	issueCode: "invalid_persisted_row_structure"
+	issueReason: string
+	raw: unknown
+}
+
 export interface AiTokenUsagePersistedState {
 	version: 1
 	rows: Record<string, AiTokenUsageAggregateRow>
+	quarantinedRows: Record<string, AiTokenUsageQuarantinedRow>
 }
 
 export interface AiTokenUsageUploadEnvelope {
@@ -121,6 +142,8 @@ export interface AiTokenUsageAggregateUploadRow {
 	inputTokens: number
 	outputTokens: number
 	cacheReadTokens: number
+	cacheReadObservedRequestCount: number
+	cacheReadObservedInputTokens: number
 	cacheWriteTokens: number
 	totalTokens: number
 	firstOccurredAt: number
@@ -158,18 +181,13 @@ export const normalizeDimensionValue = (value?: string, fallback = "unknown"): s
 	return trimmed ? trimmed : fallback
 }
 
-export { normalizeUserEmail }
+export { classifyUserEmail, normalizeUserEmail }
 
 export const buildUserKey = (userEmail: string): string => buildEmailUserKey(userEmail)
 
-export const normalizeConfiguredUserEmail = (value?: string): string | undefined => {
-	const normalized = normalizeUserEmail(value)
-	if (!normalized || normalized.includes(" ")) {
-		return undefined
-	}
-	const at = normalized.indexOf("@")
-	const dot = normalized.lastIndexOf(".")
-	return at > 0 && dot > at + 1 && dot < normalized.length - 1 ? normalized : undefined
+export const normalizeConfiguredUserEmail = (value: unknown): string | undefined => {
+	const identity = classifyUserEmail(value)
+	return identity.kind === "valid" ? identity.userEmail : undefined
 }
 
 export const buildAnonymousUserKey = (installationId: string): string => {
@@ -177,6 +195,21 @@ export const buildAnonymousUserKey = (installationId: string): string => {
 	const digest = createHash("sha256").update(`kilocode-ai-token-usage:${stableSeed}`).digest("hex")
 	return `${AI_TOKEN_USAGE_ANONYMOUS_USER_KEY_PREFIX}${digest.slice(0, 32)}`
 }
+
+export const isPersistedIdentityEmailMissing = (value: unknown): boolean => classifyUserEmail(value).kind === "missing"
+
+/**
+ * A configured identity may adopt only facts that still have explicit anonymous
+ * provenance. In particular, a non-empty but invalid persisted email is not
+ * "missing": treating it as anonymous could silently move user A's facts to B.
+ */
+export const isReassignableAnonymousIdentity = (
+	identity: Pick<AiTokenUsageRecordInput, "userEmail" | "userKey" | "identityKind">,
+): boolean =>
+	isPersistedIdentityEmailMissing(identity.userEmail) &&
+	typeof identity.userKey === "string" &&
+	identity.userKey.startsWith(AI_TOKEN_USAGE_ANONYMOUS_USER_KEY_PREFIX) &&
+	(identity.identityKind === undefined || identity.identityKind === "anonymous")
 
 export const buildAggregateKey = (
 	dateKey: string,

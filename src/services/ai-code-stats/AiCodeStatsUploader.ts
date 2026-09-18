@@ -18,6 +18,7 @@ import { resolveAiCodeStatsCommitStatusUrl, resolveAiCodeStatsWebhookUrl } from 
 import {
 	CURRENT_AI_CODE_STATS_SEMANTICS_VERSION,
 	buildRepoCommitKey,
+	classifyUserEmail,
 	normalizePath,
 	normalizeUserEmail,
 	type AiCodeCommitLifecycleReport,
@@ -141,6 +142,10 @@ export class AiCodeStatsUploader {
 			(await this.store.getBlockedEvents()).map((block) => [block.eventId, block]),
 		)
 		const fallbackUserEmail = normalizeUserEmail(settings.userEmail)
+		const validFallbackUserEmail =
+			fallbackUserEmail && this.isValidEmail(fallbackUserEmail) ? fallbackUserEmail : undefined
+		const persistedEventUserEmails = await this.store.getPendingEventUserEmails()
+		const invalidPendingEventUserEmailState = await this.store.hasInvalidPendingEventUserEmailState()
 		const generatedAt = Date.now()
 		const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"
 		const maxEvents = Math.min(
@@ -152,6 +157,7 @@ export class AiCodeStatsUploader {
 			Math.max(1, Math.floor(context.maxEnvelopeBytes ?? INCREMENTAL_MAX_ENVELOPE_BYTES)),
 		)
 		const normalizedByEventId = new Map<string, AiCodeStatsUploadEnvelope["events"][number]>()
+		const eventIdentityBindingCandidates = new Set<string>()
 		const blockObservations = new Map<
 			string,
 			{
@@ -163,51 +169,40 @@ export class AiCodeStatsUploader {
 				}
 			}
 		>()
-		const events = await this.store.getPendingEvents(maxEvents, (event) => {
-			if (event.metricType !== "generated" && event.metricType !== "accepted") {
-				return false
-			}
-			const persistedBlock = persistedBlockedByEventId.get(event.eventId)
-			if (persistedBlock && !persistedBlock.retryable) {
+		const observeNormalizedEvent = (
+			event: AiCodeStatsUploadEnvelope["events"][number],
+			userEmail: string,
+		): boolean => {
+			const persistedStringError = this.incrementalEventStringValidationError(event)
+			if (persistedStringError) {
 				blockObservations.set(event.eventId, {
 					eventId: event.eventId,
 					block: {
-						category: persistedBlock.category,
-						reason: persistedBlock.reason,
+						category: "invalid_local_payload",
+						reason: persistedStringError,
 						retryable: false,
 					},
 				})
+				normalizedByEventId.delete(event.eventId)
 				return false
 			}
-			const persistedUserEmail = normalizeUserEmail(event.userEmail)
-			const validPersistedUserEmail =
-				persistedUserEmail && this.isValidEmail(persistedUserEmail) ? persistedUserEmail : undefined
-			if (persistedUserEmail && !validPersistedUserEmail) {
+			let normalized: AiCodeStatsUploadEnvelope["events"][number]
+			try {
+				normalized = this.normalizeIncrementalEvent(event, userEmail)
+			} catch (error) {
 				blockObservations.set(event.eventId, {
 					eventId: event.eventId,
 					block: {
-						category: "invalid_identity",
-						reason: "incremental event has a non-empty invalid persisted userEmail",
+						category: "invalid_local_payload",
+						reason: `incremental event normalization failed: ${
+							error instanceof Error ? error.message : String(error)
+						}`,
 						retryable: false,
 					},
 				})
+				normalizedByEventId.delete(event.eventId)
 				return false
 			}
-			const validFallbackUserEmail =
-				fallbackUserEmail && this.isValidEmail(fallbackUserEmail) ? fallbackUserEmail : undefined
-			const userEmail = validPersistedUserEmail ?? validFallbackUserEmail
-			if (!userEmail) {
-				blockObservations.set(event.eventId, {
-					eventId: event.eventId,
-					block: {
-						category: "missing_identity",
-						reason: "incremental event has no userEmail and no valid configured fallback",
-						retryable: true,
-					},
-				})
-				return false
-			}
-			const normalized = this.normalizeIncrementalEvent(event, userEmail)
 			const validationError = this.incrementalEventValidationError(normalized)
 			if (validationError) {
 				blockObservations.set(event.eventId, {
@@ -218,6 +213,7 @@ export class AiCodeStatsUploader {
 						retryable: false,
 					},
 				})
+				normalizedByEventId.delete(event.eventId)
 				return false
 			}
 			const singleEventPayload = this.buildIncrementalEnvelope(
@@ -235,12 +231,113 @@ export class AiCodeStatsUploader {
 						retryable: maxEnvelopeBytes < INCREMENTAL_MAX_ENVELOPE_BYTES,
 					},
 				})
+				normalizedByEventId.delete(event.eventId)
 				return false
 			}
 			blockObservations.set(event.eventId, { eventId: event.eventId })
 			normalizedByEventId.set(event.eventId, normalized)
 			return true
+		}
+		const events = await this.store.getPendingEvents(maxEvents, (event) => {
+			if (event.metricType !== "generated" && event.metricType !== "accepted") {
+				return false
+			}
+			const persistedBlock = persistedBlockedByEventId.get(event.eventId)
+			if (persistedBlock && !persistedBlock.retryable) {
+				blockObservations.set(event.eventId, {
+					eventId: event.eventId,
+					block: {
+						category: persistedBlock.category,
+						reason: persistedBlock.reason,
+						retryable: false,
+					},
+				})
+				return false
+			}
+			const persistedIdentity = classifyUserEmail(event.userEmail)
+			if (persistedIdentity.kind === "invalid") {
+				blockObservations.set(event.eventId, {
+					eventId: event.eventId,
+					block: {
+						category: "invalid_identity",
+						reason: "incremental event has a non-empty invalid persisted userEmail",
+						retryable: false,
+					},
+				})
+				return false
+			}
+			const boundIdentity = classifyUserEmail(persistedEventUserEmails[event.eventId])
+			if (boundIdentity.kind === "invalid") {
+				blockObservations.set(event.eventId, {
+					eventId: event.eventId,
+					block: {
+						category: "invalid_identity",
+						reason: "incremental event has a non-empty invalid persisted identity binding",
+						retryable: false,
+					},
+				})
+				return false
+			}
+			const validPersistedUserEmail = persistedIdentity.kind === "valid" ? persistedIdentity.userEmail : undefined
+			if (!validPersistedUserEmail && invalidPendingEventUserEmailState) {
+				blockObservations.set(event.eventId, {
+					eventId: event.eventId,
+					block: {
+						category: "invalid_identity",
+						reason: "incremental event identity binding store is malformed",
+						retryable: false,
+					},
+				})
+				return false
+			}
+			const validBoundUserEmail = boundIdentity.kind === "valid" ? boundIdentity.userEmail : undefined
+			const userEmail = validPersistedUserEmail ?? validBoundUserEmail ?? validFallbackUserEmail
+			if (!userEmail) {
+				blockObservations.set(event.eventId, {
+					eventId: event.eventId,
+					block: {
+						category: "missing_identity",
+						reason: "incremental event has no userEmail and no valid configured fallback",
+						retryable: true,
+					},
+				})
+				return false
+			}
+			if (!validPersistedUserEmail && !validBoundUserEmail) {
+				eventIdentityBindingCandidates.add(event.eventId)
+			}
+			return observeNormalizedEvent(event, userEmail)
 		})
+		if (eventIdentityBindingCandidates.size > 0 && validFallbackUserEmail) {
+			const durableBindings = await this.store.bindPendingEventUserEmails(
+				[...eventIdentityBindingCandidates],
+				validFallbackUserEmail,
+			)
+			for (const event of events) {
+				if (!eventIdentityBindingCandidates.has(event.eventId)) {
+					continue
+				}
+				const durableIdentity = classifyUserEmail(durableBindings[event.eventId])
+				if (durableIdentity.kind === "missing") {
+					normalizedByEventId.delete(event.eventId)
+					blockObservations.delete(event.eventId)
+					continue
+				}
+				if (durableIdentity.kind === "invalid") {
+					normalizedByEventId.delete(event.eventId)
+					blockObservations.set(event.eventId, {
+						eventId: event.eventId,
+						block: {
+							category: "invalid_identity",
+							reason: "incremental event has a non-empty invalid persisted identity binding",
+							retryable: false,
+						},
+					})
+					continue
+				}
+				observeNormalizedEvent(event, durableIdentity.userEmail)
+			}
+		}
 		const blockedEvents = await this.store.reconcileEventUploadBlocks([...blockObservations.values()])
 		const candidates = events.flatMap((event) => {
 			const normalized = normalizedByEventId.get(event.eventId)
@@ -303,6 +400,8 @@ export class AiCodeStatsUploader {
 			return this.emptyCommitReportUploadResult()
 		}
 		const fallbackUserEmail = normalizeUserEmail(settings.userEmail)
+		const validFallbackUserEmail =
+			fallbackUserEmail && this.isValidEmail(fallbackUserEmail) ? fallbackUserEmail : undefined
 
 		const webhookUrl = resolveAiCodeStatsWebhookUrl(settings.webhookUrl)
 		const matchingReports = (await this.store.getQueuedCommitReports()).filter(
@@ -324,7 +423,49 @@ export class AiCodeStatsUploader {
 			if (this.hasUploadDeadlineExpired(options.deadlineAt)) {
 				break
 			}
-			const reportUserEmail = this.resolveCommitReportUserEmail(queued.report, fallbackUserEmail)
+			let reportUserEmail: string | undefined
+			try {
+				reportUserEmail = this.resolveCommitReportUserEmail(queued.report, queued.boundUserEmail)
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error)
+				failedReportErrors.push({
+					reportId: queued.report.reportId,
+					commitHash: queued.report.commitHash,
+					rawPayloadBytes: 0,
+					compressedPayloadBytes: 0,
+					encoding: "identity",
+					timeoutMs: 0,
+					message,
+					errorCategory: "invalid_local_payload",
+					userMessage: "本地保留的 commit 上报身份无效，已停止自动重试；请导出诊断并联系管理员处理。",
+					...summarizeUploadTarget(webhookUrl),
+				})
+				continue
+			}
+			if (!reportUserEmail && validFallbackUserEmail) {
+				const durableBinding = await this.store.bindQueuedCommitReportUserEmail(
+					queued.report.reportId,
+					validFallbackUserEmail,
+				)
+				try {
+					reportUserEmail = this.resolveCommitReportUserEmail(queued.report, durableBinding)
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error)
+					failedReportErrors.push({
+						reportId: queued.report.reportId,
+						commitHash: queued.report.commitHash,
+						rawPayloadBytes: 0,
+						compressedPayloadBytes: 0,
+						encoding: "identity",
+						timeoutMs: 0,
+						message,
+						errorCategory: "invalid_local_payload",
+						userMessage: "本地保留的 commit 上报身份无效，已停止自动重试；请导出诊断并联系管理员处理。",
+						...summarizeUploadTarget(webhookUrl),
+					})
+					continue
+				}
+			}
 			if (!reportUserEmail) {
 				failedReportErrors.push({
 					reportId: queued.report.reportId,
@@ -652,6 +793,51 @@ export class AiCodeStatsUploader {
 		}
 	}
 
+	private incrementalEventStringValidationError(
+		event: AiCodeStatsUploadEnvelope["events"][number],
+	): string | undefined {
+		const record = event as unknown as Record<string, unknown>
+		const stringFields = [
+			"eventId",
+			"sourceType",
+			"ide",
+			"metricType",
+			"changeType",
+			"userId",
+			"userName",
+			"departmentName",
+			"officeName",
+			"teamName",
+			"userEmail",
+			"organizationId",
+			"organizationName",
+			"sourceIp",
+			"provider",
+			"model",
+			"projectKey",
+			"projectName",
+			"repoRoot",
+			"repoRelativePath",
+			"filePath",
+			"relativePath",
+			"language",
+			"gitRemoteUrl",
+			"gitBranch",
+			"fileSnapshotHash",
+			"taskId",
+			"commitHash",
+			"matchStrategy",
+			"generatedBlockId",
+			"codeSnippet",
+			"fileSnapshotContent",
+		]
+		const invalidField = stringFields.find((field) => {
+			const value = record[field]
+			return value !== undefined && typeof value !== "string"
+		})
+		return invalidField ? `incremental event field ${invalidField} must be a string when present` : undefined
+	}
+
 	private incrementalEventValidationError(event: AiCodeStatsUploadEnvelope["events"][number]): string | undefined {
 		if (
 			!event.eventId?.trim() ||
@@ -845,18 +1031,37 @@ export class AiCodeStatsUploader {
 
 	private resolveCommitReportUserEmail(
 		report: Parameters<typeof buildCompactCommitReportPayload>[0],
-		fallbackUserEmail?: string,
+		boundUserEmail?: unknown,
 	): string | undefined {
-		return (
-			normalizeUserEmail(
-				report.acceptedBlocks?.find((block) => normalizeUserEmail(block.userEmail))?.userEmail,
-			) ??
-			normalizeUserEmail(
-				report.generatedBlocks?.find((block) => normalizeUserEmail(block.userEmail))?.userEmail,
-			) ??
-			normalizeUserEmail(report.candidateLines?.find((line) => normalizeUserEmail(line.userEmail))?.userEmail) ??
-			fallbackUserEmail
-		)
+		const candidates: Array<{ field: string; value: unknown }> = [
+			...(report.acceptedBlocks ?? []).map((block, index) => ({
+				field: `acceptedBlocks[${index}].userEmail`,
+				value: block.userEmail,
+			})),
+			...(report.generatedBlocks ?? []).map((block, index) => ({
+				field: `generatedBlocks[${index}].userEmail`,
+				value: block.userEmail,
+			})),
+			...(report.candidateLines ?? []).map((line, index) => ({
+				field: `candidateLines[${index}].userEmail`,
+				value: line.userEmail,
+			})),
+			{ field: "boundUserEmail", value: boundUserEmail },
+		]
+		let selectedUserEmail: string | undefined
+		for (const candidate of candidates) {
+			const identity = classifyUserEmail(candidate.value)
+			if (identity.kind === "invalid") {
+				throw new Error(`AI code commit report has invalid persisted identity at ${candidate.field}`)
+			}
+			if (identity.kind === "valid") {
+				if (selectedUserEmail && selectedUserEmail !== identity.userEmail) {
+					throw new Error(`AI code commit report has conflicting persisted identities at ${candidate.field}`)
+				}
+				selectedUserEmail = identity.userEmail
+			}
+		}
+		return selectedUserEmail
 	}
 
 	private emptyCommitReportUploadResult(): AiCodeCommitReportUploadResult {

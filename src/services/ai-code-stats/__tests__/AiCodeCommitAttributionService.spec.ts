@@ -481,6 +481,19 @@ describe("AiCodeCommitAttributionService", () => {
 		expect(commits).toBeUndefined()
 	})
 
+	it("rejects a non-object-id commit before invoking Git through a shell", async () => {
+		const repoDir = await initRealGitRepo()
+		const markerPath = path.join(repoDir, "shell-injection-marker")
+		const service = new AiCodeCommitAttributionService(store, {
+			createWatcher: () => new FakeWatcher(),
+		})
+
+		await expect(
+			(service as any).loadCommitTimestamp(repoDir, `${"a".repeat(40)}; touch ${markerPath}`),
+		).rejects.toThrow("commit hash is not a full Git object id")
+		await expect(fs.access(markerPath)).rejects.toMatchObject({ code: "ENOENT" })
+	})
+
 	it("observes reset rewrite as a strong commits_abandoned lifecycle report", async () => {
 		const onCommitLifecycleObserved = vi.fn(async (_payload: any) => {})
 		await store.addPendingLineAttributions([buildPendingLine()])

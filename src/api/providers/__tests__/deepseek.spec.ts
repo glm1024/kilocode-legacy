@@ -21,10 +21,8 @@ vi.mock("openai", () => {
 									prompt_tokens: 10,
 									completion_tokens: 5,
 									total_tokens: 15,
-									prompt_tokens_details: {
-										cache_miss_tokens: 8,
-										cached_tokens: 2,
-									},
+									prompt_cache_miss_tokens: 8,
+									prompt_cache_hit_tokens: 2,
 								},
 							}
 						}
@@ -104,10 +102,8 @@ vi.mock("openai", () => {
 										prompt_tokens: 10,
 										completion_tokens: 5,
 										total_tokens: 15,
-										prompt_tokens_details: {
-											cache_miss_tokens: 8,
-											cached_tokens: 2,
-										},
+										prompt_cache_miss_tokens: 8,
+										prompt_cache_hit_tokens: 2,
 									},
 								}
 							},
@@ -330,13 +326,13 @@ describe("DeepSeekHandler", () => {
 
 			const usageChunks = chunks.filter((chunk) => chunk.type === "usage")
 			expect(usageChunks.length).toBeGreaterThan(0)
-			expect(usageChunks[0].cacheWriteTokens).toBe(8)
+			expect(usageChunks[0].cacheWriteTokens).toBeUndefined() // kilocode_change: miss is not a write
 			expect(usageChunks[0].cacheReadTokens).toBe(2)
 		})
 	})
 
 	describe("processUsageMetrics", () => {
-		it("should correctly process usage metrics including cache information", () => {
+		it("should map cache hits without treating cache misses as writes", () => {
 			// We need to access the protected method, so we'll create a test subclass
 			class TestDeepSeekHandler extends DeepSeekHandler {
 				public testProcessUsageMetrics(usage: any) {
@@ -350,10 +346,8 @@ describe("DeepSeekHandler", () => {
 				prompt_tokens: 100,
 				completion_tokens: 50,
 				total_tokens: 150,
-				prompt_tokens_details: {
-					cache_miss_tokens: 80,
-					cached_tokens: 20,
-				},
+				prompt_cache_miss_tokens: 80,
+				prompt_cache_hit_tokens: 20,
 			}
 
 			const result = testHandler.testProcessUsageMetrics(usage)
@@ -361,9 +355,66 @@ describe("DeepSeekHandler", () => {
 			expect(result.type).toBe("usage")
 			expect(result.inputTokens).toBe(100)
 			expect(result.outputTokens).toBe(50)
-			expect(result.cacheWriteTokens).toBe(80)
+			expect(result.cacheWriteTokens).toBeUndefined()
 			expect(result.cacheReadTokens).toBe(20)
 		})
+
+		// kilocode_change start
+		it("preserves an explicit zero cache hit count", () => {
+			class TestDeepSeekHandler extends DeepSeekHandler {
+				public testProcessUsageMetrics(usage: any) {
+					return this.processUsageMetrics(usage)
+				}
+			}
+
+			const result = new TestDeepSeekHandler(mockOptions).testProcessUsageMetrics({
+				prompt_tokens: 100,
+				completion_tokens: 50,
+				prompt_cache_hit_tokens: 0,
+				prompt_cache_miss_tokens: 100,
+			})
+
+			expect(result.cacheReadTokens).toBe(0)
+			expect(result.cacheWriteTokens).toBeUndefined()
+		})
+
+		it("keeps the OpenAI-compatible cached token fallback without mapping misses as writes", () => {
+			class TestDeepSeekHandler extends DeepSeekHandler {
+				public testProcessUsageMetrics(usage: any) {
+					return this.processUsageMetrics(usage)
+				}
+			}
+
+			const result = new TestDeepSeekHandler(mockOptions).testProcessUsageMetrics({
+				prompt_tokens: 100,
+				completion_tokens: 50,
+				prompt_tokens_details: {
+					cached_tokens: 20,
+					cache_miss_tokens: 80,
+				},
+			})
+
+			expect(result.cacheReadTokens).toBe(20)
+			expect(result.cacheWriteTokens).toBeUndefined()
+		})
+
+		it("only maps explicitly named cache-write fields as writes", () => {
+			class TestDeepSeekHandler extends DeepSeekHandler {
+				public testProcessUsageMetrics(usage: any) {
+					return this.processUsageMetrics(usage)
+				}
+			}
+
+			const result = new TestDeepSeekHandler(mockOptions).testProcessUsageMetrics({
+				prompt_tokens: 100,
+				completion_tokens: 50,
+				prompt_cache_miss_tokens: 80,
+				cache_creation_input_tokens: 20,
+			})
+
+			expect(result.cacheWriteTokens).toBe(20)
+		})
+		// kilocode_change end
 
 		it("should handle missing cache metrics gracefully", () => {
 			class TestDeepSeekHandler extends DeepSeekHandler {

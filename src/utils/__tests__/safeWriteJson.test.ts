@@ -390,6 +390,51 @@ describe("safeWriteJson", () => {
 		expect(await readFileContent(staleBackupPath)).toEqual(staleBackupData)
 	})
 
+	test("fails closed when intent and current are missing and multiple backups have misleading mtimes", async () => {
+		const exactBackupData = { message: "immediately previous committed content" }
+		const staleBackupData = { message: "older retained content" }
+		const exactBackupPath = path.join(tempDir, ".test-file.json.bak_100_exact.tmp")
+		const staleBackupPath = path.join(tempDir, ".test-file.json.bak_999_stale.tmp")
+		await fs.unlink(currentTestFilePath)
+		await fs.writeFile(exactBackupPath, JSON.stringify(exactBackupData))
+		await fs.writeFile(staleBackupPath, JSON.stringify(staleBackupData))
+		const exactTime = new Date("2026-01-01T00:00:00.000Z")
+		const misleadingFutureTime = new Date("2036-01-01T00:00:00.000Z")
+		await fs.utimes(exactBackupPath, exactTime, exactTime)
+		await fs.utimes(staleBackupPath, misleadingFutureTime, misleadingFutureTime)
+
+		await expect(recoverSafeWriteJson(currentTestFilePath)).rejects.toThrow(
+			"committed backup artifacts are ambiguous or invalid without a valid intent",
+		)
+
+		expect(await fileExists(currentTestFilePath)).toBe(false)
+		expect(await readFileContent(exactBackupPath)).toEqual(exactBackupData)
+		expect(await readFileContent(staleBackupPath)).toEqual(staleBackupData)
+	})
+
+	test("fails closed instead of substituting a retained backup when a v1 intent's exact backup is missing", async () => {
+		const staleBackupData = { message: "older retained content" }
+		const staleBackupPath = path.join(tempDir, ".test-file.json.bak_999_stale.tmp")
+		await fs.unlink(currentTestFilePath)
+		await fs.writeFile(staleBackupPath, JSON.stringify(staleBackupData))
+		await fs.writeFile(
+			path.join(tempDir, ".test-file.json.write-intent.json"),
+			JSON.stringify({
+				version: 1,
+				state: "prepared",
+				newFileName: ".test-file.json.new_100_missing.tmp",
+				backupFileName: ".test-file.json.bak_100_missing.tmp",
+			}),
+		)
+
+		await expect(recoverSafeWriteJson(currentTestFilePath)).rejects.toThrow(
+			"the v1 intent's exact committed backup is missing or invalid",
+		)
+
+		expect(await fileExists(currentTestFilePath)).toBe(false)
+		expect(await readFileContent(staleBackupPath)).toEqual(staleBackupData)
+	})
+
 	test("recovers a valid backup when the current target is corrupt", async () => {
 		const backupData = { message: "last committed content" }
 		const backupCandidatePath = path.join(tempDir, ".test-file.json.bak_1772500000003_recovery.tmp")

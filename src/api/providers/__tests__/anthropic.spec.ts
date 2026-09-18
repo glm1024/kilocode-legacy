@@ -191,6 +191,57 @@ describe("AnthropicHandler", () => {
 		})
 
 		// kilocode_change start
+		it("preserves an explicit zero cache read count", async () => {
+			mockCreate.mockImplementationOnce(async () => ({
+				async *[Symbol.asyncIterator]() {
+					yield {
+						type: "message_start",
+						message: {
+							usage: {
+								input_tokens: 100,
+								output_tokens: 50,
+								cache_read_input_tokens: 0,
+							},
+						},
+					}
+				},
+			}))
+
+			const chunks = []
+			for await (const chunk of handler.createMessage(systemPrompt, [])) {
+				chunks.push(chunk)
+			}
+
+			const usageChunk = chunks.find((chunk) => chunk.type === "usage")
+			expect(usageChunk?.cacheReadTokens).toBe(0)
+		})
+
+		it("leaves cache read undefined when Anthropic omits the field", async () => {
+			mockCreate.mockImplementationOnce(async () => ({
+				async *[Symbol.asyncIterator]() {
+					yield {
+						type: "message_start",
+						message: {
+							usage: {
+								input_tokens: 100,
+								output_tokens: 50,
+							},
+						},
+					}
+				},
+			}))
+
+			const chunks = []
+			for await (const chunk of handler.createMessage(systemPrompt, [])) {
+				chunks.push(chunk)
+			}
+
+			const usageChunk = chunks.find((chunk) => chunk.type === "usage")
+			expect(usageChunk?.cacheReadTokens).toBeUndefined()
+		})
+		// kilocode_change end
+
+		// kilocode_change start
 		it("uses anthropicDeploymentName as the model for streaming calls when provided", async () => {
 			const handlerWithDeployment = new AnthropicHandler({
 				...mockOptions,

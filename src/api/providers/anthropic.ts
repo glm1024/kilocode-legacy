@@ -284,7 +284,7 @@ export class AnthropicHandler extends BaseProvider implements SingleCompletionHa
 						inputTokens: input_tokens,
 						outputTokens: output_tokens,
 						cacheWriteTokens: cache_creation_input_tokens || undefined,
-						cacheReadTokens: cache_read_input_tokens || undefined,
+						cacheReadTokens: cache_read_input_tokens ?? undefined, // kilocode_change: preserve explicit zero vs missing
 					}
 
 					inputTokens += input_tokens
